@@ -268,6 +268,14 @@ const answerOnce = async (
         await conversation.cancel(pending, CANCELLED);
         throw turn?.aborted ? turn.reason : error;
       }
+      // An earlier prompt that ended (cut off, or declined): this one goes on.
+      if (
+        pending !== id &&
+        error instanceof restate.TerminalError &&
+        (await conversation.answer(pending)) !== undefined
+      ) {
+        continue;
+      }
       // Refused for good (a wrong API key): the prompt ends unanswered, and
       // fails as terminal. An earlier one's, this one goes on.
       const refused = refusal(error);
