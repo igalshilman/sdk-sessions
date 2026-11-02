@@ -72,8 +72,10 @@ pnpm exec oxfmt "${PACKAGES[@]}" >/dev/null
 # on HEAD, without a commit.
 if git diff --quiet; then
   echo "Every package is at $VERSION already: tagging HEAD"
+  CREATED="tag $TAG"
 else
   git commit -aqm "Release $TAG"
+  CREATED="commit and tag $TAG"
 fi
 git tag -a "$TAG" -m "Release $TAG"
 
@@ -85,6 +87,6 @@ else
 fi
 
 echo
-echo "Created commit and tag $TAG. To release, push both:"
+echo "Created $CREATED. To release, push:"
 echo
 echo "  git push --atomic $REMOTE HEAD:$BRANCH $TAG"
