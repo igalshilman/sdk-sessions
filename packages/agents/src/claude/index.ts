@@ -124,14 +124,18 @@ async function run(
     },
     { signal },
   );
-  // A reply whose tools did not finish (a crash): run them, with the same ids.
+  // A reply whose tools did not finish (a crash): run them, with the same ids,
+  // once the calls whose results are stored are settled, as for any reply:
+  // else one of its calls could take the id of an identical call answered before.
   if (runner.params.messages.at(-1)?.role === 'assistant') {
+    await toolCallStarted(ctx);
     const results = await runner.generateToolResponse();
     check();
     if (results) {
       await conversation.append(id, [results]);
       runner.pushMessages(results);
     }
+    await toolCallEnded(ctx);
   }
   for await (const message of runner) {
     const reply: Anthropic.Beta.Messages.BetaMessageParam = { role: 'assistant', content: message.content };
