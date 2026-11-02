@@ -1,6 +1,6 @@
 {
   "name": "@restatedev/agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agent frameworks in Restate virtual objects, their state in the object's SQL database: pi, OpenCode, LangGraph, Claude (Anthropic SDK) and DeepSeek Harness",
   "license": "MIT",
   "repository": {
