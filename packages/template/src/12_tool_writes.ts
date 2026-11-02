@@ -10,7 +10,7 @@
  *
  *   OPENAI_API_KEY=… node src/12_tool_writes.ts                         # and register it (see 01)
  *   curl localhost:8080/wallet/alice/chat -d 'Send 20 to bob for the pizza.'
- *   curl localhost:8080/wallet/bob/history                              # 20, from alice
+ *   curl localhost:8080/wallet/bob/history                              # ends with 20, from alice
  *   curl localhost:8080/wallet/alice/chat -d 'Now send him a million.'  # the tool answers "Not enough money"
  */
 import * as restate from 'restate-sessions';

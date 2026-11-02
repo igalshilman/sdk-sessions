@@ -15,7 +15,7 @@
  *   node src/08_sends.ts                                                                # and register it (see 01)
  *   curl localhost:8080/wallet/alice/deposit --json '{"id": "d2", "amount": 100}'
  *   curl localhost:8080/wallet/alice/transfer --json '{"to": "bob", "amount": 30}'      # alice's balance after the transfer
- *   curl localhost:8080/wallet/bob/history                                              # 30, from alice
+ *   curl localhost:8080/wallet/bob/history                                              # ends with 30, from alice
  *   curl localhost:8080/wallet/alice/transfer --json '{"to": "bob", "amount": 5000}'    # fails, and bob gets nothing
  */
 import * as restate from 'restate-sessions';
