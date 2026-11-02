@@ -369,8 +369,15 @@ await check('an operation starts without an await', async () => {
   assert.equal((await call('Concurrency/eager/eagerCall')).value, true);
 });
 
-await check("a handler's context: the key, the request, the database and calls", async () => {
-  assert.deepEqual((await call('Concurrency/context/context')).value, ['db', 'key', 'request', 'rpc', 'send']);
+await check("a handler's context: the key, the request, the database, calls and cancel", async () => {
+  assert.deepEqual((await call('Concurrency/context/context')).value, [
+    'cancel',
+    'db',
+    'key',
+    'request',
+    'rpc',
+    'send',
+  ]);
 });
 
 await check('a call awaited late is not held up by a pending 30s sleep', async () => {
