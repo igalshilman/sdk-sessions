@@ -304,6 +304,12 @@ export const withPi = async <T>(
     return await transcribing(ctx, read, () =>
       Promise.race([abortOn(), work({ harness, context, conversation, prompt })]),
     );
+  } catch (error) {
+    // A turn that ends unanswered (cancelled, refused) counts the messages
+    // steered to it that the conversation has, given in an earlier attempt
+    // too: its close answers only the others. An attempt that ended closes nothing.
+    if (!(error instanceof AttemptEnded)) await settleSteering(ctx, steerable).catch(() => {});
+    throw error;
   } finally {
     turn?.removeEventListener('abort', onStop);
     await harness.close(withoutAbortSignal(context));

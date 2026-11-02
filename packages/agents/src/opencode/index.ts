@@ -42,6 +42,7 @@ import type { Plugin } from '@opencode/plugin';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 import {
   alsoClearing,
+  AttemptEnded,
   chatHandler,
   CHECK_MODEL,
   checkModelName,
@@ -509,6 +510,12 @@ export const withOpenCode = async <T>(
     // The log reads the session through this host, while it is open.
     const read = () => transcribe(host);
     return await transcribing(ctx, read, () => Promise.race([interruptOn(host, failure), work({ host, prompt })]));
+  } catch (error) {
+    // A turn that ends unanswered (cancelled, refused) counts the messages
+    // steered to it that the session has, given in an earlier attempt too:
+    // its close answers only the others. An attempt that ended closes nothing.
+    if (!(error instanceof AttemptEnded)) await settleSteering(ctx, steerable).catch(() => {});
+    throw error;
   } finally {
     turn?.removeEventListener('abort', onStop);
     await host.close();
