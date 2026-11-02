@@ -80,9 +80,9 @@ and `steer` (the message it answers), `clear` (forget it all), `sync`,
 
 Each framework's packages are optional peer dependencies of
 restate-agents: a project installs restate-agents, whose required peers
-(restate-sessions, the Restate SDK and zod) npm and pnpm install with it, and
-the packages of the frameworks it imports, so that `restate-agents/pi`
-brings pi alone:
+(restate-sessions, which brings the Restate SDK, and zod) npm and pnpm
+install with it, and the packages of the frameworks it imports, so that
+`restate-agents/pi` brings pi alone:
 
 ```sh
 npm install restate-agents @earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord   # pi

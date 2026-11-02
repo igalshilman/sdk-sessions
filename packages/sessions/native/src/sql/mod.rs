@@ -503,7 +503,8 @@ impl Database {
     /// The record `name` as this session holds it: as the last commit that
     /// set it left it, empty if none did. A reader's own commits set its
     /// records, as they change its SQL, though they are never stored. Once a
-    /// failure ended the session, it is the record as stored.
+    /// failure ended the session, it is the record as stored; once a
+    /// cancelled call dropped the engine, it fails with the session's end.
     pub async fn record(&self, name: &str) -> Result<Bytes> {
         let mut session = self.session.lock().await;
         let engine = session.engine()?;
@@ -1149,8 +1150,23 @@ impl Drop for Running<'_> {
 }
 
 /// Step `statement` to its end, driving its I/O and collecting its rows, at
-/// most `max_bytes` of them.
+/// most `max_bytes` of them. A failure of a write over `max_private_bytes` is
+/// [`Refused`]: the same statement goes over it again on every retry.
 async fn query_engine(
+    io: &KvIo,
+    statement: &mut turso_core::Statement,
+    max_bytes: usize,
+) -> std::result::Result<Rows, Failure> {
+    match step_to_end(io, statement, max_bytes).await {
+        Err(Failure::Fatal(_)) if io.over_limit() => Err(Failure::Fatal(Refused::boxed(
+            "private changes exceed Limits::max_private_bytes",
+        ))),
+        ran => ran,
+    }
+}
+
+/// See [`query_engine`].
+async fn step_to_end(
     io: &KvIo,
     statement: &mut turso_core::Statement,
     max_bytes: usize,

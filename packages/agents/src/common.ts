@@ -235,7 +235,7 @@ export async function toolCallStarted(ctx: restate.SessionContext) {
   const read = reading.get(ctx);
   if (read) {
     const transcript = await read();
-    await settle(ctx, (id) => transcript.answered(id));
+    await settle(ctx, (id, failed) => transcript.answered(id, failed));
   }
 }
 
@@ -364,6 +364,19 @@ export class ToolError extends Error {
   }
 }
 
+/** The errors a framework's own tools (not `tool()`'s) failed with: see {@link fromTool}. */
+const toolErrors = new WeakSet<object>();
+
+/**
+ * `error` is a tool's: a framework's own tool (Claude's, LangChain's...)
+ * that failed, whose error is never taken for the model's provider refusing
+ * (a tool that calls a model API may fail as one does). `tool()`'s are
+ * {@link ToolError}s.
+ */
+export function fromTool(error: unknown) {
+  if (typeof error === 'object' && error !== null) toolErrors.add(error);
+}
+
 /** The Anthropic SDK's errors of a request that fails again however often it is made. */
 const FOR_GOOD = new Set(['AuthenticationError', 'PermissionDeniedError', 'NotFoundError', 'BadRequestError']);
 
@@ -373,7 +386,8 @@ const FOR_GOOD = new Set(['AuthenticationError', 'PermissionDeniedError', 'NotFo
  * (a tool's, an overloaded provider's) fail the attempt, and Restate retries.
  */
 function refused(error: unknown) {
-  if (error instanceof ToolError) return false;
+  if (error instanceof ToolError || (typeof error === 'object' && error !== null && toolErrors.has(error)))
+    return false;
   if (error instanceof Error && FOR_GOOD.has(error.constructor.name)) return true;
   return /API key not found|no API key|Could not resolve authentication method|Provider is not configured|"code":"(AUTH|MISSING_CREDENTIAL)"/i.test(
     String(error),
@@ -489,12 +503,17 @@ export class Transcript {
     );
   }
 
-  /** Whether tool call `id` has its output, and not an error's. */
-  answered(id: string) {
+  /**
+   * Whether tool call `id` has its output: not an error's, unless it is
+   * `failed`, the error the call answered with.
+   */
+  answered(id: string, failed?: string) {
     const at = this.#calls.get(id);
     return (
       at !== undefined &&
-      this.#messages[at]!.parts.some((p) => p.type === 'tool' && p.id === id && p.output !== undefined && !p.error)
+      this.#messages[at]!.parts.some(
+        (p) => p.type === 'tool' && p.id === id && p.output !== undefined && (!p.error || p.output === failed),
+      )
     );
   }
 
@@ -528,7 +547,7 @@ function logged(ctx: restate.SessionContext, read: Read): Promise<void> {
     const transcript = await read();
     await log.sync(ctx.db, transcript.messages());
     // The calls whose results the framework stored are made: see calls.ts.
-    await settle(ctx, (id) => transcript.answered(id));
+    await settle(ctx, (id, failed) => transcript.answered(id, failed));
   };
   const done = (writing.get(ctx) ?? Promise.resolve()).then(write, write);
   writing.set(ctx, done);

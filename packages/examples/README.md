@@ -63,6 +63,11 @@ curl localhost:8080/assistant/alice/messages                                 # t
 Without the CLI, register through the admin API:
 `curl localhost:9070/deployments --json '{"uri": "http://localhost:9080"}'`.
 
+To run another example on the same port with the same Restate, stop the
+first and register again with `--force`, since the address now serves
+other services:
+`npx @restatedev/restate -y deployments register --force http://localhost:9080`.
+
 With Restate in Docker, the agent is at the host's address, as the
 container sees it:
 

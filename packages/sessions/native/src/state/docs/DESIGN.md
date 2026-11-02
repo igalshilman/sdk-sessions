@@ -148,11 +148,11 @@ own), served by `KvIo`:
 - **Commit.** The engine's checkpoint moves its WAL into the private view of
   the database file, whose changed pages go into the mutation, as writes to
   the file `db`. They stay in the private view until the mutation's flush
-  succeeds; a flush the state refused (before anything was written) leaves
-  them there, for the next commit. Inside `Database::transaction`, a
-  statement that ends the transaction (`COMMIT`, `END`, `ROLLBACK`) fails
-  and ends the session before anything is durable, and so does dropping the
-  transaction future.
+  succeeds; a flush the state refused (before anything was written) ends
+  the session, with nothing of the call stored. Between `Database::begin`
+  and `commit`, a statement that ends the transaction (`COMMIT`, `END`,
+  `ROLLBACK`) fails and ends the session before anything is durable, and so
+  does dropping a call's future.
 
 ## Owner cache
 
@@ -244,7 +244,8 @@ Measurements: [ARCHITECTURE.md](ARCHITECTURE.md#6-numbers).
   than asking the store for all of them together.
 - **Memory.** A session's private changes (`max_private_bytes`, 256 MiB) and a
   statement's result rows (`max_result_bytes`, 64 MiB) are capped; exceeding
-  either fails the statement. A state keeps the tail since its checkpoint in
+  either fails the statement as `Refused`, which a retry would repeat, and
+  ends the session. A state keeps the tail since its checkpoint in
   memory, as its overlay, and at most 256 decoded frames and patches. Parked
   engines share a byte budget, by a measured estimate.
 - **Integrity.** Restate provides it: a value reads back as written. Decoding

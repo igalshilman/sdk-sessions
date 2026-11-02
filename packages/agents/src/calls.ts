@@ -14,9 +14,10 @@
 // last id it was made with ({@link settle}, at each publish, and before each
 // tool call): one that answered just before a crash, whose result the
 // framework had not stored, is made again as the same call. An error there
-// is not its result: OpenCode gives the call it interrupted one, and the
-// model makes it again. Once stored, the model has its result, and an
-// identical call it makes later is a call of its own.
+// is not its result (OpenCode gives the call it interrupted one, and the
+// model makes it again), unless the call answered with that error: a
+// terminal error is its result too. Once stored, the model has its result,
+// and an identical call it makes later is a call of its own.
 import type * as restate from 'restate-sessions';
 import { Schema } from 'restate-sessions/internal';
 import { randomUUID } from 'node:crypto';
@@ -29,6 +30,8 @@ interface Call {
   attempt: string;
   /** Answered, until the transcript has its result. */
   done?: true;
+  /** It answered with this error (`Error: <message>`), a terminal one: its result, as the transcript has it. */
+  failed?: string;
 }
 
 /** The calls an invocation's tools made that the transcript has no result of yet. */
@@ -105,9 +108,13 @@ export async function callOf(ctx: CallsContext, tool: string, input: unknown, ca
   const made = call;
   return {
     id: made.ids[0]!,
-    /** It answered (a terminal error included): kept until the transcript has its result. */
-    async answered() {
+    /**
+     * It answered, with `failed` if a terminal error answered it: kept until
+     * the transcript has its result.
+     */
+    async answered(failed?: string) {
       made.done = true;
+      if (failed !== undefined) made.failed = failed;
       await store(ctx, state);
     },
   };
@@ -115,15 +122,16 @@ export async function callOf(ctx: CallsContext, tool: string, input: unknown, ca
 
 /**
  * Forget the calls that answered whose result the framework stored: those
- * of which `stored(id)` is true for the last id they were made with. Called
+ * of which `stored(id, failed)` is true for the last id they were made with,
+ * `failed` the error that answered the call, if one did. Called
  * at each publish, and before each tool call, with the transcript as the
  * framework stored it: also in an attempt that made no call yet, which would
  * otherwise take one an earlier attempt made, and the model has the result
  * of.
  */
-export async function settle(ctx: CallsContext, stored: (id: string) => boolean) {
+export async function settle(ctx: CallsContext, stored: (id: string, failed?: string) => boolean) {
   const state = await attemptOf(ctx).calls;
-  const kept = state.calls.filter((c) => !c.done || !stored(c.ids.at(-1)!));
+  const kept = state.calls.filter((c) => !c.done || !stored(c.ids.at(-1)!, c.failed));
   if (kept.length === state.calls.length) return;
   state.calls = kept;
   await store(ctx, state);

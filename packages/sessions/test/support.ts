@@ -62,6 +62,8 @@ export interface AttemptOptions {
   cancel?: (invocationId: string) => void;
   /** Before each of the attempt's state requests. */
   onRequest?: () => void;
+  /** The `ctx.run` that syncs a commit's writes: it may reject, as one Restate cancelled does. */
+  onSync?: () => Promise<void>;
   /** A shared handler's attempt: its `ctx.db` reads beside the owner's, and writes nothing. */
   shared?: boolean;
   /** The object's name (by default, one of its own), such as one with a schema. */
@@ -83,6 +85,7 @@ export function sqlAttempt({
   send = () => {},
   cancel = () => {},
   onRequest = () => {},
+  onSync = async () => {},
   shared = false,
   service = `test-${randomUUID()}`,
 }: AttemptOptions) {
@@ -118,7 +121,7 @@ export function sqlAttempt({
       onRequest();
       return [...map.keys()];
     },
-    run: async () => {},
+    run: () => onSync(),
     genericSend: (s: restate.GenericSend<Uint8Array>) => {
       check();
       send(s);

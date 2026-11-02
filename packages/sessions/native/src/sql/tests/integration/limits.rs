@@ -25,6 +25,8 @@ fn private_changes_are_bounded() -> Result<()> {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("max_private_bytes"), "{error}");
+        // A retry would go over it again: refused, not a storage error.
+        assert!(error.is::<crate::Refused>(), "{error:?}");
         assert!(db.execute("SELECT 1").await.is_err(), "poisoned");
         drop(db);
         let db = Db::open_with(store, options(), limits()).await?;

@@ -142,6 +142,10 @@ pub(crate) struct FlushReport {
     /// it, the tail grows, and the next flush tries again; after more
     /// failures in a row, fewer and fewer flushes do (one in 64 at most).
     pub checkpoint_failed: Option<String>,
+    /// Why the garbage collection after the checkpoint failed: the flush
+    /// landed, but the state ended, as what the collection deleted has an
+    /// unknown outcome; the next open collects again.
+    pub collection_failed: Option<String>,
 }
 
 /// What a checkpoint did ([`FlushReport::checkpoint`]).
@@ -1009,6 +1013,7 @@ impl Snapshot {
             entry_bytes,
             checkpoint: staged.map(|staged| staged.report),
             checkpoint_failed: None,
+            collection_failed: None,
         };
         Ok((report, self.continued(next)))
     }

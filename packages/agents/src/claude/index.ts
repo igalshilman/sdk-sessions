@@ -35,17 +35,18 @@ import {
   CLAUDE_MODEL,
   type Configure,
   configured,
+  fromTool,
   messagesHandler,
   modelIdOf,
   modelOf,
   nextPromptId,
+  refusal,
   stopSignalOf,
+  storedAnswer,
   toolCallEnded,
   toolCallStarted,
-  Transcript,
   transcribing,
-  refusal,
-  storedAnswer,
+  Transcript,
   UNANSWERED,
 } from '../common.ts';
 import { type Answer, withOutput } from '../output.ts';
@@ -74,6 +75,7 @@ function failing(tools: BetaRunnableTool[]) {
         try {
           return await tool.run(args, context);
         } catch (e) {
+          fromTool(e);
           failure ??= e;
           throw e;
         }
@@ -124,14 +126,18 @@ async function run(
     },
     { signal },
   );
-  // A reply whose tools did not finish (a crash): run them, with the same ids.
+  // A reply whose tools did not finish (a crash): run them, with the same ids,
+  // once the calls whose results are stored are settled, as for any reply:
+  // else one of its calls could take the id of an identical call answered before.
   if (runner.params.messages.at(-1)?.role === 'assistant') {
+    await toolCallStarted(ctx);
     const results = await runner.generateToolResponse();
     check();
     if (results) {
       await conversation.append(id, [results]);
       runner.pushMessages(results);
     }
+    await toolCallEnded(ctx);
   }
   for await (const message of runner) {
     const reply: Anthropic.Beta.Messages.BetaMessageParam = { role: 'assistant', content: message.content };
@@ -261,6 +267,14 @@ const answerOnce = async (
       if (turn?.aborted || error instanceof restate.CancelledError) {
         await conversation.cancel(pending, CANCELLED);
         throw turn?.aborted ? turn.reason : error;
+      }
+      // An earlier prompt that ended (cut off, or declined): this one goes on.
+      if (
+        pending !== id &&
+        error instanceof restate.TerminalError &&
+        (await conversation.answer(pending)) !== undefined
+      ) {
+        continue;
       }
       // Refused for good (a wrong API key): the prompt ends unanswered, and
       // fails as terminal. An earlier one's, this one goes on.

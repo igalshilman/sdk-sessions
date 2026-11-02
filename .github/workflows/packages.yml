@@ -16,6 +16,8 @@ on:
       - packages/e2e/packaging.ts
       - packages/e2e/package.json
       - package.json
+      # The compiler options packages/*/tsconfig.build.json extend.
+      - tsconfig.json
       - pnpm-workspace.yaml
       - pnpm-lock.yaml
       - .github/workflows/packages.yml

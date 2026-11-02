@@ -24,6 +24,18 @@ it('an SQL error of ctx.db is terminal, and the session goes on', async () => {
   });
 });
 
+it('rows with a column named twice are terminal, in a handler and in a body', async () => {
+  const a = sqlAttempt({ map: new Map() });
+  const twice = 'SELECT 1 AS id, 2 AS id';
+  await a.end(async () => {
+    expect(await failure(a.db.query(twice))).toBeInstanceOf(restate.TerminalError);
+    expect(await failure(a.db.get(twice))).toBeInstanceOf(restate.TerminalError);
+    await a.db.transaction(async (tx) => {
+      expect(await failure(tx.query(twice))).toBeInstanceOf(restate.TerminalError);
+    });
+  });
+});
+
 it("an SQL error inside a transaction is terminal there, and the body's rethrowing it rolls back", async () => {
   const a = sqlAttempt({ map: new Map() });
   await a.end(async () => {
@@ -133,4 +145,21 @@ it('a storage error ends the session, and is retried', async () => {
   expect(error).toBeInstanceOf(Error);
   expect(error).not.toBeInstanceOf(restate.TerminalError);
   expect((error as Error).message).toMatch(/fenced/);
+});
+
+it('a cancellation that ends a call of ctx.db fails it with the CancelledError', async () => {
+  let cancelled = false;
+  const onSync = async () => {
+    if (cancelled) throw new restate.CancelledError();
+  };
+  const a = sqlAttempt({ map: new Map(), onSync });
+  const error = await failure(
+    a.end(async () => {
+      await a.db.execute('CREATE TABLE t (n INTEGER)');
+      // Restate cancels the invocation while the commit waits for its sync.
+      cancelled = true;
+      await a.db.execute('INSERT INTO t VALUES (1)');
+    }),
+  );
+  expect(error).toBeInstanceOf(restate.CancelledError);
 });

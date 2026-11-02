@@ -55,23 +55,25 @@ import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { CodingTools } from '@earendil-works/pi-durable/tools';
 import {
   AttemptEnded,
-  CHECK_MODEL,
   chatHandler,
+  CHECK_MODEL,
   checkModelName,
   type Configure,
   configured,
   messagesHandler,
   ModelError,
   modelOf,
-  providerOf,
   nextPromptId,
+  providerOf,
+  refusal,
+  REFUSED,
   settleSteering,
   type Steerable,
   stopSignalOf,
   toolCallEnded,
   toolCallStarted,
-  Transcript,
   transcribing,
+  Transcript,
 } from '../common.ts';
 import { type Answer, withOutput } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
@@ -172,11 +174,20 @@ async function rootOn(harness: Harness, context: Context, model: string): Promis
   return root;
 }
 
-/** The error of prompt `id`, which ended unanswered for `reason`: the model's, if it is the model's. */
-function unanswered(id: string, why: string | null | undefined, model: string) {
+/**
+ * The error of prompt `id`, which ended unanswered for `reason` (and
+ * `detail`, pi-durable's): {@link REFUSED} if there is no model, or its
+ * provider refused it, as for the other frameworks.
+ */
+function unanswered(id: string, why: string | null | undefined, detail: unknown, model: string) {
   const reason = why ?? 'unknown';
-  const check = reason === 'model_error' || reason === 'no_model' ? ` (the model ${model}: ${CHECK_MODEL})` : '';
-  return new restate.TerminalError(`prompt ${id} unanswered: ${reason}${check}`);
+  const text =
+    detail === undefined || detail === null ? '' : typeof detail === 'string' ? detail : JSON.stringify(detail);
+  const message = `prompt ${id} unanswered: ${reason}${text ? `: ${text}` : ''}`;
+  if (reason === 'no_model' || (reason === 'model_error' && refusal(new Error(text)))) {
+    return new restate.TerminalError(`${message} (the model ${model}: ${CHECK_MODEL})`, { errorCode: REFUSED });
+  }
+  return new restate.TerminalError(message);
 }
 
 /**
@@ -269,7 +280,7 @@ export const withPi = async <T>(
     const settled = await submission.wait(context);
     // A prompt the cancellation's abort ended fails with the cancellation.
     if (settled.status !== 'done' || settled.answer === undefined)
-      throw cancelled ?? unanswered(id, settled.reason, model);
+      throw cancelled ?? unanswered(id, settled.reason, settled.detail, model);
     const { answer } = settled;
     const entry = await root.commit((tx) => tx.entry(AssistantEntry, answer), context);
     const reply = entry?.model?.at(-1);

@@ -175,7 +175,8 @@ curl localhost:8080/assistant/alice/facts
 ## Repository layout
 
 This is a pnpm workspace ([`pnpm-workspace.yaml`](pnpm-workspace.yaml)) with
-five packages. Each has its own README, and its unit tests in `test/`.
+five packages. Each has its own README; the two libraries have their unit
+tests in `test/`.
 
 - [`packages/sessions`](packages/sessions/README.md): `restate-sessions`.
   The storage is a Rust addon in

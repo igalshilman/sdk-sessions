@@ -53,23 +53,24 @@ import {
   aborted,
   CANCELLED,
   chatHandler,
-  type Configure,
   checkModelName,
+  type Configure,
   configured,
+  fromTool,
   messagesHandler,
   ModelError,
   modelOf,
   nextPromptId,
   providerOf,
+  refusal,
   settleSteering,
   type Steerable,
   stopSignalOf,
+  storedAnswer,
   toolCallEnded,
   toolCallStarted,
-  Transcript,
   transcribing,
-  refusal,
-  storedAnswer,
+  Transcript,
   UNANSWERED,
 } from '../common.ts';
 import { type Answer, withOutput } from '../output.ts';
@@ -399,6 +400,7 @@ const tracked = (
       await toolCallEnded(ctx, steerable());
       return result;
     } catch (error) {
+      fromTool(error);
       fail(error);
       throw error;
     }

@@ -51,9 +51,9 @@ A name is either a handler or a view, not both. Each one is a function, or
 `{ handler, ...options }` with the SDK's usual handler options (`input`,
 `output`, `description`, `ingressPrivate`, …). You only annotate the input;
 `ctx` is inferred. `description`, `options` and `metadata` work as on any
-virtual object. A session object starts an invocation with only its
-database's head preloaded, and hides the database's state operations in
-Restate's UI.
+virtual object, but for the state options: a session object starts an
+invocation with only its database's head preloaded, and hides the
+database's state operations in Restate's UI.
 
 SDK handlers (`restate.handlers.*`) aren't accepted. Journaled work belongs
 in a regular `restate.object`, `restate.service` or `restate.workflow`, which
@@ -91,10 +91,10 @@ operations concurrently, with `Promise.all` or `Promise.race`.
 
 A view reads the session's database as committed, while handlers may be
 committing at the same time. A chat UI can read a conversation while the
-agent is still working on it, for example. A view takes a snapshot at its
-first read and keeps reading that snapshot, whatever the handlers commit
-afterwards. A view that is still running after 16 of their commits fails,
-and Restate retries it ([how readers work](native/src/state/docs/DESIGN.md#readers)).
+agent is still working on it, for example. A view reads a snapshot of the
+database as it was when the view's invocation started, whatever the
+handlers commit afterwards. A view that is still running after 16 of their
+commits fails, and Restate retries it ([how readers work](native/src/state/docs/DESIGN.md#readers)).
 
 A view's `db` has no `execute` or `transaction`, and its context has no
 `send`. A write through `query` fails too, because a view's database is
@@ -237,6 +237,12 @@ running. A second attempt may get a different answer: the message that
 started once the first attempt's cancel took effect. Get the id from a call
 with an idempotency key instead, which gives every attempt the same answer
 ([calls and sends](#calls-and-sends)).
+
+A cancellation that comes while a `ctx.db` call waits on Restate fails that
+call with a `CancelledError`, as any other await of the handler does. A
+commit it interrupts may still be stored, so a `CancelledError` from
+`transaction()` doesn't mean the transaction rolled back: if it committed,
+the key's next invocation makes its sends.
 
 ## Sends in a transaction
 

@@ -679,8 +679,9 @@ impl Mutation {
     /// durable state: it puts a pack, which its head names; then it
     /// deletes the packs and manifests no checkpoint the head names needs. A checkpoint that
     /// fails changes nothing: the flush goes on, and a later one
-    /// checkpoints. A collection that fails ends the state, though the
-    /// flush landed.
+    /// checkpoints. A collection that fails ends the state, but not the
+    /// flush, which landed: the report says why
+    /// ([`FlushReport::collection_failed`]).
     pub(crate) async fn flush(mut self) -> Result<FlushReport> {
         let shared = self.shared.clone();
         if shared.reader {
@@ -732,7 +733,10 @@ impl Mutation {
         *shared.snapshot.lock().unwrap() = Arc::new(after);
         running.done = true;
         if let Some(checkpoint) = &mut report.checkpoint {
-            checkpoint.deleted = shared.collect_garbage(false).await?;
+            match shared.collect_garbage(false).await {
+                Ok(deleted) => checkpoint.deleted = deleted,
+                Err(error) => report.collection_failed = Some(error.to_string()),
+            }
         }
         Ok(report)
     }

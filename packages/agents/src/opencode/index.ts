@@ -41,23 +41,25 @@ import { mkdir } from 'node:fs/promises';
 import type { Plugin } from '@opencode/plugin';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 import {
-  CHECK_MODEL,
+  alsoClearing,
   chatHandler,
+  CHECK_MODEL,
   checkModelName,
   type Configure,
   configured,
   messagesHandler,
   modelOf,
-  providerOf,
   nextPromptId,
-  alsoClearing,
+  providerOf,
+  refusal,
+  REFUSED,
   settleSteering,
   type Steerable,
   stopSignalOf,
   toolCallEnded,
   toolCallStarted,
-  Transcript,
   transcribing,
+  Transcript,
 } from '../common.ts';
 import { type Answer, withOutput } from '../output.ts';
 import type { z } from 'zod';
@@ -496,8 +498,11 @@ export const withOpenCode = async <T>(
     if (now.state !== 'failed') throw new Error(`prompt ${id} is not in the session`);
     // A prompt the cancellation's interrupt ended fails with the cancellation.
     if (cancelled) throw cancelled;
+    // Its provider's refusal (a missing API key, say) is REFUSED, as for the other frameworks.
+    const message = `prompt ${id} unanswered: ${now.reason}`;
+    if (!refusal(new Error(now.reason))) throw new restate.TerminalError(message);
     const of = `the model ${model.providerID}/${model.id}: ${CHECK_MODEL}`;
-    throw new restate.TerminalError(`prompt ${id} unanswered: ${now.reason} (${of})`);
+    throw new restate.TerminalError(`${message} (${of})`, { errorCode: REFUSED });
   };
 
   try {

@@ -205,9 +205,30 @@ describe("Restate's tools", () => {
     const transcript = new Transcript();
     transcript.call('call_1', 'status', { order: '103' });
     transcript.result('call_1', 'Tool execution was interrupted', true);
-    await settle(next.ctx, (id) => transcript.answered(id));
+    await settle(next.ctx, (id, failed) => transcript.answered(id, failed));
     await t.run({ order: '103' }, { ctx: next.ctx, callId: 'call_2' });
     expect(next.made.map((m) => m.idempotencyKey)).toEqual(['inv1:call_1']);
+  });
+
+  it('make a call that failed for good as a call of its own, once the framework stored its error', async () => {
+    const t = call(orders, 'status', { description: 'An order', input: z.object({ order: z.string() }) });
+    const state = new Map<string, Uint8Array>();
+    const first = context(state);
+    first.sdk.genericCall = async (c: Record<string, unknown>) => {
+      first.made.push({ kind: 'call', ...c });
+      throw new restate.TerminalError('busy, try again');
+    };
+    const failed = await t.run({ order: '103' }, { ctx: first.ctx, callId: 'call_1' });
+    expect(failed).toBe('Error: busy, try again');
+    // The framework stored that error as the call's result; the attempt then
+    // ended (a suspension), and the model, resumed, tries again.
+    const next = context(state);
+    const transcript = new Transcript();
+    transcript.call('call_1', 'status', { order: '103' });
+    transcript.result('call_1', failed);
+    await settle(next.ctx, (id, error) => transcript.answered(id, error));
+    await t.run({ order: '103' }, { ctx: next.ctx, callId: 'call_2' });
+    expect(next.made.map((m) => m.idempotencyKey)).toEqual(['inv1:call_2']);
   });
 
   it('make a call whose result is stored as a call of its own, in an attempt that made none yet', async () => {
