@@ -411,6 +411,32 @@ impl World {
             // It may have named one.
             Err(_) => self.adopted += 1,
         }
+        // Its collection failed: the flush landed, but the state ended, with
+        // the collection's deletes unsynced, as after a failed collection.
+        if let Ok(FlushReport {
+            collection_failed: Some(_),
+            ..
+        }) = &outcome
+        {
+            if self
+                .memory
+                .unsynced()
+                .iter()
+                .any(|(_, value)| value.is_some())
+            {
+                return Err("a failed collection left writes unsynced".into());
+            }
+            if session.state.is_usable() {
+                return Err("a failed collection left the state usable".into());
+            }
+            self.observed(pending);
+            drop(session);
+            if self.rng.percent(50) {
+                self.crash();
+            }
+            let candidates = self.since_sync.clone();
+            return self.reopen(&candidates).await;
+        }
         if outcome.is_ok() {
             // One that wrote syncs; an unchanged one writes nothing, and
             // needs no sync: its session's open synced what it read.

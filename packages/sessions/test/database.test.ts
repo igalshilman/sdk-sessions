@@ -513,18 +513,23 @@ for (const { how, keys } of [
     },
   },
 ]) {
-  test(`a listing that ${how} fails the commit that collects, which landed`, async () => {
+  test(`a listing that ${how} ends the session after the commit that collects, which landed`, async () => {
     const backend = new Backend();
     const ns = fresh();
     const store = backend.request();
     store.keys = keys;
     const db = await open(ns, store);
     await db.execute('CREATE TABLE t(b BLOB)');
-    let committed = 1;
-    // A commit that checkpoints collects: once the tail holds a few rows.
+    let committed = 0;
+    // A commit that checkpoints collects, once the tail holds a few rows: it
+    // succeeds, and the call after it finds the session ended.
     await assert.rejects(async () => {
-      for (; committed < 40; committed++) await db.execute('INSERT INTO t VALUES (randomblob(3000))');
-    }, /listing failed/);
+      while (committed < 40) {
+        await db.execute('INSERT INTO t VALUES (randomblob(3000))');
+        committed++;
+      }
+    }, /session ended/);
+    assert.ok(committed > 0 && committed < 40, `${committed} committed`);
     const reopened = await open(ns, backend.request());
     assert.deepEqual(await reopened.values('SELECT count(*) FROM t'), [[committed]]);
     await reopened.close();
