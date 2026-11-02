@@ -6,9 +6,10 @@
 // When OpenCode resumes a turn that a crash interrupted, a tool call that was
 // running gets an "interrupted" result, and OpenCode asks the model to
 // continue. The teller then retries such a transfer with `retryOf` naming the
-// call, so it moves the money once; reports a result that came before the
-// crash; and otherwise answers the prompt again (as a retry of a transfer
-// whose input OpenCode had not stored in full, which may have run).
+// prompt's first transfer, so it moves the money once however many retries a
+// crash cut off; reports a result that came before the crash; and otherwise
+// answers the prompt again (as a retry of a transfer whose input OpenCode had
+// not stored in full, which may have run).
 //
 // It is the model `teller/teller` of OpenCode booted with `tellerPlugin`, as
 // `withTeller(openOpenCode)` does: with MODEL=teller/teller, an
@@ -74,14 +75,21 @@ export function reply(prompt: LanguageModelV3Message[], tools: string[]): Reply 
         .findLast((c) => c.type === 'tool-call' && c.toolCallId === part.toolCallId);
       if (call?.type !== 'tool-call') throw new Error(`no tool call ${part.toolCallId}`);
       const input = { ...(call.input as Record<string, unknown>) };
+      // The prompt's first transfer: the one every retry of it retries. A
+      // retry whose input OpenCode lost (below) no longer says which it retried.
+      const first = prompt
+        .slice(at)
+        .flatMap((m) => (m.role === 'assistant' ? m.content : []))
+        .find((c) => c.type === 'tool-call' && c.toolName === 'transfer');
+      const original = first?.type === 'tool-call' ? first.toolCallId : call.toolCallId;
       if (call.toolName !== 'transfer' || 'amount' in input) {
-        if (call.toolName === 'transfer') input.retryOf ??= call.toolCallId;
+        if (call.toolName === 'transfer') input.retryOf ??= original;
         return { call: { id, name: call.toolName, input } };
       }
       // OpenCode stores a tool call when its input starts, and its whole
       // input once the call runs: a crash between them leaves a call that
       // may have run. The prompt is answered again, as a retry of it.
-      retryOf = call.toolCallId;
+      retryOf = original;
     } else if (result) {
       return { text: `Done: ${textOf(result)}` };
     }
