@@ -40,7 +40,11 @@ discards its writes. The state shows what was flushed (`state.record(name)`,
 `state.file().read(page)`), never what a mutation holds. The host must
 guarantee one owner per namespace. A failed or cancelled flush ends the
 state (`is_usable()` returns false): its outcome is unknown, so settle
-outstanding requests and open a new one.
+outstanding requests and open a new one. A flush the state refuses before
+writing anything (too many records, or too large ones) fails alone, and the
+state goes on; so does a flush whose checkpoint fails. A garbage collection
+that fails after a flush landed ends the state, but the flush succeeds, its
+report saying why.
 
 With a page cache, a value can be parked for the namespace's next state
 (`state.park(value, weight)`), which takes it back (`state.take_parked()`)

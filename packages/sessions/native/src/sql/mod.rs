@@ -503,7 +503,8 @@ impl Database {
     /// The record `name` as this session holds it: as the last commit that
     /// set it left it, empty if none did. A reader's own commits set its
     /// records, as they change its SQL, though they are never stored. Once a
-    /// failure ended the session, it is the record as stored.
+    /// failure ended the session, it is the record as stored; once a
+    /// cancelled call dropped the engine, it fails with the session's end.
     pub async fn record(&self, name: &str) -> Result<Bytes> {
         let mut session = self.session.lock().await;
         let engine = session.engine()?;
