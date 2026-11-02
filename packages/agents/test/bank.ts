@@ -1,5 +1,5 @@
 // The bank tools, once for every framework (restate-agents' `tool()`): they
-// move money in the ledger (../sql/ledger.ts), with the tool call id as the
+// move money in the ledger (../../sessions/test/ledger.ts), with the tool call id as the
 // transfer id (prefixed with the agent's name and key: the ledger is shared),
 // so a tool call run again after a crash moves the money once; and each call
 // to the ledger has an idempotency key made from the request id and the tool

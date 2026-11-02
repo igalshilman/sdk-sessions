@@ -1,6 +1,6 @@
 // The bank agent on pi (restate-agents/pi): an Agent object per session.
 //
-// Its tools move money in the ledger (../sql/ledger.ts), with the tool call
+// Its tools move money in the ledger (../../sessions/test/ledger.ts), with the tool call
 // id as the transfer id (prefixed with the agent's key: the ledger is shared,
 // and a model's call ids need not be unique beyond its session), so a tool
 // call run again after a crash moves the money once. Each call to the ledger has an idempotency key made from the
