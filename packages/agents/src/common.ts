@@ -235,7 +235,7 @@ export async function toolCallStarted(ctx: restate.SessionContext) {
   const read = reading.get(ctx);
   if (read) {
     const transcript = await read();
-    await settle(ctx, (id) => transcript.answered(id));
+    await settle(ctx, (id, failed) => transcript.answered(id, failed));
   }
 }
 
@@ -489,12 +489,17 @@ export class Transcript {
     );
   }
 
-  /** Whether tool call `id` has its output, and not an error's. */
-  answered(id: string) {
+  /**
+   * Whether tool call `id` has its output: not an error's, unless it is
+   * `failed`, the error the call answered with.
+   */
+  answered(id: string, failed?: string) {
     const at = this.#calls.get(id);
     return (
       at !== undefined &&
-      this.#messages[at]!.parts.some((p) => p.type === 'tool' && p.id === id && p.output !== undefined && !p.error)
+      this.#messages[at]!.parts.some(
+        (p) => p.type === 'tool' && p.id === id && p.output !== undefined && (!p.error || p.output === failed),
+      )
     );
   }
 
@@ -528,7 +533,7 @@ function logged(ctx: restate.SessionContext, read: Read): Promise<void> {
     const transcript = await read();
     await log.sync(ctx.db, transcript.messages());
     // The calls whose results the framework stored are made: see calls.ts.
-    await settle(ctx, (id) => transcript.answered(id));
+    await settle(ctx, (id, failed) => transcript.answered(id, failed));
   };
   const done = (writing.get(ctx) ?? Promise.resolve()).then(write, write);
   writing.set(ctx, done);

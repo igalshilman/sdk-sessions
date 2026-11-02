@@ -123,7 +123,7 @@ async function once<T>(name: string, input: unknown, context: ToolCall, body: (c
   } catch (error) {
     // A terminal error answers the call; any other fails the attempt, and the
     // retry makes the call again.
-    if (error instanceof restate.TerminalError) await call.answered();
+    if (error instanceof restate.TerminalError) await call.answered(`Error: ${error.message}`);
     throw error;
   }
 }
