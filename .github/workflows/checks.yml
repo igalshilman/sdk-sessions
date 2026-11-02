@@ -40,6 +40,13 @@ jobs:
       - run: pnpm --filter e2e concurrency
       - run: pnpm --filter e2e tools
       - run: pnpm --filter e2e crash
+      # A failed crash run keeps its services' and the server's logs.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/restate-sessions-examples-*
+          if-no-files-found: ignore
 
   # The addon's Rust tests (`pnpm --filter restate-sessions test:rust`).
   rust:
