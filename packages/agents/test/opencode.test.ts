@@ -19,7 +19,7 @@ import {
   handlerOf,
   SAID,
 } from './support.ts';
-import { teller, withTeller } from './fakes/opencode.ts';
+import { reply as tellerReply, teller, withTeller } from './fakes/opencode.ts';
 import * as opencode from 'restate-agents/opencode';
 import { prompt } from './opencode.ts';
 import type * as OpenCodeDb from 'restate-agents/opencode/db';
@@ -35,6 +35,28 @@ const besideYours = async (ctx: restate.SessionContext, message: string) => {
   await ctx.db.execute('CREATE TABLE IF NOT EXISTS session (id TEXT)');
   return handlerOf(prompt)(ctx, message);
 };
+
+/** OpenCode's prompt to go on with a turn a restart interrupted, as the teller reads it. */
+const CONTINUE = 'The server restarted while you were working. Continue.';
+
+/** A transfer call `toolCallId` of the model, with `input` as OpenCode stored it. */
+const transferCall = (toolCallId: string, input: Record<string, unknown>) => ({
+  role: 'assistant' as const,
+  content: [{ type: 'tool-call' as const, toolCallId, toolName: 'transfer', input }],
+});
+
+/** The result OpenCode gives transfer call `toolCallId`, which a restart interrupted. */
+const interrupted = (toolCallId: string) => ({
+  role: 'tool' as const,
+  content: [
+    {
+      type: 'tool-result' as const,
+      toolCallId,
+      toolName: 'transfer',
+      output: { type: 'text' as const, value: 'Tool execution interrupted' },
+    },
+  ],
+});
 
 describe('the OpenCode agent', () => {
   it('answers arguments that do not fit a tool with what is wrong, for the model to fix', async () => {
@@ -184,6 +206,23 @@ describe('the OpenCode agent', () => {
     expect(retry).toEqual(first);
     expect(first?.key).toBe(`inv1:${first?.id.split('/').at(-1)}`);
     expect(c.ledger.transfers.size).toBe(1);
+  });
+
+  it("retries a prompt's first transfer, through a retry whose input a crash cut off", () => {
+    const next = tellerReply(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'Please move 1 from 0 to 1' }] },
+        transferCall('call_a', { from: 0, to: 1, amount: 1 }),
+        interrupted('call_a'),
+        { role: 'user', content: [{ type: 'text', text: CONTINUE }] },
+        // Its retry, cut off while its input streamed: OpenCode stored none of it.
+        transferCall('call_b', {}),
+        interrupted('call_b'),
+        { role: 'user', content: [{ type: 'text', text: CONTINUE }] },
+      ],
+      ['transfer', 'audit'],
+    );
+    expect(next.call?.input).toEqual({ from: 0, to: 1, amount: 1, retryOf: 'call_a' });
   });
 
   it("fails the attempt on a tool's error, rather than hand it to the model", async () => {
