@@ -260,10 +260,13 @@ const answerOnce = async (
 /**
  * End the run of `app` that was cancelled or refused, as its `answer` node: a
  * result of `text` for each tool call of the last reply that has none, then
- * `text` as the reply and the prompt's answer.
+ * `text` as the reply and the prompt's answer. A run that stored no input
+ * yet (cancelled at once) has nothing to end: the prompt the state has is
+ * an earlier one, which has its answer.
  */
 async function close(app: ReturnType<ReturnType<typeof graph>['compile']>, config: RunnableConfig, text: string) {
   const { values } = await app.getState(config);
+  if (values.prompt === undefined || values.answers?.[values.prompt] !== undefined) return;
   const messages = (values.messages ?? []) as BaseMessage[];
   const answered = new Set(messages.filter((m) => ToolMessage.isInstance(m)).map((m) => m.tool_call_id));
   const last = messages.findLast((m) => AIMessage.isInstance(m));
