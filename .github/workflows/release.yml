@@ -100,10 +100,12 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v5
+      # npm alone: no pnpm here, so no dependency cache (which would look for it).
       - uses: actions/setup-node@v5
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - uses: actions/download-artifact@v4
         with:
           name: packages
