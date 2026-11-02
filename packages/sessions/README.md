@@ -91,10 +91,10 @@ operations concurrently, with `Promise.all` or `Promise.race`.
 
 A view reads the session's database as committed, while handlers may be
 committing at the same time. A chat UI can read a conversation while the
-agent is still working on it, for example. A view takes a snapshot at its
-first read and keeps reading that snapshot, whatever the handlers commit
-afterwards. A view that is still running after 16 of their commits fails,
-and Restate retries it ([how readers work](native/src/state/docs/DESIGN.md#readers)).
+agent is still working on it, for example. A view reads a snapshot of the
+database as it was when the view's invocation started, whatever the
+handlers commit afterwards. A view that is still running after 16 of their
+commits fails, and Restate retries it ([how readers work](native/src/state/docs/DESIGN.md#readers)).
 
 A view's `db` has no `execute` or `transaction`, and its context has no
 `send`. A write through `query` fails too, because a view's database is

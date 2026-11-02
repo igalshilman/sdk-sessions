@@ -51,8 +51,8 @@ export interface SessionContext {
 
 /**
  * The context of a session object's view: it runs beside the handlers, and
- * reads the database as committed at its first read, whatever they commit
- * meanwhile. It writes nothing, and sends nothing, but it can cancel an
+ * reads the database as committed when its invocation started, whatever they
+ * commit meanwhile. It writes nothing, and sends nothing, but it can cancel an
  * invocation: a handler of its own object's, say, as a Stop button does.
  */
 export interface ViewContext {
