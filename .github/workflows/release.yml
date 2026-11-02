@@ -121,11 +121,19 @@ jobs:
           for tarball in ./packages-out/*.tgz; do
             NAME=$(tar -xOf "$tarball" package/package.json | jq -r '.name')
             VERSION=$(tar -xOf "$tarball" package/package.json | jq -r '.version')
-            if [ -n "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" ]; then
-              echo "$NAME@$VERSION is on npm already, skipped"
-              continue
-            fi
-            npm publish "$tarball" --tag "$NPM_TAG" --access public --provenance
+            for attempt in 1 2 3; do
+              if [ -n "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" ]; then
+                echo "$NAME@$VERSION is on npm already, skipped"
+                break
+              fi
+              # Provenance goes through sigstore's transparency log, which has
+              # its transients (an upload that times out, retried, answers 409
+              # "an equivalent entry already exists"): tried again.
+              if npm publish "$tarball" --tag "$NPM_TAG" --access public --provenance; then break; fi
+              if [ "$attempt" = 3 ]; then exit 1; fi
+              echo "::warning::$NAME@$VERSION failed to publish (attempt $attempt), trying again"
+              sleep 15
+            done
           done
           echo "Published \`${{ needs.version.outputs.version }}\` with dist-tag \`$NPM_TAG\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Create GitHub release
