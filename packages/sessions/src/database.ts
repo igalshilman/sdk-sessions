@@ -65,11 +65,26 @@ function objects({ columns, rows }: SqlQueryResult): Row[] {
   return rows.map((row) => Object.fromEntries(columns.map((name, i) => [name, row[i]!])));
 }
 
-/** {@link DatabaseWriter} over `run`, which runs one call's SQL and returns its rows with their columns. */
-export function sqlOver(run: (sql: string, params?: SqlParam[]) => Promise<SqlQueryResult>): DatabaseWriter {
+/**
+ * {@link DatabaseWriter} over `run`, which runs one call's SQL and returns
+ * its rows with their columns, failing as `failure` makes its errors (as
+ * `run` makes the engine's).
+ */
+export function sqlOver(
+  run: (sql: string, params?: SqlParam[]) => Promise<SqlQueryResult>,
+  failure: (error: unknown) => unknown = (error) => error,
+): DatabaseWriter {
+  const rowsOf = async (sql: string, params?: SqlParam[]) => {
+    const result = await run(sql, params);
+    try {
+      return objects(result);
+    } catch (error) {
+      throw failure(error);
+    }
+  };
   return {
-    query: async <T>(sql: string, params?: SqlParam[]) => objects(await run(sql, params)) as T[],
-    get: async <T>(sql: string, params?: SqlParam[]) => objects(await run(sql, params))[0] as T | undefined,
+    query: async <T>(sql: string, params?: SqlParam[]) => (await rowsOf(sql, params)) as T[],
+    get: async <T>(sql: string, params?: SqlParam[]) => (await rowsOf(sql, params))[0] as T | undefined,
     values: async (sql, params) => (await run(sql, params)).rows,
     execute: async (sql, params) => void (await run(sql, params)),
   };

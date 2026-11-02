@@ -222,7 +222,7 @@ async function forHandler<T>(call: Promise<T>): Promise<T> {
 
 /** The SQL of a transaction's body: `tx`'s, failing as {@link forHandler} does. */
 function forBody(tx: ConnectionTransaction): DatabaseWriter {
-  return sqlOver((sql, params) => forHandler(tx.queryColumns(sql, params)));
+  return sqlOver((sql, params) => forHandler(tx.queryColumns(sql, params)), handlerError);
 }
 
 /**
@@ -390,7 +390,7 @@ export class Attempt {
     this.ctx = ctx;
     this.name = name;
     this.db = {
-      ...sqlOver((sql, params) => this.call((db) => db.queryColumns(sql, params))),
+      ...sqlOver((sql, params) => this.call((db) => db.queryColumns(sql, params)), handlerError),
       // A shared handler's writes stay in its session: it has no outbox.
       transaction: <T>(body: (tx: Transaction) => Promise<T>) =>
         this.ctx.shared
