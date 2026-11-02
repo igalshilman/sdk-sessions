@@ -1149,8 +1149,23 @@ impl Drop for Running<'_> {
 }
 
 /// Step `statement` to its end, driving its I/O and collecting its rows, at
-/// most `max_bytes` of them.
+/// most `max_bytes` of them. A failure of a write over `max_private_bytes` is
+/// [`Refused`]: the same statement goes over it again on every retry.
 async fn query_engine(
+    io: &KvIo,
+    statement: &mut turso_core::Statement,
+    max_bytes: usize,
+) -> std::result::Result<Rows, Failure> {
+    match step_to_end(io, statement, max_bytes).await {
+        Err(Failure::Fatal(_)) if io.over_limit() => Err(Failure::Fatal(Refused::boxed(
+            "private changes exceed Limits::max_private_bytes",
+        ))),
+        ran => ran,
+    }
+}
+
+/// See [`query_engine`].
+async fn step_to_end(
     io: &KvIo,
     statement: &mut turso_core::Statement,
     max_bytes: usize,

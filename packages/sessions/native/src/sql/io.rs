@@ -275,6 +275,9 @@ pub(super) struct KvIo {
     /// A request or synchronous engine read failed: the engine's state after
     /// the error is unknown.
     failed: AtomicBool,
+    /// A write went over `max_private_bytes`: the statement's failure is
+    /// one a retry would repeat ([`Self::over_limit`]).
+    over_limit: AtomicBool,
     /// The state the tests' `mount` opened, which their `publish` flushes.
     #[cfg(test)]
     state: Mutex<Option<crate::state::State>>,
@@ -297,6 +300,7 @@ impl KvIo {
             driver: futures::lock::Mutex::new(()),
             progress: Mutex::default(),
             failed: AtomicBool::default(),
+            over_limit: AtomicBool::default(),
             #[cfg(test)]
             state: Mutex::new(None),
             #[cfg(test)]
@@ -397,6 +401,12 @@ impl KvIo {
         self.failed.store(true, Ordering::SeqCst);
     }
 
+    /// Whether a write went over `max_private_bytes`: a statement whose I/O
+    /// failed for it would fail so again, however often it is retried.
+    pub(crate) fn over_limit(&self) -> bool {
+        self.over_limit.load(Ordering::SeqCst)
+    }
+
     /// An error for the engine, recorded as a failure of this adapter.
     fn engine_error(&self, message: impl Into<String>) -> LimboError {
         self.fail();
@@ -491,6 +501,7 @@ impl KvIo {
             (private.dirty.len() + private.flushed.len()) * BLOCK_SIZE
         };
         if file == WAL && held + total + 2 * BLOCK_SIZE > limit {
+            self.over_limit.store(true, Ordering::SeqCst);
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "private changes exceed Limits::max_private_bytes",
