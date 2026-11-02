@@ -312,6 +312,10 @@ export function sessionObject<
   const { name, schema, handlers = {}, views = {}, description, metadata, options } = definition;
   const both = Object.keys(handlers).filter((key) => key in views);
   if (both.length > 0) throw new Error(`${name}: ${both.join(', ')} is a handler and a view: name one otherwise`);
+  // Its state is its database's: which keys an invocation starts with is the session object's own.
+  if (options && ('state' in options || 'enableLazyState' in options)) {
+    throw new Error(`${name}: a session object sets its state options itself: leave out state and enableLazyState`);
+  }
   if (schema) register(name, schema);
   const sdkHandlers: Record<string, (ctx: restate.ObjectContext, input?: unknown) => Promise<unknown>> = {};
   const own = new Map<string, { fn: Fn<never>; view: boolean; explicit: boolean }>();

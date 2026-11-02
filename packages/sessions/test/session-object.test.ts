@@ -176,6 +176,15 @@ test('an object or workflow needs its key, a service has none', async () => {
   );
 });
 
+test("a definition refuses state options, which are the session object's own", () => {
+  for (const options of [{ state: { preload: true } }, { enableLazyState: false }]) {
+    assert.throws(
+      () => restate.sessionObject({ name: 'preloads', handlers: { a: async () => 1 }, options }),
+      /sets its state options itself/,
+    );
+  }
+});
+
 test('a definition refuses a name of both kinds, and SDK handlers', () => {
   assert.throws(
     () => restate.sessionObject({ name: 'twice', handlers: { a: async () => 1 }, views: { a: async () => 2 } }),

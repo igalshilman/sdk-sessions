@@ -51,9 +51,9 @@ A name is either a handler or a view, not both. Each one is a function, or
 `{ handler, ...options }` with the SDK's usual handler options (`input`,
 `output`, `description`, `ingressPrivate`, …). You only annotate the input;
 `ctx` is inferred. `description`, `options` and `metadata` work as on any
-virtual object. A session object starts an invocation with only its
-database's head preloaded, and hides the database's state operations in
-Restate's UI.
+virtual object, but for the state options: a session object starts an
+invocation with only its database's head preloaded, and hides the
+database's state operations in Restate's UI.
 
 SDK handlers (`restate.handlers.*`) aren't accepted. Journaled work belongs
 in a regular `restate.object`, `restate.service` or `restate.workflow`, which
