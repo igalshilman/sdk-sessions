@@ -570,7 +570,12 @@ export class Attempt {
       if (ctx.shared) await db.execute('PRAGMA query_only = 1');
       // What a crash may have left unmade.
       if (!ctx.shared && this.name === undefined) {
-        decodeOutbox(await db.record(OUTBOX)).forEach((outgoing) => this.make(outgoing, true));
+        const left = decodeOutbox(await db.record(OUTBOX));
+        left.forEach((outgoing) => this.make(outgoing, true));
+        // Emptied at once, as a transaction's own sends are (see `withSends`):
+        // kept until the handler's end, an attempt that resumes a long wait
+        // would make them again, past the idempotency retention.
+        if (left.length > 0) await this.flush(db);
       }
       if (own) await this.ensureSchemas(db, [own]);
     } catch (error) {

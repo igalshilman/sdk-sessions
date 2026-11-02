@@ -150,6 +150,23 @@ describe('the sends of a transaction', () => {
     expect(await balance(o)).toBe(1);
   });
 
+  it('empties the outbox it sent again as it opens, before the handler ends', async () => {
+    const o = object();
+    const crashed = o.attempt({ crash: true });
+    await expect(transfer(crashed)).rejects.toThrow('crashed');
+    crashed.abort();
+    // An attempt that only reads, then suspends: its end stores nothing.
+    const next = o.attempt();
+    await next.db.values('SELECT 1');
+    next.abort();
+    expect(next.sent).toHaveLength(2);
+    expect(await o.outbox()).toEqual([]);
+    // The attempt that resumes the wait makes them no more.
+    const resumed = o.attempt();
+    await resumed.end(() => resumed.db.values('SELECT 1'));
+    expect(resumed.sent).toEqual([]);
+  });
+
   it('sends again what a crash lost of a transaction that changed nothing', async () => {
     const o = object();
     const setup = o.attempt();
