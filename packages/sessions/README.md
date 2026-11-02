@@ -238,6 +238,12 @@ started once the first attempt's cancel took effect. Get the id from a call
 with an idempotency key instead, which gives every attempt the same answer
 ([calls and sends](#calls-and-sends)).
 
+A cancellation that comes while a `ctx.db` call waits on Restate fails that
+call with a `CancelledError`, as any other await of the handler does. A
+commit it interrupts may still be stored, so a `CancelledError` from
+`transaction()` doesn't mean the transaction rolled back: if it committed,
+the key's next invocation makes its sends.
+
 ## Sends in a transaction
 
 A send made with `tx.send` goes out right after its transaction commits, and

@@ -134,3 +134,20 @@ it('a storage error ends the session, and is retried', async () => {
   expect(error).not.toBeInstanceOf(restate.TerminalError);
   expect((error as Error).message).toMatch(/fenced/);
 });
+
+it('a cancellation that ends a call of ctx.db fails it with the CancelledError', async () => {
+  let cancelled = false;
+  const onSync = async () => {
+    if (cancelled) throw new restate.CancelledError();
+  };
+  const a = sqlAttempt({ map: new Map(), onSync });
+  const error = await failure(
+    a.end(async () => {
+      await a.db.execute('CREATE TABLE t (n INTEGER)');
+      // Restate cancels the invocation while the commit waits for its sync.
+      cancelled = true;
+      await a.db.execute('INSERT INTO t VALUES (1)');
+    }),
+  );
+  expect(error).toBeInstanceOf(restate.CancelledError);
+});

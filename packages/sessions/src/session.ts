@@ -5,7 +5,7 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import type * as restate from '@restatedev/restate-sdk';
-import { serde, TerminalError } from '@restatedev/restate-sdk';
+import { CancelledError, serde, TerminalError } from '@restatedev/restate-sdk';
 import { millisOrDurationToMillis, type Serde } from '@restatedev/restate-sdk-core';
 import {
   open,
@@ -160,13 +160,24 @@ const unbeside = (name: string) => (key: string) => {
  * rejects, so the session that made it ends instead of holding its lock for
  * the life of the process.
  */
-function objectStore(ctx: SqlHost, end: AttemptEnd, dbName: string | undefined): Store {
+function objectStore(
+  ctx: SqlHost,
+  end: AttemptEnd,
+  dbName: string | undefined,
+  cancelled: (error: CancelledError) => void,
+): Store {
   const keyOf = dbName === undefined ? (key: string) => key : beside(dbName);
+  // The addon gets a request's failure as text: a cancellation is kept here,
+  // for the call that failed of it to fail with it (see `Attempt.call`).
+  const request = <T>(promise: PromiseLike<T>) =>
+    end.race(promise).catch((error: unknown) => {
+      if (error instanceof CancelledError) cancelled(error);
+      throw error;
+    });
   // TODO: read with protocol v8's ephemeral get, left out of the journal, once
   // a Restate release ships v8 and the SDK lets a library make one (FUTURE.md
   // at the repository's root). Restate 1.8 negotiates v7 at most: a journaled get.
-  const get = async (key: string) =>
-    (await end.race(ctx.get(keyOf(key), serde.binary, named(keyOf(key))))) ?? undefined;
+  const get = async (key: string) => (await request(ctx.get(keyOf(key), serde.binary, named(keyOf(key))))) ?? undefined;
   if (ctx.shared) return { get, set: refusedWrite, clear: refusedWrite, sync: async () => {} };
   return {
     get,
@@ -174,13 +185,13 @@ function objectStore(ctx: SqlHost, end: AttemptEnd, dbName: string | undefined):
     clear: (key) => ctx.clear(keyOf(key), named(keyOf(key))),
     // The database's keys, for a garbage collection.
     keys: async () => {
-      const keys = await end.race(ctx.stateKeys());
+      const keys = await request(ctx.stateKeys());
       if (dbName === undefined) return keys;
       const own = unbeside(dbName);
       return keys.flatMap((key) => own(key) ?? []);
     },
     sync: async () => {
-      await end.race(ctx.run('sync', () => {}));
+      await request(ctx.run('sync', () => {}));
     },
   };
 }
@@ -372,6 +383,8 @@ export class Attempt {
   private unseenOpen = false;
   /** Stops closing the session when the attempt ends. */
   private keepOpen: () => void = () => {};
+  /** The invocation's cancellation, once a request of the session failed of it. */
+  private cancelled: CancelledError | undefined;
 
   constructor(ctx: SqlHost, name?: string) {
     this.ctx = ctx;
@@ -496,11 +509,20 @@ export class Attempt {
     await dropAll(handle, schemas);
   }
 
-  /** `call` on the session, opening it on the first; its failure as the handler fails with it. */
+  /**
+   * `call` on the session, opening it on the first; its failure as the
+   * handler fails with it, or the invocation's cancellation, if a request of
+   * the session failed of it: a call it ended fails with a CancelledError,
+   * as any of the handler's awaits does.
+   */
   private async call<T>(call: (db: Connection) => Promise<T>): Promise<T> {
     this.unseenOpen = false;
-    const db = await this.opened();
-    return forHandler(call(db));
+    try {
+      const db = await this.opened();
+      return await forHandler(call(db));
+    } catch (error) {
+      throw this.cancelled ?? error;
+    }
   }
 
   /** Apply the steps of `schemas` that the database lacks, each schema once per attempt. */
@@ -556,7 +578,7 @@ export class Attempt {
     const key = `${ctx.request().target.service}/${encodeURIComponent(ctx.key)}`;
     const namespace = this.name === undefined ? key : `${key}/${this.name}`;
     const end = new AttemptEnd(ctx.invocationEndPromise.promise);
-    const object = objectStore(ctx, end, this.name);
+    const object = objectStore(ctx, end, this.name, (error) => (this.cancelled ??= error));
     const db = await open(namespace, wrapStore ? wrapStore(object) : object, { reader: ctx.shared });
     // A handler still waiting for something else when the attempt ends (a
     // model request, say) keeps the session no longer: it closes once no
