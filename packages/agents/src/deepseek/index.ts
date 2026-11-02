@@ -51,6 +51,7 @@ import {
 } from '@deepseek-ai/dsh-tools';
 import {
   aborted,
+  AttemptEnded,
   CANCELLED,
   chatHandler,
   checkModelName,
@@ -323,6 +324,10 @@ const answerOnce = async (
     await settleSteering(ctx, steerable());
     return answer;
   } catch (e) {
+    // A turn that ends unanswered (cancelled, refused) counts the messages
+    // steered to it that the session has, given in an earlier attempt too:
+    // its close answers only the others. An attempt that ended closes nothing.
+    if (agent && !(e instanceof AttemptEnded)) await settleSteering(ctx, steeringOf(agent)).catch(() => {});
     // A cancelled invocation cancels the agent's turn, which the log keeps.
     if (e instanceof restate.CancelledError && agent) await cancelTurn(harness, agent);
     else (harness.sessionPersistence as SqlSessionPersistence).abandon();
