@@ -68,6 +68,18 @@ describe('a wrong model', () => {
     }
   });
 
+  it("without its provider's API key fails the invocation, for pi's agent", async () => {
+    const key = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      const refused = conversation(pi.chat({ model: 'openai/gpt-4o-mini' }), 'k').attempt('inv1', 'Hi');
+      await expect(refused).rejects.toMatchObject({ code: REFUSED });
+      await expect(refused).rejects.toThrow(/check the agent's model/);
+    } finally {
+      if (key !== undefined) process.env.OPENAI_API_KEY = key;
+    }
+  });
+
   it('that the provider refuses for good fails the invocation, saying what to check', async () => {
     const refused = answer(new Failing(new AuthenticationError('invalid x-api-key')));
     await expect(refused).rejects.toBeInstanceOf(restate.TerminalError);
