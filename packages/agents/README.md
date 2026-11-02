@@ -1,4 +1,4 @@
-# restate-agents
+# @restatedev/agents
 
 Durable agents on Restate: an agent of one of five frameworks (pi, OpenCode,
 LangGraph, Claude, the DeepSeek Harness) in a Restate virtual object, its
@@ -22,8 +22,8 @@ A chat agent with a tool, the whole of
 [`examples/basic/chat.ts`](../examples/basic/chat.ts):
 
 ```ts
-import { serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const weather = tool({
@@ -70,40 +70,40 @@ and `steer` (the message it answers), `clear` (forget it all), `sync`,
 `notifications` and `watch` (to follow it), and `signal` and `pending`
 ([Signals](#signals)).
 
-| Import                                                | Framework                       | Choose it when                                                                                |
-| ----------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------- |
-| [`restate-agents/pi`](src/pi/README.md)               | pi-durable                      | You want the default: any provider, coding tools on request, and its Harness (compact, reset) |
-| [`restate-agents/opencode`](src/opencode/README.md)   | OpenCode 2.0, embedded          | You want a coding agent: OpenCode's own tools (read, edit, bash, grep...) in a directory      |
-| [`restate-agents/langgraph`](src/langgraph/README.md) | LangGraph                       | You use LangChain: its tools, or a chat model of your own                                     |
-| [`restate-agents/claude`](src/claude/README.md)       | the Anthropic SDK's tool runner | You want Claude with nothing in between: the lightest, the API's own messages                 |
-| [`restate-agents/deepseek`](src/deepseek/README.md)   | DeepSeek Harness                | You want DeepSeek's harness: DeepSeek's models, or any pi-ai knows                            |
+| Import                                                    | Framework                       | Choose it when                                                                                |
+| --------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------- |
+| [`@restatedev/agents/pi`](src/pi/README.md)               | pi-durable                      | You want the default: any provider, coding tools on request, and its Harness (compact, reset) |
+| [`@restatedev/agents/opencode`](src/opencode/README.md)   | OpenCode 2.0, embedded          | You want a coding agent: OpenCode's own tools (read, edit, bash, grep...) in a directory      |
+| [`@restatedev/agents/langgraph`](src/langgraph/README.md) | LangGraph                       | You use LangChain: its tools, or a chat model of your own                                     |
+| [`@restatedev/agents/claude`](src/claude/README.md)       | the Anthropic SDK's tool runner | You want Claude with nothing in between: the lightest, the API's own messages                 |
+| [`@restatedev/agents/deepseek`](src/deepseek/README.md)   | DeepSeek Harness                | You want DeepSeek's harness: DeepSeek's models, or any pi-ai knows                            |
 
 Each framework's packages are optional peer dependencies of
-restate-agents: a project installs restate-agents, whose required peers
-(restate-sessions, which brings the Restate SDK, and zod) npm and pnpm
+@restatedev/agents: a project installs @restatedev/agents, whose required peers
+(@restatedev/sessions, which brings the Restate SDK, and zod) npm and pnpm
 install with it, and the packages of the frameworks it imports, so that
-`restate-agents/pi` brings pi alone:
+`@restatedev/agents/pi` brings pi alone:
 
 ```sh
-npm install restate-agents @earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord   # pi
-npm install restate-agents @anthropic-ai/sdk                                                        # Claude
-npm install restate-agents @langchain/core @langchain/langgraph @langchain/langgraph-checkpoint \
+npm install @restatedev/agents @earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord   # pi
+npm install @restatedev/agents @anthropic-ai/sdk                                                        # Claude
+npm install @restatedev/agents @langchain/core @langchain/langgraph @langchain/langgraph-checkpoint \
   @langchain/openai                       # LangGraph, and the provider of its models: or @langchain/anthropic
-npm install restate-agents @opencode/core@2.0.32 @opencode/plugin@2.0.32 @opencode/sdk@2.0.32 \
+npm install @restatedev/agents @opencode/core@2.0.32 @opencode/plugin@2.0.32 @opencode/sdk@2.0.32 \
   @opencode/server@2.0.32 effect@4.0.1    # OpenCode, which pins its packages, and effect
-npm install restate-agents @earendil-works/pi-ai @deepseek-ai/cordis \
+npm install @restatedev/agents @earendil-works/pi-ai @deepseek-ai/cordis \
   @deepseek-ai/{dsh-agent,dsh-agent-loop,dsh-llm,dsh-llm-deepseek-api-key,dsh-llm-pi-ai,dsh-session}@0.2.1-rc.2 \
   @deepseek-ai/{dsh-session-checkpoint-policy,dsh-session-persistence,dsh-session-projection}@0.2.1-rc.2 \
   @deepseek-ai/{dsh-system-prompt,dsh-tools}@0.2.1-rc.2   # DeepSeek
 ```
 
-OpenCode is pinned: restate-agents stores its tables in the object's
+OpenCode is pinned: @restatedev/agents stores its tables in the object's
 database, as its version lays them out. A subpath whose packages are
 missing fails as it is imported, naming the first it lacks. The packages
 are not published yet:
 [`pnpm --filter e2e packaging`](../e2e/packaging.ts) installs them from
 their tarballs, with pi alone. In this repository the frameworks' packages
-are restate-agents' development dependencies, so every example runs as it is.
+are @restatedev/agents' development dependencies, so every example runs as it is.
 
 Every framework takes `model`, `system`, `tools` and `output` (a
 [structured answer](#structured-answers)); pi and OpenCode take a
@@ -168,7 +168,7 @@ and records the cut-off tool calls as cancelled, in its own way, and the
 next message starts afresh. The calls its tools made (a wait for an
 approval, a sub-agent's task, a workflow) are cancelled with it. `chat`
 uses Restate's explicit cancellation for this (`explicitCancellation: true`,
-with `cancelled(ctx)` and `cancelCalls(ctx)` of `restate-sessions/internal`).
+with `cancelled(ctx)` and `cancelCalls(ctx)` of `@restatedev/sessions/internal`).
 
 An attempt that ends before its turn does, while its process lives on
 (Restate suspended it, gave up on it, or lost its connection), stops its
@@ -295,7 +295,7 @@ turn's start and end), or at its timeout (50 s by default, at most 60), with
 the new revision, the `status`, and the messages since its `cursor`, in one
 request. It waits in Restate, holding no process; sent again with the same
 idempotency key, it joins the same wait. `follow()` of
-`restate-agents/client` (below) is a loop of syncs:
+`@restatedev/agents/client` (below) is a loop of syncs:
 
 ```sh
 curl localhost:8080/support/alice/sync --json '{}'                              # {"revision": 7, "cursor": 31, "status": ..., "messages": [...], "more": false}
@@ -314,14 +314,14 @@ const answer = await ctx.rpc(assistant, 'alice').chat('Hi, I am Alice');
 
 From any other code, a web app included, with Restate's own client
 ([`@restatedev/restate-sdk-clients`](https://docs.restate.dev/develop/ts/clients)).
-`agent(name)` of `restate-agents/client` is the agent's definition as the
+`agent(name)` of `@restatedev/agents/client` is the agent's definition as the
 client takes it: its name, typed with an agent's handlers. It imports
 Restate's client and nothing of the agent's code or the SDK, so a web app
 bundles it as it is:
 
 ```ts
 import * as clients from '@restatedev/restate-sdk-clients';
-import { agent } from 'restate-agents/client';
+import { agent } from '@restatedev/agents/client';
 
 const restate = clients.connect({ url: 'http://localhost:8080' });
 const alice = restate.objectClient(agent('assistant'), 'alice');
@@ -344,7 +344,7 @@ does not end it, and a wait it retries joins the one already parked in
 Restate:
 
 ```ts
-import { agent, follow } from 'restate-agents/client';
+import { agent, follow } from '@restatedev/agents/client';
 
 const stop = new AbortController();
 const messages = new Map<number, ChatMessage>();
@@ -358,7 +358,7 @@ Each change has `waiting` too, what the agent waits for, and `asText(message)`
 is a message to read, as a terminal shows it: its text, and its tool calls
 with their outputs.
 
-`restate-agents/client` also has the types of what the handlers answer
+`@restatedev/agents/client` also has the types of what the handlers answer
 (`Messages`, `Status`, `Waiting`...); `agent<H>(name)` types a session
 object of your own with its handlers `H`.
 [`examples/ui`](../examples/ui/app.ts) is a chat page on it: the
@@ -366,11 +366,11 @@ conversation as the agent works, its approvals, steering and Stop.
 
 ## Tools
 
-Any agent's `tools` take the tools of `restate-agents`, which work the same
+Any agent's `tools` take the tools of `@restatedev/agents`, which work the same
 in every framework, and a framework's own tools:
 
 ```ts
-import { call, send, signal, subagent, tool, workflow } from 'restate-agents';
+import { call, send, signal, subagent, tool, workflow } from '@restatedev/agents';
 ```
 
 | Tool                                                           | What the model gets                                                                                                                                                                          |
@@ -486,7 +486,7 @@ and delivers it to the agents of `route`, at once (the other system does not
 wait for the agent):
 
 ```ts
-import { serve, webhook } from 'restate-agents';
+import { serve, webhook } from '@restatedev/agents';
 
 const issues = webhook({
   name: 'linear', // at /linear/webhook
@@ -565,8 +565,8 @@ in its own table (a shorter
 [`examples/basic/memory.ts`](../examples/basic/memory.ts)):
 
 ```ts
-import { sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const remember = tool({
@@ -631,7 +631,7 @@ API, such as compacting the conversation (see their READMEs).
 each attempt resumes from the database; and the SQL storage hidden from the
 journal in Restate's UI. Its `options` (such as `retryPolicy`) and
 `metadata` add to these. It is a `restate.sessionObject` of
-[`restate-sessions`](../sessions/README.md): `handlers` run one at a time per
+[`@restatedev/sessions`](../sessions/README.md): `handlers` run one at a time per
 key, and `views` beside them. Its own cannot be named `signal`, `pending`,
 `status`, `stop`, `steer`, `notifications` or `watch`, views every agent's
 session object has, nor `sync`, `clear` or `erase`, which an agent has (one with a
@@ -640,22 +640,22 @@ database as committed, beside a message being answered.
 
 ## Build your own
 
-`restate-agents` is not published: it runs on
-[`restate-sessions`](../sessions/README.md) (SQL in virtual objects, with its
+`@restatedev/agents` is not published: it runs on
+[`@restatedev/sessions`](../sessions/README.md) (SQL in virtual objects, with its
 Node.js addon), which this repository builds.
 Build them once, at the repository's root, with `pnpm install && pnpm build`:
 it needs Rust (for the addon), Node 24 or later, and pnpm (see
 [Build and test](../../README.md#build-and-test)).
 
 Then the quickest start is a file in [`packages/examples/`](../examples/README.md),
-whose package has `restate-agents`, the SDK and zod. Or a package of your own
+whose package has `@restatedev/agents`, the SDK and zod. Or a package of your own
 in the pnpm workspace: a directory under `packages/`
 ([`pnpm-workspace.yaml`](../../pnpm-workspace.yaml)), with
 
 ```json
 {
   "type": "module",
-  "dependencies": { "@restatedev/restate-sdk": "1.18.1", "restate-agents": "workspace:*", "zod": "4.6.5" }
+  "dependencies": { "@restatedev/restate-sdk": "1.18.2", "@restatedev/agents": "workspace:*", "zod": "4.6.5" }
 }
 ```
 
@@ -671,8 +671,8 @@ with the framework's own conformance suite where it has one
 ([`test/storage/`](test/storage)). Each framework's README lists its own.
 
 ```sh
-pnpm --filter restate-agents test             # all of them, without a Restate server
-pnpm --filter restate-agents test langgraph   # one framework's
+pnpm --filter @restatedev/agents test             # all of them, without a Restate server
+pnpm --filter @restatedev/agents test langgraph   # one framework's
 ```
 
 The same agents run against a real Restate server, through crashes, in

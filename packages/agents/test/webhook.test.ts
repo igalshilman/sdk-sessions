@@ -4,7 +4,7 @@
 // records its sends; restate-tools.ts delivers to a running turn, on Restate.
 import { createHmac } from 'node:crypto';
 import * as restate from '@restatedev/restate-sdk';
-import { companionOf, deliver as deliverTo, sessionObject, webhook, webhookMessage } from 'restate-agents';
+import { companionOf, deliver as deliverTo, sessionObject, webhook, webhookMessage } from '@restatedev/agents';
 import { describe, expect, it } from 'vitest';
 
 const triage = sessionObject({ name: 'triage', handlers: { chat: async (_ctx, text: string) => text } });
@@ -117,7 +117,7 @@ describe('a webhook', () => {
     });
   });
 
-  it('fails at its definition with a route that is not an agent of restate-agents', () => {
+  it('fails at its definition with a route that is not an agent of @restatedev/agents', () => {
     const plain = restate.object({ name: 'plain', handlers: { chat: async (_ctx: restate.ObjectContext) => '' } });
     expect(() => webhook({ name: 'linear', route: [plain] })).toThrow(/plain is not a sessionObject\(\) or agent\(\)/);
   });
@@ -135,7 +135,7 @@ describe("an agent's companion", () => {
     expect(companion.object.name).toBe('signals');
     expect(companion.key).toBe('triage:ENG-1');
     expect(companion.agent).toEqual({ service: 'triage', key: 'ENG-1' });
-    expect(() => companionOf({ name: 'plain' }, 'k')).toThrow(/plain is not an agent of restate-agents/);
+    expect(() => companionOf({ name: 'plain' }, 'k')).toThrow('plain is not an agent of @restatedev/agents');
   });
 
   it("takes a delivery from a session object's handler, as from one of the SDK's", () => {

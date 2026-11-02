@@ -6,11 +6,11 @@ or the binary `RESTATE_SERVER` names. Each package's own tests, which need no
 server, are in its `test/` directory (`pnpm test` at the root runs them all).
 
 - [`crash.ts`](crash.ts): the agents of
-  [`restate-agents`'s tests](../agents/test) and the sessions of
-  [`restate-sessions`'s](../sessions/test) (the ledger and the shop), through
+  [`@restatedev/agents`'s tests](../agents/test) and the sessions of
+  [`@restatedev/sessions`'s](../sessions/test) (the ledger and the shop), through
   crashes: the services abort at random, and the server is killed twice
   (`pnpm --filter e2e crash`). The agents' models are the scripted ones of
-  [`restate-agents/test/fakes`](../agents/test/fakes/fakes.ts).
+  [`@restatedev/agents/test/fakes`](../agents/test/fakes/fakes.ts).
   [`serve.ts`](serve.ts) serves them all, or some (`node serve.ts ledger shop`).
 - [`concurrency.ts`](concurrency.ts): the context without journal replay
   (`pnpm --filter e2e concurrency`).

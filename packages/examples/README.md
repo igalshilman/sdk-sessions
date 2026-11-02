@@ -3,7 +3,7 @@
 Each one is a file you run with Node (24 or later), from here, after
 `pnpm install && pnpm build` at the repository's root (see
 [Run an example](#run-an-example)). Start with [`chat.ts`](basic/chat.ts),
-and [`restate-agents`](../agents/README.md), the agents they use.
+and [`@restatedev/agents`](../agents/README.md), the agents they use.
 They come in three levels: **basic**, an agent and what it keeps;
 **intermediate**, one of Restate's patterns at a time (its tools, a person in
 the loop, teams, workflows, coding agents); and **advanced**, applications
@@ -48,7 +48,7 @@ that put them together. New to it all? Begin with
 Each agent is a virtual object, one per key, whose conversation is in the
 object's SQL database: a message is answered once per invocation, and a
 crash resumes the reply. The agents are in
-[`restate-agents`](../agents/README.md).
+[`@restatedev/agents`](../agents/README.md).
 
 ## Run an example
 
@@ -90,5 +90,5 @@ or to send a message again safely, see
 ## Write your own
 
 A new file here, beside the others, runs the same way: its package has
-`restate-agents`, the SDK and zod. For a package of your own, see
+`@restatedev/agents`, the SDK and zod. For a package of your own, see
 [Build your own](../agents/README.md#build-your-own).

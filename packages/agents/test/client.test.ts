@@ -1,5 +1,5 @@
-// The conversation as a person reads it (asText of restate-agents/client).
-import { asText } from 'restate-agents/client';
+// The conversation as a person reads it (asText of @restatedev/agents/client).
+import { asText } from '@restatedev/agents/client';
 import { describe, expect, it } from 'vitest';
 
 describe('a message as text', () => {

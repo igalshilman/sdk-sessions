@@ -1,6 +1,6 @@
 // Copies the built addon into the package of this machine's platform
 // (../npm/<platform>/sessions.node, see ../src/platform.ts), where
-// restate-sessions loads it: librestate_sessions.dylib on macOS,
+// @restatedev/sessions loads it: librestate_sessions.dylib on macOS,
 // librestate_sessions.so elsewhere.
 // Usage: node copy-addon.ts release|debug|dist
 import { copyFileSync } from 'node:fs';

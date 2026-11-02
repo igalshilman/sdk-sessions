@@ -265,30 +265,6 @@ and its sub-issues appear, each moving on its own. Comment on the issue
 it takes the comment once they answer. Comment on a pull request, or review
 it, on GitHub: its coder answers there, and pushes what you asked for.
 
-## Run it, in a container
-
-The factory's image, [`Dockerfile`](Dockerfile), is built and pushed to
-`ghcr.io/igalshilman/sqlexperiment/factory` on each push to `main`
-([the workflow](../../../../.github/workflows/factory-image.yml)). It runs the
-factory on Linear and GitHub, as above; Restate registers it at port 9080.
-It holds no secrets (`.dockerignore` keeps every `.env` out): give them to it.
-
-```sh
-docker run -p 9080:9080 -v factory:/data --env-file packages/examples/.env \
-  ghcr.io/igalshilman/sqlexperiment/factory
-```
-
-The coders run real commands in it, in `/data/workspace`: the container is
-their sandbox. `RESTATE_SERVE_ONLY` serves only the services it names, so
-the same image deploys in parts: the coders in a sandbox of their own, say,
-and the rest beside them, with `signals`, which every agent uses (through
-Restate, so one part serves it for all).
-
-```sh
-docker run -e RESTATE_SERVE_ONLY=coder ...                                           # the coders
-docker run -e RESTATE_SERVE_ONLY=linear,github,triage,planner,reviewer,signals ...   # the rest
-```
-
 ## Watch it, on the board
 
 A page for a demo, [`board/`](board/board.ts): each issue as the factory
@@ -305,14 +281,14 @@ npx vite advanced/factory/board   # http://localhost:5173, from packages/example
 
 It reads what the agents already keep, through Restate: the issues, by
 Restate's SQL over triage's state (its admin API, at port 9070), and each
-agent's conversation, with `follow()` of restate-agents' client (the
+agent's conversation, with `follow()` of @restatedev/agents' client (the
 ingress, at port 8080). Triage's calls to the planner, the coders and the
 reviewer name the agents to follow, and their answers carry the plan, the
 pull requests and the reviews. It changes nothing.
 
 ## What it shows
 
-- **A webhook into agents**: `webhook()` of restate-agents makes the
+- **A webhook into agents**: `webhook()` of @restatedev/agents makes the
   `linear` service. Linear posts to it at Restate's ingress, and it
   delivers each new issue, and each comment on it, to the triage agent,
   keyed by the issue, as a message that says where it comes from

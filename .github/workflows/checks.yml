@@ -1,7 +1,8 @@
 # The repository's checks, as a contributor runs them at the root: `pnpm lint`
 # (types, oxlint, oxfmt, rustfmt, clippy) and `pnpm test` (every package's
 # tests, then the addon's Rust tests); and the end-to-end tests against a
-# real Restate server (packages/e2e). A pull request merges once they pass.
+# real Restate server (packages/e2e). A pull request merges once they pass,
+# and a release runs them on its tag (release.yml).
 name: checks
 
 on:
@@ -9,6 +10,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -48,7 +50,7 @@ jobs:
           path: /tmp/restate-sessions-examples-*
           if-no-files-found: ignore
 
-  # The addon's Rust tests (`pnpm --filter restate-sessions test:rust`).
+  # The addon's Rust tests (`pnpm --filter @restatedev/sessions test:rust`).
   rust:
     runs-on: ubuntu-latest
     steps:

@@ -14,10 +14,10 @@
  *   curl localhost:8080/coder/fizzbuzz/chat -d 'Also write a README at the top'   # refused: not in src/
  *   curl localhost:8080/coder/fizzbuzz/messages
  */
-import type * as restate from 'restate-sessions';
+import type * as restate from '@restatedev/sessions';
 import type { Plugin } from '@opencode/plugin';
-import { chatHandler, sessionObject, serve } from 'restate-agents';
-import * as opencode from 'restate-agents/opencode';
+import { chatHandler, sessionObject, serve } from '@restatedev/agents';
+import * as opencode from '@restatedev/agents/opencode';
 
 const workspace = process.env.WORKSPACE ?? '/tmp/review';
 

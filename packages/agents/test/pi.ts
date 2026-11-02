@@ -1,4 +1,4 @@
-// The bank agent on pi (restate-agents/pi): an Agent object per session.
+// The bank agent on pi (@restatedev/agents/pi): an Agent object per session.
 //
 // Its tools move money in the ledger (../../sessions/test/ledger.ts), with the tool call
 // id as the transfer id (prefixed with the agent's key: the ledger is shared,
@@ -9,13 +9,13 @@
 //
 // Environment: PORT (default 9080), MODEL with its provider's API key,
 // and ABORT_PER_MILLE (see ../faults.ts).
-import type * as restate from 'restate-sessions';
-import { sessionObject, signals } from 'restate-agents';
+import type * as restate from '@restatedev/sessions';
+import { sessionObject, signals } from '@restatedev/agents';
 import { Type } from '@earendil-works/pi-ai';
 import { defineTool } from '@earendil-works/pi-durable';
-import { serveIfMain } from 'restate-sessions/test/faults';
-import { ledger } from 'restate-sessions/test/ledger';
-import * as pi from 'restate-agents/pi';
+import { serveIfMain } from '@restatedev/sessions/test/faults';
+import { ledger } from '@restatedev/sessions/test/ledger';
+import * as pi from '@restatedev/agents/pi';
 
 /** The bank tools of an invocation: they reach the ledger through `ctx`. */
 const transfer = (ctx: restate.SessionContext) =>

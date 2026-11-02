@@ -15,9 +15,9 @@
  * The environment (the real Linear and GitHub, WORKSPACE): env.ts. Coders
  * run real commands, on this machine: use a sandbox.
  */
-import { serve, subagent, webhook } from 'restate-agents';
-import * as opencode from 'restate-agents/opencode';
-import * as pi from 'restate-agents/pi';
+import { serve, subagent, webhook } from '@restatedev/agents';
+import * as opencode from '@restatedev/agents/opencode';
+import * as pi from '@restatedev/agents/pi';
 import * as env from './env.ts';
 import * as github from './github.ts';
 import { Built, Plan, Review } from './answers.ts';

@@ -13,8 +13,8 @@ each other's exact versions.
 ## Use
 
 ```ts
-import { serve } from 'restate-agents';
-import * as deepseek from 'restate-agents/deepseek';
+import { serve } from '@restatedev/agents';
+import * as deepseek from '@restatedev/agents/deepseek';
 import { weather } from './weather.ts';
 
 const assistant = deepseek.agent({ name: 'assistant', system: 'Answer briefly.', tools: [weather] });
@@ -25,7 +25,7 @@ await serve(assistant);
 | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`  | `provider/model-id`; or else `MODEL`, or else `deepseek/deepseek-flash` (see below)                                                                            |
 | `system` | The system prompt                                                                                                                                              |
-| `tools`  | `tool()`s and Restate's tools of `restate-agents`, or the harness's `defineTool`s                                                                              |
+| `tools`  | `tool()`s and Restate's tools of `@restatedev/agents`, or the harness's `defineTool`s                                                                          |
 | `output` | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
 
 ## Models
@@ -73,7 +73,7 @@ it, and leaves the model to decide what to do about it. So:
   matters for a long one, such as a wait for an approval, since a suspension
   (after Restate's inactivity timeout) restarts the handler too.
 - **A tool's error fails the attempt**, and Restate retries it; a
-  `restate.TerminalError` of a `restate-agents` tool is its answer to the
+  `restate.TerminalError` of a `@restatedev/agents` tool is its answer to the
   model. The failed attempt stores nothing more, so its retry finds the call
   without a result, as above.
 - **A failed turn fails the attempt**: a model request that failed, or a
@@ -97,7 +97,7 @@ With a Restate server, and the agent registered with it: see
 
 The tests run on a scripted model, [`test/fakes/deepseek.ts`](../../test/fakes/deepseek.ts),
 which makes a fresh tool call id for every call, as a model does
-(`pnpm --filter restate-agents test deepseek`, from the repository root):
+(`pnpm --filter @restatedev/agents test deepseek`, from the repository root):
 
 - [`test/deepseek.test.ts`](../../test/deepseek.test.ts):
   each point above, with crashes that stop an attempt in a tool call, or

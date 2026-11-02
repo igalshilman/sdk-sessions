@@ -13,9 +13,9 @@
  *   curl localhost:8080/desk/alice/chat -d 'The app crashes when I open my orders'
  *   curl localhost:8080/billing/alice/messages   # what billing was asked, and answered
  */
-import { chatHandler, sessionObject, serve } from 'restate-agents';
-import * as langgraph from 'restate-agents/langgraph';
-import * as pi from 'restate-agents/pi';
+import { chatHandler, sessionObject, serve } from '@restatedev/agents';
+import * as langgraph from '@restatedev/agents/langgraph';
+import * as pi from '@restatedev/agents/pi';
 
 const billing = langgraph.agent({
   name: 'billing',

@@ -10,8 +10,8 @@
  *   npx @restatedev/restate deployments register http://localhost:9080
  *   curl localhost:8080/assistant/alice/chat -d 'Hi, I am Alice. Is it warm in Lisbon?'
  */
-import { serve, tool } from 'restate-agents';
-import * as opencode from 'restate-agents/opencode';
+import { serve, tool } from '@restatedev/agents';
+import * as opencode from '@restatedev/agents/opencode';
 import { z } from 'zod';
 
 // A tool, for any framework's agent (the framework's own tools work too).

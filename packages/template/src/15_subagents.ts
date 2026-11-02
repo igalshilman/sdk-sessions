@@ -11,9 +11,9 @@
  *   curl localhost:8080/wallet/alice/chat -d 'I want the bike, 600, by June. Ask the coach for a plan.'
  *   curl localhost:8080/wallet/alice/messages                           # the task it gave the coach, and the plan
  */
-import type * as restate from 'restate-sessions';
-import { sessionObject, serve, subagent, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import type * as restate from '@restatedev/sessions';
+import { sessionObject, serve, subagent, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const balanceOf = async (db: restate.DatabaseReader) =>

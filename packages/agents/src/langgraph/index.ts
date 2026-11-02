@@ -25,8 +25,8 @@
 //   agent lacks, or with arguments that do not fit, is the model's to fix.
 // - A message is answered once per invocation: the graph records each answer
 //   in its state, and a retried attempt returns it.
-import * as restate from 'restate-sessions';
-import type { Database } from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
+import type { Database } from '@restatedev/sessions';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatAnthropic } from '@langchain/anthropic';
 import type { ChatOpenAI } from '@langchain/openai';
@@ -144,14 +144,14 @@ const chatModel = async (named: string): Promise<BaseChatModel> => {
 let openai: Promise<{ ChatOpenAI: typeof ChatOpenAI }> | undefined;
 let anthropic: Promise<{ ChatAnthropic: typeof ChatAnthropic }> | undefined;
 
-/** The integration `name`, which its user installs beside restate-agents. */
+/** The integration `name`, which its user installs beside @restatedev/agents. */
 async function integration<T>(name: string, load: () => Promise<T>): Promise<T> {
   try {
     return await load();
   } catch (error) {
     if ((error as { code?: unknown }).code !== 'ERR_MODULE_NOT_FOUND') throw error;
     throw new ModelError(
-      `${name.replace('@langchain/', '')}/<model-id> models need ${name}: install it beside restate-agents`,
+      `${name.replace('@langchain/', '')}/<model-id> models need ${name}: install it beside @restatedev/agents`,
     );
   }
 }

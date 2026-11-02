@@ -3,7 +3,7 @@
 // user, and the Case, keyed per order: in a sandbox).
 //
 //   MODEL=openai/gpt-6-luna OPENAI_API_KEY=… node advanced/gateway/main.ts [tools|agents]
-import { serve } from 'restate-agents';
+import { serve } from '@restatedev/agents';
 import { assistant, caseAgent } from './agent.ts';
 import { gateway } from './gateway.ts';
 import { tools } from './tools.ts';

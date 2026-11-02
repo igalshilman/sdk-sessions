@@ -12,7 +12,7 @@
  *   curl localhost:8080/wallet/alice/balance           # 20, plus what lesson 02 deposited
  *   curl localhost:8080/wallet/alice/history           # every deposit, oldest first
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 /** The sum of the entries. A `DatabaseReader` is any database you can read: a handler's, a view's or a transaction's. */
 const balanceOf = async (db: restate.DatabaseReader) =>

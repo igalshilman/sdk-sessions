@@ -1,9 +1,9 @@
-// Restate's own tools (restate-agents' call, send, workflow and signal), run
+// Restate's own tools (@restatedev/agents' call, send, workflow and signal), run
 // with a fake context that records the calls they make.
-import * as restate from 'restate-sessions';
-import { call, sessionObject, send, signal, subagent, tool, workflow, type Tool } from 'restate-agents';
-import { type AttemptContext, contextOf, invoke } from 'restate-sessions/internal';
-import { fakeContext, type Made, memoryDatabase } from 'restate-sessions/test/support';
+import * as restate from '@restatedev/sessions';
+import { call, sessionObject, send, signal, subagent, tool, workflow, type Tool } from '@restatedev/agents';
+import { type AttemptContext, contextOf, invoke } from '@restatedev/sessions/internal';
+import { fakeContext, type Made, memoryDatabase } from '@restatedev/sessions/test/support';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { settle } from '../src/calls.ts';
@@ -290,10 +290,10 @@ const named = (handlers: Record<string, () => Promise<void>>) => () => sessionOb
 const handlersOf = (o: object) => Object.keys((o as { object: object }).object);
 
 describe('object', () => {
-  it("refuses handlers of its own named as restate-agents' own", () => {
-    expect(named({ signal: async () => {} })).toThrow("`signal` is a handler of restate-agents' own");
-    expect(named({ pending: async () => {} })).toThrow("`pending` is a handler of restate-agents' own");
-    expect(named({ clear: async () => {} })).toThrow("`clear` is a handler of restate-agents' own");
+  it("refuses handlers of its own named as @restatedev/agents' own", () => {
+    expect(named({ signal: async () => {} })).toThrow("`signal` is a handler of @restatedev/agents' own");
+    expect(named({ pending: async () => {} })).toThrow("`pending` is a handler of @restatedev/agents' own");
+    expect(named({ clear: async () => {} })).toThrow("`clear` is a handler of @restatedev/agents' own");
     // @ts-expect-error: a handler every object has
     expect(() => sessionObject({ name: 'assistant', handlers: { signal: async () => {} } })).toThrow('`signal`');
   });

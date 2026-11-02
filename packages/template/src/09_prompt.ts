@@ -2,7 +2,7 @@
  * 09 · A model in a handler
  *
  * From here on, the wallet talks to a model, so it is defined with
- * `sessionObject` from restate-agents: `restate.sessionObject` with what
+ * `sessionObject` from @restatedev/agents: `restate.sessionObject` with what
  * agents need set up, their tables in the same database and a few built-in
  * handlers you will meet in the next lessons.
  *
@@ -13,9 +13,9 @@
  *   OPENAI_API_KEY=… node src/09_prompt.ts      # and register it (see 01)
  *   curl localhost:8080/wallet/alice/summary    # a few words on alice's money
  */
-import type * as restate from 'restate-sessions';
-import { sessionObject, serve } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import type * as restate from '@restatedev/sessions';
+import { sessionObject, serve } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 
 const balanceOf = async (db: restate.DatabaseReader) =>
   (await db.get<{ balance: number }>('SELECT coalesce(sum(amount), 0) AS balance FROM entries'))?.balance ?? 0;

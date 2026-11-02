@@ -13,9 +13,9 @@
  *   curl localhost:8080/wallet/alice/chat -d 'Send 15 to @bobby for the tickets.'
  *   curl localhost:8080/wallet/alice/messages                           # the lookup, then the transfer
  */
-import * as restate from 'restate-sessions';
-import { call, sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import * as restate from '@restatedev/sessions';
+import { call, sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const handle = restate.sessionObject({

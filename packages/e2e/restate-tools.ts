@@ -1,4 +1,4 @@
-// Restate's own tools (restate-agents' call, signal and workflow) against a
+// Restate's own tools (@restatedev/agents' call, signal and workflow) against a
 // real Restate server: the support agent of examples/intermediate/support.ts on a scripted
 // model, which looks the order up, waits for approval, then refunds.
 //
@@ -22,12 +22,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as restate from '@restatedev/restate-sdk';
 import { createModels } from '@earendil-works/pi-ai/models';
-import { call, signal, signals, webhook, workflow, type Messages, type Status, type Waiting } from 'restate-agents';
+import { call, signal, signals, webhook, workflow, type Messages, type Status, type Waiting } from '@restatedev/agents';
 import * as clients from '@restatedev/restate-sdk-clients';
-import { agent, type ChatMessage, follow, type Followed } from 'restate-agents/client';
-import * as pi from 'restate-agents/pi';
+import { agent, type ChatMessage, follow, type Followed } from '@restatedev/agents/client';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
-import { callTools, fakeProvider, say, textOf } from 'restate-agents/test/fakes/pi';
+import { callTools, fakeProvider, say, textOf } from '@restatedev/agents/test/fakes/pi';
 import { RESTATE_SERVER as SERVER } from './restate-server.ts';
 
 const INGRESS = 'http://127.0.0.1:8080';
@@ -237,7 +237,7 @@ try {
 
   // Sent without waiting, and its answer fetched later: by the invocation's
   // id, or by the idempotency key it was sent with.
-  // Through Restate's client, with the agent's types of restate-agents/client.
+  // Through Restate's client, with the agent's types of @restatedev/agents/client.
   const ingress = clients.connect({ url: INGRESS });
   const henry = ingress.objectClient(agent('support'), 'henry');
   assert.deepEqual(await henry.signal({ name: 'approval', value: 'approved', keep: true }), { resolved: null });

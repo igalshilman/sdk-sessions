@@ -16,8 +16,8 @@
  *   curl localhost:8080/creative/alice/chat -d 'Name a color.'
  */
 import { ChatOpenAI } from '@langchain/openai';
-import { serve } from 'restate-agents';
-import * as langgraph from 'restate-agents/langgraph';
+import { serve } from '@restatedev/agents';
+import * as langgraph from '@restatedev/agents/langgraph';
 
 const precise = langgraph.agent({
   name: 'precise',

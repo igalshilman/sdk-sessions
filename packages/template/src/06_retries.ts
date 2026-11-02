@@ -21,7 +21,7 @@
  *   curl localhost:8080/wallet/alice/deposit --json '{"id": "d1", "amount": 10, "note": "refund"}'   # counted once, though the first attempt failed
  *   curl localhost:8080/wallet/alice/deposit --json '{"id": "d1", "amount": 10, "note": "refund"}'   # sent again: the balance stays the same
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 const balanceOf = async (db: restate.DatabaseReader) =>
   (await db.get<{ balance: number }>('SELECT coalesce(sum(amount), 0) AS balance FROM entries'))?.balance ?? 0;

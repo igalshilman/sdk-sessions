@@ -1,12 +1,12 @@
-// The bank agent on LangGraph (restate-agents/langgraph): a GraphAgent object per conversation, whose tools
+// The bank agent on LangGraph (@restatedev/agents/langgraph): a GraphAgent object per conversation, whose tools
 // (./bank.ts) move money in the ledger.
 //
 // Environment: PORT (default 9080), OPENAI_API_KEY, MODEL, and ABORT_PER_MILLE (see
 // ../faults.ts).
-import { sessionObject, signals } from 'restate-agents';
-import * as langgraph from 'restate-agents/langgraph';
-import { serveIfMain } from 'restate-sessions/test/faults';
-import { ledger } from 'restate-sessions/test/ledger';
+import { sessionObject, signals } from '@restatedev/agents';
+import * as langgraph from '@restatedev/agents/langgraph';
+import { serveIfMain } from '@restatedev/sessions/test/faults';
+import { ledger } from '@restatedev/sessions/test/ledger';
 import { bank } from './bank.ts';
 
 /** Answer a message, once per invocation. */

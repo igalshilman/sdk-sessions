@@ -3,13 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "description": "A tutorial in files: a wallet per user, from a SQL database per key to agents, one idea at a time",
+  "license": "MIT",
   "type": "module",
   "dependencies": {
     "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
-    "restate-agents": "workspace:*",
-    "restate-sessions": "workspace:*",
+    "@restatedev/agents": "workspace:*",
+    "@restatedev/sessions": "workspace:*",
     "zod": "4.6.5"
   },
   "engines": {

@@ -16,7 +16,7 @@
  */
 import { createInterface } from 'node:readline/promises';
 import * as clients from '@restatedev/restate-sdk-clients';
-import { type Agent, agent, type Followed, follow, type Part } from 'restate-agents/client';
+import { type Agent, agent, type Followed, follow, type Part } from '@restatedev/agents/client';
 import type { Task } from './tools.ts';
 
 /** The pair's handlers: an agent's, and its own `tasks`. */

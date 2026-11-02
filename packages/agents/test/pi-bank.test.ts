@@ -1,10 +1,10 @@
 // The bank agent on pi (./pi.ts) without a Restate server, through crashes of
 // the handler (see ../testing.ts). Its model is the teller (../fakes/pi.ts).
-// `pnpm --filter restate-agents test pi`.
+// `pnpm --filter @restatedev/agents test pi`.
 import { describe, expect, it, vi } from 'vitest';
 import { conversation, crashedAnywhere, handlerOf, SAID } from './support.ts';
-import type * as restate from 'restate-sessions';
-import * as pi from 'restate-agents/pi';
+import type * as restate from '@restatedev/sessions';
+import * as pi from '@restatedev/agents/pi';
 import { prompt } from './pi.ts';
 
 // The default model's provider, OpenAI's, is the teller.

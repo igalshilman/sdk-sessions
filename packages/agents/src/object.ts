@@ -1,6 +1,6 @@
 // Virtual objects set up for SQL and agents.
-import * as restate from 'restate-sessions';
-import { reset } from 'restate-sessions/internal';
+import * as restate from '@restatedev/sessions';
+import { reset } from '@restatedev/sessions/internal';
 import {
   cleared,
   onClear,
@@ -247,7 +247,7 @@ type With<H, V> = Functions<typeof BUILT_IN> &
 
 /**
  * A Restate virtual object with a SQL database per key, `ctx.db`: a
- * `restate.sessionObject` of restate-sessions, set up for agents.
+ * `restate.sessionObject` of @restatedev/sessions, set up for agents.
  *
  *   const notes = sessionObject({
  *     name: 'notes',
@@ -263,7 +263,7 @@ type With<H, V> = Functions<typeof BUILT_IN> &
  * and `notifications` and `watch({ revision })`, to follow its
  * conversation. An agent, an object with a `messages` view (such as
  * `claude.messages()`), has `clear` too, which forgets its conversation
- * (its database too), and `sync`, which `follow()` of restate-agents/client
+ * (its database too), and `sync`, which `follow()` of @restatedev/agents/client
  * reads.
  *
  * `schema`, optional: tables of your own, beside the agent's (which are its
@@ -299,7 +299,7 @@ export const sessionObject = <
   }
   for (const key of own) {
     if (key in handlers || key in views)
-      throw new Error(`${name}: \`${key}\` is a handler of restate-agents' own: name yours otherwise`);
+      throw new Error(`${name}: \`${key}\` is a handler of @restatedev/agents' own: name yours otherwise`);
   }
   // A model provider's refusal (a missing API key) ends a handler's invocation.
   const yours = Object.fromEntries(

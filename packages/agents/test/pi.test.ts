@@ -1,9 +1,9 @@
 // pi's chat without a Restate server or an API key: Anthropic's provider is a
 // fake model (../fakes/pi.ts).
-import * as restate from 'restate-sessions';
-import { subagent, tool } from 'restate-agents';
+import * as restate from '@restatedev/sessions';
+import { subagent, tool } from '@restatedev/agents';
 import { z } from 'zod';
-import * as pi from 'restate-agents/pi';
+import * as pi from '@restatedev/agents/pi';
 import { describe, expect, it, vi } from 'vitest';
 import { callTools, fakeProvider, say, textOf } from './fakes/pi.ts';
 import { AttemptEnded } from '../src/common.ts';

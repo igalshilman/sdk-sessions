@@ -2,7 +2,7 @@
 // `close`, which `status`, `steer` and `deliver` read (and the `stop` view,
 // through `status`). Its handlers
 // run on a fake context, which keeps the state and records what they send.
-import { signals } from 'restate-agents';
+import { signals } from '@restatedev/agents';
 import { describe, expect, it } from 'vitest';
 
 const agent = { service: 'assistant', key: 'alice' };

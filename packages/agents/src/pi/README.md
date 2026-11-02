@@ -9,8 +9,8 @@ Here its storage is the agent's SQL database, in the Restate virtual object
 ## Use
 
 ```ts
-import { serve } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { serve } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { weather } from './weather.ts';
 
 const assistant = pi.agent({ name: 'assistant', system: 'Answer briefly.', tools: [weather] });
@@ -22,7 +22,7 @@ await serve(assistant);
 | `model`       | `provider/model-id`, of any provider pi-ai knows; or else `MODEL`, or else `openai/gpt-6-sol` (`OPENAI_API_KEY`)                                               |
 | `models`      | A pi-ai model registry, for a provider of your own                                                                                                             |
 | `system`      | The system prompt                                                                                                                                              |
-| `tools`       | `tool()`s and Restate's tools of `restate-agents`, or pi-durable's `defineTool`s                                                                               |
+| `tools`       | `tool()`s and Restate's tools of `@restatedev/agents`, or pi-durable's `defineTool`s                                                                           |
 | `output`      | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
 | `workspace`   | A directory for pi-durable's coding tools (`read`, `write`, `edit`, `bash`), on the local file system; use a sandbox                                           |
 | `serviceTier` | OpenAI's service tier for each request: `fast` for its fast mode (priced higher), `flex`, and so on                                                            |
@@ -67,7 +67,7 @@ handler does. A retried attempt opens the Harness again and carries on:
   however often a crash cut it off (pi-durable's `restartLimit` is
   `Infinity`: Restate's retry policy decides);
 - a tool's error fails the attempt, and Restate retries it (pi-durable would
-  hand it to the model); a `restate.TerminalError` of a `restate-agents`
+  hand it to the model); a `restate.TerminalError` of a `@restatedev/agents`
   tool is its answer to the model.
 
 The files of a `workspace` are not in the database: they last as long as the
@@ -89,7 +89,7 @@ coordinator that hands coding tasks to OpenCode coders.
 ## Tests
 
 The tests run on a scripted model, [`test/fakes/pi.ts`](../../test/fakes/pi.ts),
-which needs no key (`pnpm --filter restate-agents test pi`, from the repository root):
+which needs no key (`pnpm --filter @restatedev/agents test pi`, from the repository root):
 
 - [`test/storage/pi.test.ts`](../../test/storage/pi.test.ts):
   pi-durable's storage conformance suite on the object's database;

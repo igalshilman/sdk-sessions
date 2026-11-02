@@ -84,8 +84,8 @@ Lessons 09 to 16 use OpenAI's models, with your API key in `OPENAI_API_KEY`.
 
 ## Next
 
-- [`restate-sessions`](../sessions/README.md) and
-  [`restate-agents`](../agents/README.md) cover everything the lessons use,
+- [`@restatedev/sessions`](../sessions/README.md) and
+  [`@restatedev/agents`](../agents/README.md) cover everything the lessons use,
   in full.
 - [The examples](../examples/README.md) are larger applications built the
   same way.

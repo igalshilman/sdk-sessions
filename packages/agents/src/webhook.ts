@@ -15,7 +15,7 @@
 //
 // The other system posts to Restate's ingress, at `/<name>/webhook`.
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { sdk as restate } from 'restate-sessions/internal';
+import { sdk as restate } from '@restatedev/sessions/internal';
 import { deliver, hasCompanion } from './signals.ts';
 
 /** How a webhook is signed: the HMAC-SHA256 of its body with `secret`, in hex, in the request's `header`. */
@@ -26,7 +26,7 @@ export interface WebhookAuth {
   secret: string;
 }
 
-/** An agent (an `sessionObject()` or `agent()` of restate-agents, with a `chat` handler) that webhooks go to. */
+/** An agent (an `sessionObject()` or `agent()` of @restatedev/agents, with a `chat` handler) that webhooks go to. */
 type Route = restate.VirtualObjectDefinition<string, { chat: unknown }>;
 
 /**

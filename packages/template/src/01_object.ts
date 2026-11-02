@@ -17,7 +17,7 @@
  * Every lesson serves on port 9080, so stop this one before you start the
  * next, and register again.
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 // A session object: a virtual object that gets a database in the next lesson.
 const wallet = restate.sessionObject({

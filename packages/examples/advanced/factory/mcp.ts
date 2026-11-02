@@ -9,7 +9,7 @@
  */
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import * as restate from '@restatedev/restate-sdk';
-import { type Tool, tool } from 'restate-agents';
+import { type Tool, tool } from '@restatedev/agents';
 import { z } from 'zod';
 
 /** The tools of the MCP server at `url`, asked for once, when the endpoint starts. */

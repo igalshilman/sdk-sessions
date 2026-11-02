@@ -11,9 +11,9 @@
  *   npx @restatedev/restate deployments register http://localhost:9080
  *   curl localhost:8080/coordinator/alice/chat -d 'Write fizzbuzz.py and primes.py, and run them'
  */
-import { serve, subagent } from 'restate-agents';
-import * as opencode from 'restate-agents/opencode';
-import * as pi from 'restate-agents/pi';
+import { serve, subagent } from '@restatedev/agents';
+import * as opencode from '@restatedev/agents/opencode';
+import * as pi from '@restatedev/agents/pi';
 
 const workspace = process.env.WORKSPACE ?? '/tmp/coding';
 

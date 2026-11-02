@@ -4,7 +4,7 @@
 the whole OpenCode server in your process, with no HTTP listener. Here it
 runs in the agent's virtual object, and OpenCode's database (sessions,
 messages, the inbox, durable events) is an SQL database of the key's own,
-in the object's state beside `ctx.db` (`database` of restate-sessions): OpenCode
+in the object's state beside `ctx.db` (`database` of @restatedev/sessions): OpenCode
 boots only on a database that is empty or its own, so its tables are alone
 there, and `ctx.db` keeps the conversation's log and the tables of yours
 ([SQL in Restate virtual objects](../../../sessions/README.md)). The integration
@@ -14,8 +14,8 @@ OpenCode needs Node 24.
 ## Use
 
 ```ts
-import { serve } from 'restate-agents';
-import * as opencode from 'restate-agents/opencode';
+import { serve } from '@restatedev/agents';
+import * as opencode from '@restatedev/agents/opencode';
 
 const coder = opencode.agent({ name: 'coder', workspace: '/work/coder' });
 await serve(coder);
@@ -25,7 +25,7 @@ await serve(coder);
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `model`     | `provider/model-id`, of any provider OpenCode serves; or else `MODEL`, or else `openai/gpt-6-sol` (`OPENAI_API_KEY`)                                                                                                                                   |
 | `system`    | The system prompt                                                                                                                                                                                                                                      |
-| `tools`     | `tool()`s and Restate's tools of `restate-agents`, or OpenCode tools of your own (`OpenCodeTool`)                                                                                                                                                      |
+| `tools`     | `tool()`s and Restate's tools of `@restatedev/agents`, or OpenCode tools of your own (`OpenCodeTool`)                                                                                                                                                  |
 | `output`    | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers))                                                                                         |
 | `workspace` | A directory of the local machine to work in, with OpenCode's own tools (read, write, edit, bash, glob, grep...), or a function of the context that gives one (`(ctx) => \`/work/${ctx.key}\``); use a sandbox. Without one, the agent has only `tools` |
 | `plugins`   | OpenCode plugins of your own (`@opencode/plugin`), such as one that denies edits outside `src/` ([`examples/intermediate/review.ts`](../../../examples/intermediate/review.ts))                                                                        |
@@ -46,7 +46,7 @@ client.
 
 ## Through crashes
 
-[`db.ts`](db.ts) (`restate-agents/opencode/db`) boots OpenCode's embedded
+[`db.ts`](db.ts) (`@restatedev/agents/opencode/db`) boots OpenCode's embedded
 host on its database: an Effect `SqlClient` through
 `Database.configuredClient`, OpenCode's seam for an injected client, each
 OpenCode transaction an SQL transaction. The handler is not replayed: a
@@ -69,7 +69,7 @@ turn starts, and resumes every claimed turn when it boots.
   matters for a long one, such as a wait for an approval, since a suspension
   (after Restate's inactivity timeout) restarts the handler too.
 - **A tool's error fails the attempt**, and Restate retries it; a
-  `restate.TerminalError` of a `restate-agents` tool is its answer to the
+  `restate.TerminalError` of a `@restatedev/agents` tool is its answer to the
   model. The failed attempt stores nothing more, so its retry finds the call
   interrupted, as above.
 - **A message is answered once per invocation**: the invocation id is its
@@ -110,7 +110,7 @@ each with a workspace, under a pi coordinator.
 
 The tests run on a scripted model, [`test/fakes/opencode.ts`](../../test/fakes/opencode.ts),
 an AI SDK language model that OpenCode calls through a plugin's `language`
-hook, and makes a fresh tool call id for every call (`pnpm --filter restate-agents test opencode`,
+hook, and makes a fresh tool call id for every call (`pnpm --filter @restatedev/agents test opencode`,
 from the repository root):
 
 - [`test/storage/opencode.test.ts`](../../test/storage/opencode.test.ts):

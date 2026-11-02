@@ -1,8 +1,8 @@
 // Session objects without a Restate server: their definition, their
 // contexts, transactions with sends, and the types users write against.
 import assert from 'node:assert/strict';
-import * as restate from 'restate-sessions';
-import { type AttemptContext, cancelCalls, contextOf, invoke, reset, Schema } from 'restate-sessions/internal';
+import * as restate from '@restatedev/sessions';
+import { type AttemptContext, cancelCalls, contextOf, invoke, reset, Schema } from '@restatedev/sessions/internal';
 import { expectTypeOf, test, vi } from 'vitest';
 import { fakeContext, type Made, memoryDatabase } from './support.ts';
 

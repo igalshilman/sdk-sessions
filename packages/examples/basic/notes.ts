@@ -8,7 +8,7 @@
  *   curl localhost:8080/notes/alice/add --json '"Buy milk"'
  *   curl localhost:8080/notes/alice/list
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 const notes = restate.sessionObject({
   name: 'notes',

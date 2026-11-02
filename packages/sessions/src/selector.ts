@@ -10,10 +10,10 @@
 // is replayed, so a handler with SQL hands every awaited promise to one loop,
 // which asks the VM about all of them at once (`hookSelector`). The hook
 // replaces the invocation's `promisesExecutor.doProgress`: it relies on the
-// SDK's internals, as of the version this package pins (1.18.1).
+// SDK's internals, as of the version this package pins (1.18.2).
 //
 // TODO: drop the selector, and the pin, once an SDK release lets a handler
-// with explicit recovery await concurrently (FUTURE.md at the repository's root).
+// with explicit recovery await concurrently.
 import { setImmediate } from 'node:timers/promises';
 
 /** A future of the VM, as `do_progress` takes it. */
@@ -229,8 +229,8 @@ export function hookSelector(ctx: object): () => void {
   const missing = executor ? FIELDS.filter((field) => executor[field] === undefined) : ['promisesExecutor'];
   if (missing.length > 0 || typeof executor?.coreVm.do_progress !== 'function') {
     throw new Error(
-      `restate-sessions drives a handler's promises through the SDK's internals, which this SDK version does not have ` +
-        `(${missing.join(', ') || 'coreVm.do_progress'}): use the @restatedev/restate-sdk that restate-sessions pins`,
+      `@restatedev/sessions drives a handler's promises through the SDK's internals, which this SDK version does not have ` +
+        `(${missing.join(', ') || 'coreVm.do_progress'}): use the @restatedev/restate-sdk that @restatedev/sessions pins`,
     );
   }
   const { coreVm, outputPump, externalProgressChannel, runClosuresTracker, ephemeralRequestTracker } = executor;

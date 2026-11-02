@@ -22,7 +22,7 @@ import type {
   LanguageModelV3StreamPart,
 } from '@ai-sdk/provider';
 import { Model, Provider, type Plugin } from '@opencode/plugin';
-import type { openOpenCode } from 'restate-agents/opencode/db';
+import type { openOpenCode } from '@restatedev/agents/opencode/db';
 
 /** A reply of the teller: text, and maybe a tool call. */
 export interface Reply {
@@ -198,7 +198,7 @@ export const tellerPlugin: Plugin.Plugin = {
   },
 };
 
-/** `open` (restate-agents/opencode/db's openOpenCode), booting OpenCode with the teller too. */
+/** `open` (@restatedev/agents/opencode/db's openOpenCode), booting OpenCode with the teller too. */
 export const withTeller =
   (open: typeof openOpenCode): typeof openOpenCode =>
   (db, fence, options) =>

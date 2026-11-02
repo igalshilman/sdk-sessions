@@ -16,8 +16,8 @@ you give it.
 ## Use
 
 ```ts
-import { serve } from 'restate-agents';
-import * as claude from 'restate-agents/claude';
+import { serve } from '@restatedev/agents';
+import * as claude from '@restatedev/agents/claude';
 import { weather } from './weather.ts';
 
 const assistant = claude.agent({ name: 'assistant', system: 'Answer briefly.', tools: [weather] });
@@ -28,7 +28,7 @@ await serve(assistant);
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`     | `anthropic/model-id`; or else `MODEL`, or else `anthropic/claude-sonnet-5-5` (`ANTHROPIC_API_KEY`)                                                             |
 | `system`    | The system prompt                                                                                                                                              |
-| `tools`     | `tool()`s and Restate's tools of `restate-agents`, or the SDK's runnable tools (such as `betaZodTool`)                                                         |
+| `tools`     | `tool()`s and Restate's tools of `@restatedev/agents`, or the SDK's runnable tools (such as `betaZodTool`)                                                     |
 | `output`    | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
 | `client`    | The Anthropic client (a base URL or a proxy of your own, say); by default one with `ANTHROPIC_API_KEY`                                                         |
 | `maxTokens` | The most tokens of each of the model's replies (default 16000): a reply cut off there fails its message (a terminal error)                                     |
@@ -54,7 +54,7 @@ again from the start, with the stored messages.
   `run`, or `callId(context)` for the SDK's tools), which it passes on, such
   as in an idempotency key.
 - **A tool's error fails the attempt**, and Restate retries it; a
-  `restate.TerminalError` of a `restate-agents` tool is its answer to the
+  `restate.TerminalError` of a `@restatedev/agents` tool is its answer to the
   model.
 - **A message is answered once per invocation**: its answer is stored with
   the model's last reply, and a retried attempt returns it. A message that a
@@ -72,7 +72,7 @@ With a Restate server, and the agent registered with it: see
 ## Tests
 
 The tests run on a scripted model, [`test/fakes/claude.ts`](../../test/fakes/claude.ts)
-(`pnpm --filter restate-agents test claude`, from the repository root):
+(`pnpm --filter @restatedev/agents test claude`, from the repository root):
 
 - [`test/claude.test.ts`](../../test/claude.test.ts):
   each point above, with crashes that stop an attempt in a tool call, or at

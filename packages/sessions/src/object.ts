@@ -149,7 +149,7 @@ export function host(
   };
 }
 
-/** The SDK's contexts behind the session objects' contexts, for restate-sessions/internal. */
+/** The SDK's contexts behind the session objects' contexts, for @restatedev/sessions/internal. */
 export const sdkContexts = new WeakMap<
   SessionContext | ViewContext,
   restate.ObjectContext | restate.ObjectSharedContext

@@ -25,7 +25,7 @@ import { ServerWorkerd } from '@opencode/server/workerd';
 import { fromPromise } from '@opencode/core/plugin/promise';
 import { OpenCode } from '@opencode/sdk/effect';
 import type { Plugin } from '@opencode/plugin';
-import type { DatabaseWriter, Database, SqlValue } from 'restate-sessions';
+import type { DatabaseWriter, Database, SqlValue } from '@restatedev/sessions';
 
 /** Closed: every later statement fails. */
 export interface Fence {
@@ -43,7 +43,7 @@ const error = (operation: string, cause: unknown) =>
 
 /** The connection inside a transaction, for statements of that transaction. */
 const InTransaction = Context.Service<SqlClient.TransactionConnection, SqlClient.TransactionConnection.Service>(
-  'restate-agents/OpenCodeTransaction',
+  '@restatedev/agents/OpenCodeTransaction',
 );
 
 /**

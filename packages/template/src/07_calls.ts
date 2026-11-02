@@ -17,7 +17,7 @@
  *   curl localhost:8080/wallet/bob/claim --json '"ace"'     # fails: @ace belongs to alice
  *   curl localhost:8080/handle/ace/owner                    # "alice"
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 const handle = restate.sessionObject({
   name: 'handle',

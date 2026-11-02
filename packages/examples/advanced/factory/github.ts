@@ -6,7 +6,7 @@
  * With GITHUB_WEBHOOK_SECRET, the webhook's secret, an event GitHub did not
  * sign is refused. GitHub's events: https://docs.github.com/en/webhooks/webhook-events-and-payloads
  */
-import type { WebhookAuth, WebhookEvent } from 'restate-agents';
+import type { WebhookAuth, WebhookEvent } from '@restatedev/agents';
 import { byAnAgent } from './signatures.ts';
 import { coderOfBranch } from './workspace.ts';
 

@@ -1079,8 +1079,8 @@ async fn drive_completion(io: &KvIo, completion: turso_core::types::IOCompletion
 }
 
 // TODO: open the engine without transparent huge pages, once a turso release
-// lets its buffer arena do without `MADV_HUGEPAGE` (FUTURE.md at the
-// repository's root): a cold open's first read may wait for a huge page.
+// lets its buffer arena do without `MADV_HUGEPAGE`: a cold open's first read
+// may wait for a huge page.
 async fn open_engine(io: &Arc<KvIo>) -> Result<Arc<turso_core::Database>> {
     let mounted: Arc<dyn IO> = Arc::new(MountedIo(io.clone()));
     let file = mounted.open_file(DB_PATH, OpenFlags::Create, false)?;

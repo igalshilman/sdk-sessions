@@ -1,8 +1,8 @@
-// An object's schema (schema.ts of restate-sessions), without a Restate server: its
+// An object's schema (schema.ts of @restatedev/sessions), without a Restate server: its
 // steps, applied once per key by the handlers that open its database.
 import { randomUUID } from 'node:crypto';
-import * as restate from 'restate-sessions';
-import { open, Schema } from 'restate-sessions/internal';
+import * as restate from '@restatedev/sessions';
+import { open, Schema } from '@restatedev/sessions/internal';
 import { describe, expect, it } from 'vitest';
 import { memoryStore, sqlAttempt } from './support.ts';
 

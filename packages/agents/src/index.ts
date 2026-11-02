@@ -1,8 +1,8 @@
-// restate-agents: agent frameworks in Restate session objects. Each framework
-// is a subpath (restate-agents/pi, /opencode, /langgraph, /claude,
+// @restatedev/agents: agent frameworks in Restate session objects. Each framework
+// is a subpath (@restatedev/agents/pi, /opencode, /langgraph, /claude,
 // /deepseek); this is what they share: session objects, tools for
 // any of them, and the tools that are Restate itself.
-import { sdk as restate } from 'restate-sessions/internal';
+import { sdk as restate } from '@restatedev/sessions/internal';
 import { signals } from './signals.ts';
 
 export {

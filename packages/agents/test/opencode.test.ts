@@ -1,9 +1,9 @@
 // The agent's handler without a Restate server, through crashes of the
 // handler (see ../testing.ts): a crashed attempt gets no chance to store
 // anything on the way out. Its model is the teller (../fakes/opencode.ts).
-// `pnpm --filter restate-agents test opencode`.
+// `pnpm --filter @restatedev/agents test opencode`.
 import { describe, expect, it, vi } from 'vitest';
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 import { AttemptEnded } from '../src/common.ts';
 import {
   afterCancel,
@@ -20,11 +20,11 @@ import {
   SAID,
 } from './support.ts';
 import { reply as tellerReply, teller, withTeller } from './fakes/opencode.ts';
-import * as opencode from 'restate-agents/opencode';
+import * as opencode from '@restatedev/agents/opencode';
 import { prompt } from './opencode.ts';
-import type * as OpenCodeDb from 'restate-agents/opencode/db';
+import type * as OpenCodeDb from '@restatedev/agents/opencode/db';
 
-vi.mock('restate-agents/opencode/db', async (original) => {
+vi.mock('@restatedev/agents/opencode/db', async (original) => {
   const db = await original<typeof OpenCodeDb>();
   return { ...db, openOpenCode: withTeller(db.openOpenCode) };
 });

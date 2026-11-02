@@ -12,8 +12,8 @@
  * invocation of `checkins/send`; FOLLOW_UP_SECONDS=10 makes it come sooner.
  */
 import * as restate from '@restatedev/restate-sdk';
-import { send, serve } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { send, serve } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 // A stand-in for an email or a message to the customer.

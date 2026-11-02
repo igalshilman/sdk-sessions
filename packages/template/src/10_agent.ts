@@ -16,9 +16,9 @@
  *   curl localhost:8080/wallet/bob/chat -d 'What am I saving for?'       # bob's wallet has a conversation of its own
  *   curl localhost:8080/wallet/alice/messages                            # alice's conversation, 09's summaries included
  */
-import type * as restate from 'restate-sessions';
-import { sessionObject, serve } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import type * as restate from '@restatedev/sessions';
+import { sessionObject, serve } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 
 const balanceOf = async (db: restate.DatabaseReader) =>
   (await db.get<{ balance: number }>('SELECT coalesce(sum(amount), 0) AS balance FROM entries'))?.balance ?? 0;

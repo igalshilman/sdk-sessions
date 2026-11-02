@@ -1,9 +1,9 @@
 // The agent's handler without a Restate server, through crashes of the
 // handler (see ../testing.ts): the runner gets no chance to save anything on
-// the way out of a crashed attempt. `pnpm --filter restate-agents test claude`. Its client is the teller's (../fakes/claude.ts).
-import * as restate from 'restate-sessions';
+// the way out of a crashed attempt. `pnpm --filter @restatedev/agents test claude`. Its client is the teller's (../fakes/claude.ts).
+import * as restate from '@restatedev/sessions';
 import { describe, expect, it, vi } from 'vitest';
-import { CANCELLED, REFUSED, tool, UNANSWERED } from 'restate-agents';
+import { CANCELLED, REFUSED, tool, UNANSWERED } from '@restatedev/agents';
 import { z } from 'zod';
 import { AttemptEnded } from '../src/common.ts';
 import {
@@ -22,7 +22,7 @@ import {
   withoutIds,
 } from './support.ts';
 import { HttpError, teller } from './fakes/claude.ts';
-import * as claude from 'restate-agents/claude';
+import * as claude from '@restatedev/agents/claude';
 import { bank } from './bank.ts';
 import { prompt } from './claude.ts';
 

@@ -1,8 +1,8 @@
 // Test support: an object's state in memory, and an attempt of a handler over
-// it, with restate-sessions's own `ctx.db`, through crashes
+// it, with @restatedev/sessions's own `ctx.db`, through crashes
 // and fencing, without a Restate server.
 import { randomUUID } from 'node:crypto';
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 import {
   asDatabase,
   contextOf,
@@ -11,8 +11,8 @@ import {
   Attempt,
   type SqlHost,
   withAttempt,
-} from 'restate-sessions/internal';
-import type { AttemptContext, Store } from 'restate-sessions/internal';
+} from '@restatedev/sessions/internal';
+import type { AttemptContext, Store } from '@restatedev/sessions/internal';
 
 /**
  * A handler's `ctx.db` over `map` without the SDK, opened on its first call:
@@ -71,7 +71,7 @@ export interface AttemptOptions {
 }
 
 /**
- * `ctx.db` of an attempt, restate-sessions's own, over
+ * `ctx.db` of an attempt, @restatedev/sessions's own, over
  * `map`, and `end`, which runs the handler and ends the attempt's session
  * as an object's handler does. Each attempt is a database of its own in this
  * process (a namespace of its own), so that one a crash abandoned does not
@@ -198,7 +198,7 @@ const made = (c: restate.GenericCall<unknown, unknown> | restate.GenericSend<unk
   ...('delay' in c && c.delay !== undefined ? { delay: Number(c.delay) } : {}),
 });
 
-/** The context of one attempt of a session object's handler, for `invoke` of restate-sessions/internal. */
+/** The context of one attempt of a session object's handler, for `invoke` of @restatedev/sessions/internal. */
 export function fakeContext({
   map,
   key = 'k',

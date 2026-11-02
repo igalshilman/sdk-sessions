@@ -19,7 +19,7 @@
  *   curl localhost:8080/wallet/alice/spend --json '{"amount": 1000, "note": "a boat"}'   # fails: not enough money
  *   curl localhost:8080/wallet/alice/history                                            # lunch, but no boat
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 const balanceOf = async (db: restate.DatabaseReader) =>
   (await db.get<{ balance: number }>('SELECT coalesce(sum(amount), 0) AS balance FROM entries'))?.balance ?? 0;

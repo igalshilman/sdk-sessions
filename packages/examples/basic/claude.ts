@@ -11,8 +11,8 @@
  *   npx @restatedev/restate deployments register http://localhost:9080
  *   curl localhost:8080/assistant/alice/chat -d 'Hi, I am Alice. Is it warm in Lisbon?'
  */
-import { serve, tool } from 'restate-agents';
-import * as claude from 'restate-agents/claude';
+import { serve, tool } from '@restatedev/agents';
+import * as claude from '@restatedev/agents/claude';
 import { z } from 'zod';
 
 // A tool, for any framework's agent (the framework's own tools work too).

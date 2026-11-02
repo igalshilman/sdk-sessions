@@ -1,14 +1,14 @@
-// Session objects (restate-sessions), against a real Restate server: their
+// Session objects (@restatedev/sessions), against a real Restate server: their
 // handlers run with explicit recovery (a retried attempt starts over, against
 // the database as committed), and their operations are awaited concurrently,
-// with native or hand-written combinators (restate-sessions' promise selector
+// with native or hand-written combinators (@restatedev/sessions' promise selector
 // drives them all); a suspension waits for any of them, and a cancellation
 // reaches all of them. With lazy state, every page the database reads is a
 // request to the server. A wait is a call to a journaled service, `Helper`,
 // which sleeps.
 //
 //   pnpm --filter e2e concurrency   (RESTATE_SERVER=/path/to/restate-server to use another)
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, openSync } from 'node:fs';
 import { tmpdir } from 'node:os';

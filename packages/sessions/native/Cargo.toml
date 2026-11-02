@@ -3,7 +3,7 @@ name = "restate-sessions"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "The Node.js addon of restate-sessions: an object's SQLite-compatible database, kept in its Restate state"
+description = "The Node.js addon of @restatedev/sessions: an object's SQLite-compatible database, kept in its Restate state"
 
 # Its own workspace.
 [workspace]

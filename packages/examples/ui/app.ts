@@ -10,7 +10,7 @@
 //
 // Each user (`?user=alice`) is a conversation of its own: the agent's key.
 import * as clients from '@restatedev/restate-sdk-clients';
-import { agent, type ChatMessage, follow, type Part, type Status } from 'restate-agents/client';
+import { agent, type ChatMessage, follow, type Part, type Status } from '@restatedev/agents/client';
 
 // Restate's ingress, through the dev server's proxy (vite.config.ts).
 const restate = clients.connect({ url: `${location.origin}/ingress` });

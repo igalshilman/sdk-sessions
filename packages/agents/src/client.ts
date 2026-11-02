@@ -6,7 +6,7 @@
 // bundles it as it is.
 //
 //   import * as clients from '@restatedev/restate-sdk-clients';
-//   import { agent, follow } from 'restate-agents/client';
+//   import { agent, follow } from '@restatedev/agents/client';
 //
 //   const restate = clients.connect({ url: 'http://localhost:8080' });
 //   const alice = restate.objectClient(agent('assistant'), 'alice');

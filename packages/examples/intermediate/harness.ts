@@ -18,9 +18,9 @@
  * A model of another provider takes its API key, such as
  * `{"model": "anthropic/claude-sonnet-5-5"}` with ANTHROPIC_API_KEY.
  */
-import type * as restate from 'restate-sessions';
-import { sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import type * as restate from '@restatedev/sessions';
+import { sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 /** What a user sets up: the model, as `provider/model-id`, and a persona, the system prompt. */

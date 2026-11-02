@@ -12,7 +12,7 @@
 // task names that key them (`coder/ENG-1.parser`), and their answers (a
 // `Plan`, a `Built`, a `Review`). Each agent it finds there, it follows.
 import * as clients from '@restatedev/restate-sdk-clients';
-import { agent, type ChatMessage, follow, type Part, type Status } from 'restate-agents/client';
+import { agent, type ChatMessage, follow, type Part, type Status } from '@restatedev/agents/client';
 
 // Restate's ingress and its admin API (for its SQL), through the dev
 // server's proxy (vite.config.ts).

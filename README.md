@@ -3,11 +3,11 @@
 This repository adds two libraries to the [Restate](https://restate.dev)
 TypeScript SDK:
 
-- **[`restate-sessions`](packages/sessions/README.md)** gives every key of a
+- **[`@restatedev/sessions`](packages/sessions/README.md)** gives every key of a
   virtual object its own SQL database. We call these _session objects_, or
   _sessions_ for short. The database lives in Restate's state, so there is no
   separate database to run.
-- **[`restate-agents`](packages/agents/README.md)** runs AI agents inside
+- **[`@restatedev/agents`](packages/agents/README.md)** runs AI agents inside
   sessions, with each conversation stored in its session's database. It
   supports pi, OpenCode, LangGraph, Claude and the DeepSeek Harness.
 
@@ -23,7 +23,7 @@ database of up to 10 GiB. This one keeps notes per user
 ([`examples/basic/notes.ts`](packages/examples/basic/notes.ts)):
 
 ```ts
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 const notes = restate.sessionObject({
   name: 'notes',
@@ -63,7 +63,7 @@ Session handlers don't replay a journal after a failure. Restate simply runs
 the handler again from the start, against whatever the database holds by
 then. That means a handler should be safe to run twice, for example by
 recording a request or transfer id with its writes. The
-[`restate-sessions` README](packages/sessions/README.md) covers this, and
+[`@restatedev/sessions` README](packages/sessions/README.md) covers this, and
 how the storage works.
 
 ## Agents
@@ -103,7 +103,7 @@ curl localhost:8080/support/alice/signal --json '{"name": "approval", "value": "
 ```
 
 The same agent runs on any of the supported frameworks. See
-[`restate-agents`](packages/agents/README.md) and
+[`@restatedev/agents`](packages/agents/README.md) and
 [the examples](packages/examples/README.md).
 
 ### Your own tools and tables
@@ -113,13 +113,13 @@ database as the agent. This assistant stores what it learns about each user
 in a `facts` table next to the conversation, and exposes the table through a
 view that a profile page could call
 ([`examples/basic/memory.ts`](packages/examples/basic/memory.ts)). It is
-defined with `sessionObject` from `restate-agents`: `restate.sessionObject`
+defined with `sessionObject` from `@restatedev/agents`: `restate.sessionObject`
 plus the handlers every agent has (`status`, `stop`, `signal` and a few
 more):
 
 ```ts
-import { sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const remember = tool({
@@ -178,12 +178,12 @@ This is a pnpm workspace ([`pnpm-workspace.yaml`](pnpm-workspace.yaml)) with
 five packages. Each has its own README; the two libraries have their unit
 tests in `test/`.
 
-- [`packages/sessions`](packages/sessions/README.md): `restate-sessions`.
+- [`packages/sessions`](packages/sessions/README.md): `@restatedev/sessions`.
   The storage is a Rust addon in
   [`native/`](packages/sessions/native/README.md), whose README walks through
   [the layers](packages/sessions/native/README.md#inside-the-layers) from
   Restate's key/value state up to `ctx.db`.
-- [`packages/agents`](packages/agents/README.md): `restate-agents`, with an
+- [`packages/agents`](packages/agents/README.md): `@restatedev/agents`, with an
   integration per framework.
 - [`packages/template`](packages/template/README.md): the tutorial.
 - [`packages/examples`](packages/examples/README.md): small examples, each a
@@ -195,7 +195,7 @@ tests in `test/`.
 ## Requirements
 
 - Restate server 1.8 or later.
-- The published TypeScript SDK, version 1.18.1. `restate-sessions` pins it,
+- The published TypeScript SDK, version 1.18.2. `@restatedev/sessions` pins it,
   because it relies on some of the SDK's internals
   ([why](packages/sessions/README.md#concurrent-awaits)).
 
@@ -225,7 +225,7 @@ themselves: the 1.8.0 release from `@restatedev/restate-server`, or the binary
 in `RESTATE_SERVER` if you set it.
 
 ```sh
-pnpm --filter restate-agents test langgraph   # one framework's agent tests
+pnpm --filter @restatedev/agents test langgraph   # one framework's agent tests
 pnpm --filter e2e crash                       # agents and sessions through crashes
 pnpm --filter e2e concurrency                 # concurrent awaits without journal replay
 pnpm --filter e2e tools                       # Restate's own agent tools
@@ -241,16 +241,57 @@ The published packages are compiled to ESM JavaScript with type declarations
 in `dist/` (`pnpm --filter <package> build:ts`).
 
 The addon ships as one npm package per platform
-(`restate-sessions-<platform>`, in `packages/sessions/npm`), and
-`restate-sessions` lists them as optional dependencies, so a package manager
+(`@restatedev/sessions-<platform>`, in `packages/sessions/npm`), and
+`@restatedev/sessions` lists them as optional dependencies, so a package manager
 installs only the one for its machine. CI builds them for Linux (x64 and
 arm64, glibc 2.35 or later) and macOS on Apple silicon, and installs the
 packed packages on each
-([`packages.yml`](.github/workflows/packages.yml)). `restate-agents` lists
+([`packages.yml`](.github/workflows/packages.yml)). `@restatedev/agents` lists
 each framework as an optional peer dependency, so a project installs only
 the frameworks it uses ([which ones](packages/agents/README.md#choose-a-framework)).
 
 ```sh
-pnpm --filter restate-sessions build:dist   # the addon as published: smaller and fully optimized (takes minutes)
+pnpm --filter @restatedev/sessions build:dist   # the addon as published: smaller and fully optimized (takes minutes)
 pnpm --filter e2e packaging                 # pack, lint and install both packages into a fresh project
 ```
+
+### Releasing
+
+The published packages (the two libraries and the addon's package per
+platform: every package of the workspace without `private`) are released
+together, with one version. Release notes are generated in the GitHub
+release: edit them there.
+
+1. On `main`, with a clean tree, prepare the release commit and tag (nothing
+   is pushed):
+   ```sh
+   .tools/prepare-release.sh 0.2.0
+   ```
+2. Push the commit and the tag; the script prints the exact command:
+   ```sh
+   git push --atomic origin HEAD:main v0.2.0
+   ```
+3. The tag triggers [`release.yml`](.github/workflows/release.yml), which
+   checks that every package carries the tag's version, runs the checks and
+   builds the packages on the tagged commit (the addon for each platform,
+   every package packed and installed on each), publishes those tarballs to
+   npm and creates the GitHub release.
+
+**Pre-releases:** a version such as `0.3.0-rc.1` is published under its
+identifier as npm dist-tag (`rc`), never `latest`, and marked a pre-release
+on GitHub.
+
+**Backports:** run the script on a `release-*` branch and push there. A
+version below npm's `latest` is published under the `release-<major>.<minor>`
+dist-tag instead.
+
+**Retrying:** if a job fails (a flaky test), re-run the failed jobs of the
+run, or run the workflow by hand on the tag. Packages already on npm at that
+version are skipped.
+
+**npm:** the workflow publishes through [trusted
+publishing](https://docs.npmjs.com/trusted-publishers) (no token), so each
+package on npmjs.com lists this repository's `release.yml` as its trusted
+publisher. A package that is not on npm yet cannot be created that way:
+download the run's `packages` artifact and `npm publish` its tarball with a
+token once, then re-run the `release` job.

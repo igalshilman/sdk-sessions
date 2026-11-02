@@ -175,8 +175,8 @@ function objectStore(
       throw error;
     });
   // TODO: read with protocol v8's ephemeral get, left out of the journal, once
-  // a Restate release ships v8 and the SDK lets a library make one (FUTURE.md
-  // at the repository's root). Restate 1.8 negotiates v7 at most: a journaled get.
+  // a Restate release ships v8 and the SDK lets a library make one. Restate 1.8
+  // negotiates v7 at most: a journaled get.
   const get = async (key: string) => (await request(ctx.get(keyOf(key), serde.binary, named(keyOf(key))))) ?? undefined;
   if (ctx.shared) return { get, set: refusedWrite, clear: refusedWrite, sync: async () => {} };
   return {

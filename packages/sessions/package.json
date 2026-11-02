@@ -1,8 +1,13 @@
 {
-  "name": "restate-sessions",
+  "name": "@restatedev/sessions",
   "version": "0.1.0",
-  "private": true,
   "description": "Session objects on Restate: virtual objects with a SQL database per key, kept in the object's state (ctx.db)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/restatedev/sdk-sessions.git",
+    "directory": "packages/sessions"
+  },
   "files": [
     "dist",
     "src"
@@ -38,13 +43,13 @@
     "prepack": "pnpm build:ts"
   },
   "dependencies": {
-    "@restatedev/restate-sdk": "1.18.1",
-    "@restatedev/restate-sdk-core": "1.18.1"
+    "@restatedev/restate-sdk": "1.18.2",
+    "@restatedev/restate-sdk-core": "1.18.2"
   },
   "optionalDependencies": {
-    "restate-sessions-darwin-arm64": "workspace:*",
-    "restate-sessions-linux-arm64-gnu": "workspace:*",
-    "restate-sessions-linux-x64-gnu": "workspace:*"
+    "@restatedev/sessions-darwin-arm64": "workspace:*",
+    "@restatedev/sessions-linux-arm64-gnu": "workspace:*",
+    "@restatedev/sessions-linux-x64-gnu": "workspace:*"
   },
   "engines": {
     "node": ">=24"

@@ -116,7 +116,7 @@ struct Workload {
 }
 
 const WORKLOADS: [Workload; 11] = [
-    // A restate-sessions object: a message row, and its sends in the outbox.
+    // A @restatedev/sessions object: a message row, and its sends in the outbox.
     Workload {
         name: "chat+outbox",
         rows: 0,

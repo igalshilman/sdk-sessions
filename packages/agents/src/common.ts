@@ -2,8 +2,8 @@
 // ids of an invocation's prompts, the `chat` handler with its turn (status,
 // cancellation, steering, publishing for the clients that follow it), and
 // the `messages` handler with its `Transcript`.
-import * as restate from 'restate-sessions';
-import { cancelCalls, cancelled } from 'restate-sessions/internal';
+import * as restate from '@restatedev/sessions';
+import { cancelCalls, cancelled } from '@restatedev/sessions/internal';
 import { settle } from './calls.ts';
 import * as log from './log.ts';
 import type { Said } from './log.ts';
@@ -287,7 +287,7 @@ export const aborted = (signal: AbortSignal) =>
  *
  * While it answers, the object's `status` says so (its {@link Turn}). Its
  * invocation's cancellation (Restate's, explicit: `cancelled(ctx)` of
- * restate-sessions/internal) aborts {@link stopSignalOf} its
+ * @restatedev/sessions/internal) aborts {@link stopSignalOf} its
  * context, whenever it comes, and cancels the calls its tools made
  * (`cancelCalls(ctx)`): the agent's `prompt`
  * ends the turn, and the handler fails with a `restate.CancelledError`. An

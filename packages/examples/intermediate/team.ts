@@ -13,10 +13,10 @@
  *   curl localhost:8080/editor/alice/chat -d 'Write a short guide to Lisbon for a first visit.'
  *   curl localhost:8080/writer/alice.guide/messages   # what the editor asked the writer (the task's name may differ)
  */
-import { serve, subagent } from 'restate-agents';
-import * as langgraph from 'restate-agents/langgraph';
-import * as opencode from 'restate-agents/opencode';
-import * as pi from 'restate-agents/pi';
+import { serve, subagent } from '@restatedev/agents';
+import * as langgraph from '@restatedev/agents/langgraph';
+import * as opencode from '@restatedev/agents/opencode';
+import * as pi from '@restatedev/agents/pi';
 
 const researcher = langgraph.agent({
   name: 'researcher',

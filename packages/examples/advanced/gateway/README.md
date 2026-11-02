@@ -70,10 +70,5 @@ With `WORKSPACE` set, each agent object gets a directory of its own,
 disk, not in Restate: the conversation outlives a lost disk, its files do
 not. `bash` runs any command, so run it in a sandbox.
 
-The image's model is `openai/gpt-6-luna`: give it `OPENAI_API_KEY`.
-
-In Docker: [`Dockerfile`](Dockerfile), published as
-`ghcr.io/igalshilman/tool-gateway`, serves the endpoint on 9080.
-
 [`gateway.test.ts`](gateway.test.ts) tests its parts
 without a Restate server (`pnpm --filter examples test gateway`).

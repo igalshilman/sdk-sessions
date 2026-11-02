@@ -6,7 +6,7 @@
  * or else a git repository standing in for it; and WORKSPACE, where the
  * coders work (/tmp/restate-factory by default).
  */
-import { type Tool, tool, type WebhookAuth } from 'restate-agents';
+import { type Tool, tool, type WebhookAuth } from '@restatedev/agents';
 import { z } from 'zod';
 import { pullRequestMark } from './github.ts';
 import { mcpTools } from './mcp.ts';

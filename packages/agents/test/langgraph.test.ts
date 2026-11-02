@@ -1,10 +1,10 @@
 // The agent's handler without a Restate server, through crashes of the
 // handler (see ../testing.ts): LangGraph gets no chance to save anything on the
-// way out of a crashed attempt. `pnpm --filter restate-agents test langgraph`. Its model is the teller (../fakes/langgraph.ts).
+// way out of a crashed attempt. `pnpm --filter @restatedev/agents test langgraph`. Its model is the teller (../fakes/langgraph.ts).
 import { describe, expect, it, vi } from 'vitest';
 import * as restate from '@restatedev/restate-sdk';
-import type { ViewContext } from 'restate-sessions';
-import { CANCELLED, REFUSED, UNANSWERED } from 'restate-agents';
+import type { ViewContext } from '@restatedev/sessions';
+import { CANCELLED, REFUSED, UNANSWERED } from '@restatedev/agents';
 import { AttemptEnded } from '../src/common.ts';
 import {
   afterCancel,
@@ -20,7 +20,7 @@ import {
   SAID,
 } from './support.ts';
 import { Teller } from './fakes/langgraph.ts';
-import * as langgraph from 'restate-agents/langgraph';
+import * as langgraph from '@restatedev/agents/langgraph';
 import { prompt } from './langgraph.ts';
 import { bank } from './bank.ts';
 

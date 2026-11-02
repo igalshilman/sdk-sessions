@@ -1,10 +1,10 @@
 // A thread forked from an earlier checkpoint, on checkpointer.ts: each branch
-// keeps its own channel values. `pnpm --filter restate-agents test langgraph`.
+// keeps its own channel values. `pnpm --filter @restatedev/agents test langgraph`.
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
-import { asDatabase, open } from 'restate-sessions/internal';
+import { asDatabase, open } from '@restatedev/sessions/internal';
 import { describe, expect, it } from 'vitest';
-import { memoryStore } from 'restate-sessions/test/support';
-import { SqlCheckpointSaver } from 'restate-agents/langgraph';
+import { memoryStore } from '@restatedev/sessions/test/support';
+import { SqlCheckpointSaver } from '@restatedev/agents/langgraph';
 
 const State = Annotation.Root({ text: Annotation<string> });
 

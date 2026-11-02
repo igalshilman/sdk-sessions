@@ -18,8 +18,8 @@
 // model makes it again), unless the call answered with that error: a
 // terminal error is its result too. Once stored, the model has its result,
 // and an identical call it makes later is a call of its own.
-import type * as restate from 'restate-sessions';
-import { Schema } from 'restate-sessions/internal';
+import type * as restate from '@restatedev/sessions';
+import { Schema } from '@restatedev/sessions/internal';
 import { randomUUID } from 'node:crypto';
 
 /** A tool's call: the tool, its input as JSON, the ids it was made with (the first is its own), and the attempt that last made it. */

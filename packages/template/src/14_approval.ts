@@ -20,9 +20,9 @@
  * `/send` sends the message without waiting for the answer, which waits for
  * the confirmation.
  */
-import * as restate from 'restate-sessions';
-import { sessionObject, serve, signal, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import * as restate from '@restatedev/sessions';
+import { sessionObject, serve, signal, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const balanceOf = async (db: restate.DatabaseReader) =>

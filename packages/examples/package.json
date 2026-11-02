@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Restate session objects, and agents in them: each a file you run with node",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "vitest run"
@@ -15,10 +16,10 @@
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
     "@opencode/plugin": "2.0.32",
-    "@restatedev/restate-sdk": "1.18.1",
-    "@restatedev/restate-sdk-clients": "1.18.1",
-    "restate-agents": "workspace:*",
-    "restate-sessions": "workspace:*",
+    "@restatedev/agents": "workspace:*",
+    "@restatedev/restate-sdk": "1.18.2",
+    "@restatedev/restate-sdk-clients": "1.18.2",
+    "@restatedev/sessions": "workspace:*",
     "zod": "4.6.5"
   },
   "devDependencies": {

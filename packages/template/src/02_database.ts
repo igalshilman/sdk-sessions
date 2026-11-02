@@ -14,7 +14,7 @@
  *   curl localhost:8080/wallet/alice/deposit --json 5    # 15
  *   curl localhost:8080/wallet/bob/deposit --json 7      # 7
  */
-import * as restate from 'restate-sessions';
+import * as restate from '@restatedev/sessions';
 
 const wallet = restate.sessionObject({
   name: 'wallet',

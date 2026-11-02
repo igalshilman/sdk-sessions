@@ -11,7 +11,7 @@
 // The agents get the same prompts. Each request is resent until answered,
 // some twice.
 //
-// The agents' models are the scripted tellers (restate-agents/test/fakes/fakes.ts), which need
+// The agents' models are the scripted tellers (@restatedev/agents/test/fakes/fakes.ts), which need
 // no API key: "move 5 from 1 to 2" makes a transfer.
 //
 // Checks: the warehouses' books balance and agree with every order, and every
@@ -26,9 +26,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import type { ChildProcess } from 'node:child_process';
-import type { Messages } from 'restate-agents';
-import type { Audit } from 'restate-sessions/test/ledger';
-import type { Order, Reservation } from 'restate-sessions/test/shop';
+import type { Messages } from '@restatedev/agents';
+import type { Audit } from '@restatedev/sessions/test/ledger';
+import type { Order, Reservation } from '@restatedev/sessions/test/shop';
 import { RESTATE_SERVER as SERVER } from './restate-server.ts';
 
 const INGRESS = 'http://127.0.0.1:8080';
@@ -55,7 +55,7 @@ const PROCESSES: Process[] = [
 // The agents: the pi one, the LangGraph one, the Claude one, the DeepSeek
 // Harness one and the OpenCode one, with the same prompts.
 const AGENTS = ['Agent', 'GraphAgent', 'ClaudeAgent', 'DeepSeekAgent', 'OpenCodeAgent'];
-const FAKES = fileURLToPath(import.meta.resolve('restate-agents/test/fakes/fakes'));
+const FAKES = fileURLToPath(import.meta.resolve('@restatedev/agents/test/fakes/fakes'));
 const EXPIRY_MS = 1500;
 const SKUS = ['apple', 'pear', 'plum'];
 const STOCK = 20;

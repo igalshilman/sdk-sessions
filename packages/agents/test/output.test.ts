@@ -4,9 +4,9 @@
 // with it. On pi's chat, with a fake model (../fakes/pi.ts), and Claude's
 // (the teller's client, ../fakes/claude.ts); the others share the same code
 // (output.ts).
-import * as restate from 'restate-sessions';
-import * as claude from 'restate-agents/claude';
-import * as pi from 'restate-agents/pi';
+import * as restate from '@restatedev/sessions';
+import * as claude from '@restatedev/agents/claude';
+import * as pi from '@restatedev/agents/pi';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { teller } from './fakes/claude.ts';

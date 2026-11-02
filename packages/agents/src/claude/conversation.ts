@@ -7,8 +7,8 @@
 // the stored messages, and stores each message the runner adds.
 
 import type Anthropic from '@anthropic-ai/sdk';
-import type { Database } from 'restate-sessions';
-import { Schema } from 'restate-sessions/internal';
+import type { Database } from '@restatedev/sessions';
+import { Schema } from '@restatedev/sessions/internal';
 
 type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 

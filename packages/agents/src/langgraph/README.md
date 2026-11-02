@@ -9,8 +9,8 @@ the object's key.
 ## Use
 
 ```ts
-import { serve } from 'restate-agents';
-import * as langgraph from 'restate-agents/langgraph';
+import { serve } from '@restatedev/agents';
+import * as langgraph from '@restatedev/agents/langgraph';
 import { weather } from './weather.ts';
 
 const assistant = langgraph.agent({ name: 'assistant', system: 'Answer briefly.', tools: [weather] });
@@ -21,7 +21,7 @@ await serve(assistant);
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `model`  | `openai/model-id` (`ChatOpenAI`) or `anthropic/model-id` (`ChatAnthropic`); or else `MODEL`, or else `openai/gpt-6-sol` (`OPENAI_API_KEY`); or any LangChain chat model that calls tools |
 | `system` | The system prompt                                                                                                                                                                        |
-| `tools`  | `tool()`s and Restate's tools of `restate-agents`, or LangChain's tools                                                                                                                  |
+| `tools`  | `tool()`s and Restate's tools of `@restatedev/agents`, or LangChain's tools                                                                                                              |
 | `output` | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers))                           |
 
 For a session object of your own, `langgraph.chat(options)` is the handler and
@@ -51,7 +51,7 @@ step it stored.
   `run`), which it passes on, such as in an idempotency key.
 - **A tool's error fails the attempt**, and Restate retries it (the ToolNode
   would hand it to the model); a `restate.TerminalError` of a
-  `restate-agents` tool is its answer to the model, and so are arguments
+  `@restatedev/agents` tool is its answer to the model, and so are arguments
   that do not fit a tool, and a call of a tool the agent does not have.
 - **A message is answered once per invocation**: the graph records each
   answer in its state, by invocation id, and a retried attempt returns it. A
@@ -70,7 +70,7 @@ With a Restate server, and the agent registered with it: see
 ## Tests
 
 The tests run on a scripted model, [`test/fakes/langgraph.ts`](../../test/fakes/langgraph.ts)
-(`pnpm --filter restate-agents test langgraph`, from the repository root):
+(`pnpm --filter @restatedev/agents test langgraph`, from the repository root):
 
 - [`test/storage/langgraph.test.ts`](../../test/storage/langgraph.test.ts):
   LangGraph's checkpointer conformance suite

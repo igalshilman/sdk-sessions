@@ -3,8 +3,8 @@
  * the project's directory): the plan, a table of the project's database that
  * the pair keeps up to date as it works.
  */
-import { tool } from 'restate-agents';
-import type { DatabaseReader } from 'restate-sessions';
+import { tool } from '@restatedev/agents';
+import type { DatabaseReader } from '@restatedev/sessions';
 import { z } from 'zod';
 
 /** The plan's table, the project's own, beside the agent's: the pair's schema. */

@@ -11,8 +11,8 @@
  *   curl localhost:8080/assistant/alice/chat -d 'Suggest a restaurant for tonight.'
  *   curl localhost:8080/assistant/alice/facts
  */
-import { sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const remember = tool({

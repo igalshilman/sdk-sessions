@@ -2,21 +2,21 @@
 // line (ledger, shop, agent, langgraph, claude, deepseek, opencode), such as
 // `node serve.ts ledger shop`; with the agents' `signals` object.
 import * as restate from '@restatedev/restate-sdk';
-import { signals } from 'restate-agents';
+import { signals } from '@restatedev/agents';
 
 type Services = restate.ServeOptions['services'];
 
 const groups: Record<string, () => Promise<Services>> = {
-  ledger: async () => [(await import('restate-sessions/test/ledger')).ledger],
+  ledger: async () => [(await import('@restatedev/sessions/test/ledger')).ledger],
   shop: async () => {
-    const { warehouse, orders } = await import('restate-sessions/test/shop');
+    const { warehouse, orders } = await import('@restatedev/sessions/test/shop');
     return [warehouse, orders];
   },
-  agent: async () => [(await import('restate-agents/test/pi')).agent],
-  langgraph: async () => [(await import('restate-agents/test/langgraph')).agent],
-  claude: async () => [(await import('restate-agents/test/claude')).agent],
-  deepseek: async () => [(await import('restate-agents/test/deepseek')).agent],
-  opencode: async () => [(await import('restate-agents/test/opencode')).agent],
+  agent: async () => [(await import('@restatedev/agents/test/pi')).agent],
+  langgraph: async () => [(await import('@restatedev/agents/test/langgraph')).agent],
+  claude: async () => [(await import('@restatedev/agents/test/claude')).agent],
+  deepseek: async () => [(await import('@restatedev/agents/test/deepseek')).agent],
+  opencode: async () => [(await import('@restatedev/agents/test/opencode')).agent],
 };
 const names = process.argv.length > 2 ? process.argv.slice(2) : Object.keys(groups);
 const services = (

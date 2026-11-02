@@ -1,4 +1,4 @@
-// The bank tools, once for every framework (restate-agents' `tool()`): they
+// The bank tools, once for every framework (@restatedev/agents' `tool()`): they
 // move money in the ledger (../../sessions/test/ledger.ts), with the tool call id as the
 // transfer id (prefixed with the agent's name and key: the ledger is shared),
 // so a tool call run again after a crash moves the money once; and each call
@@ -8,10 +8,10 @@
 // A framework that gives a tool call cut off by a crash a new id (OpenCode,
 // the DeepSeek Harness) has the model retry it with `retryOf`, the id of the
 // call it retries.
-import type * as restate from 'restate-sessions';
-import { tool } from 'restate-agents';
+import type * as restate from '@restatedev/sessions';
+import { tool } from '@restatedev/agents';
 import { z } from 'zod';
-import { ledger } from 'restate-sessions/test/ledger';
+import { ledger } from '@restatedev/sessions/test/ledger';
 
 /** The ledger. */
 const books = (ctx: restate.SessionContext, idempotencyKey: string) => ctx.rpc(ledger, 'bank', { idempotencyKey });

@@ -30,7 +30,7 @@ export type Reply =
   | { text: string; call?: undefined }
   | { text?: undefined; call: { id: ToolCallId; name: string; args: Record<string, unknown> } };
 
-/** How the agent asks to finish an interrupted prompt (restate-agents/deepseek's CONTINUE). */
+/** How the agent asks to finish an interrupted prompt (@restatedev/agents/deepseek's CONTINUE). */
 const CONTINUE = /^Continue: your last turn was interrupted/;
 
 /** The teller's reply to `messages`: `{ text }`, or `{ call: { id, name, args } }`. */

@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Tests against a real Restate server: the agents and sessions through crashes, the context without journal replay, Restate's own agent tools, and the SQL benchmark; and the packages as a user installs them",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "crash": "node crash.ts",
@@ -14,10 +15,10 @@
   },
   "dependencies": {
     "@earendil-works/pi-ai": "1.4.0",
-    "@restatedev/restate-sdk": "1.18.1",
-    "@restatedev/restate-sdk-clients": "1.18.1",
-    "restate-agents": "workspace:*",
-    "restate-sessions": "workspace:*",
+    "@restatedev/agents": "workspace:*",
+    "@restatedev/restate-sdk": "1.18.2",
+    "@restatedev/restate-sdk-clients": "1.18.2",
+    "@restatedev/sessions": "workspace:*",
     "zod": "4.6.5"
   },
   "devDependencies": {

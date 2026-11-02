@@ -18,8 +18,8 @@
  * or the oldest wait for an approval: `{"name": "approval", "value": "approved"}`.
  */
 import * as restate from '@restatedev/restate-sdk';
-import { call, serve, signal, workflow } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import { call, serve, signal, workflow } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 // A plain Restate service.

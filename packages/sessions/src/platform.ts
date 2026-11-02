@@ -1,5 +1,5 @@
-// The platforms restate-sessions ships its addon for, each a package of its
-// own (npm/<platform>, `restate-sessions-<platform>`) that restate-sessions
+// The platforms @restatedev/sessions ships its addon for, each a package of its
+// own (npm/<platform>, `@restatedev/sessions-<platform>`) that @restatedev/sessions
 // depends on optionally: a package manager installs the one of its machine
 // alone (by the `os`, `cpu` and `libc` of each). The CI builds them
 // (.github/workflows/packages.yml); `pnpm build` builds this machine's.

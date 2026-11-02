@@ -3,17 +3,17 @@
 // caller waits. LangGraph's agent takes a chat model of its own, here one that
 // fails as a provider would.
 import * as restate from '@restatedev/restate-sdk';
-import { chatHandler, sessionObject, REFUSED, tool } from 'restate-agents';
-import * as deepseek from 'restate-agents/deepseek';
-import * as langgraph from 'restate-agents/langgraph';
-import * as opencode from 'restate-agents/opencode';
-import * as pi from 'restate-agents/pi';
+import { chatHandler, sessionObject, REFUSED, tool } from '@restatedev/agents';
+import * as deepseek from '@restatedev/agents/deepseek';
+import * as langgraph from '@restatedev/agents/langgraph';
+import * as opencode from '@restatedev/agents/opencode';
+import * as pi from '@restatedev/agents/pi';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { tool as langchainTool } from '@langchain/core/tools';
 import { Teller } from './fakes/langgraph.ts';
-import { invoke } from 'restate-sessions/internal';
-import { fakeContext } from 'restate-sessions/test/support';
+import { invoke } from '@restatedev/sessions/internal';
+import { fakeContext } from '@restatedev/sessions/test/support';
 import { conversation } from './support.ts';
 
 /** The Anthropic SDK's error of a wrong API key. */
@@ -108,7 +108,7 @@ describe('a wrong model', () => {
   });
 
   it("that pi does not know fails as terminal outside an agent's handlers too", async () => {
-    // As in a handler of restate-sessions' own: no chatHandler or sessionObject() maps it.
+    // As in a handler of @restatedev/sessions' own: no chatHandler or sessionObject() maps it.
     const ctx = {} as Parameters<typeof pi.withPi>[0];
     const failed = pi.withPi(ctx, { model: 'nobody/gpt-6-sol' }, async () => 'answered');
     await expect(failed).rejects.toBeInstanceOf(restate.TerminalError);

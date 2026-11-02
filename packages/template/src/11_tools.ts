@@ -13,9 +13,9 @@
  *   OPENAI_API_KEY=… node src/11_tools.ts   # and register it (see 01)
  *   curl localhost:8080/wallet/alice/chat -d 'How much do I have, and what did I spend money on?'
  */
-import * as restate from 'restate-sessions';
-import { sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import * as restate from '@restatedev/sessions';
+import { sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const balanceOf = async (db: restate.DatabaseReader) =>

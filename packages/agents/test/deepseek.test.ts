@@ -1,11 +1,11 @@
 // The agent's handler without a Restate server, through crashes of the
 // handler (see ../testing.ts): the harness gets no chance to store anything on
 // the way out of a crashed attempt, and the next attempt fences it, as Restate
-// does. Its model is the teller (../fakes/deepseek.ts). `pnpm --filter restate-agents test deepseek`.
+// does. Its model is the teller (../fakes/deepseek.ts). `pnpm --filter @restatedev/agents test deepseek`.
 import { describe, expect, it, vi } from 'vitest';
 import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 import * as restate from '@restatedev/restate-sdk';
-import { REFUSED } from 'restate-agents';
+import { REFUSED } from '@restatedev/agents';
 import { AttemptEnded } from '../src/common.ts';
 import {
   afterCancel,
@@ -21,7 +21,7 @@ import {
   SAID,
 } from './support.ts';
 import { teller } from './fakes/deepseek.ts';
-import * as deepseek from 'restate-agents/deepseek';
+import * as deepseek from '@restatedev/agents/deepseek';
 import { prompt } from './deepseek.ts';
 
 vi.mock('@deepseek-ai/dsh-llm-deepseek-api-key', () => import('./fakes/deepseek.ts'));

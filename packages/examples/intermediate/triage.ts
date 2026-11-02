@@ -13,9 +13,9 @@
  *   curl localhost:8080/restate/workflow/triage/t1/output              # what went out
  */
 import * as restate from '@restatedev/restate-sdk';
-import { serve } from 'restate-agents';
-import * as langgraph from 'restate-agents/langgraph';
-import * as pi from 'restate-agents/pi';
+import { serve } from '@restatedev/agents';
+import * as langgraph from '@restatedev/agents/langgraph';
+import * as pi from '@restatedev/agents/pi';
 
 const classifier = langgraph.agent({
   name: 'classifier',

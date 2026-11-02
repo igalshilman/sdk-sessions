@@ -1,12 +1,12 @@
-// The bank agent on the DeepSeek Harness (restate-agents/deepseek): a DeepSeekAgent object per conversation, whose tools
+// The bank agent on the DeepSeek Harness (@restatedev/agents/deepseek): a DeepSeekAgent object per conversation, whose tools
 // (./bank.ts) move money in the ledger.
 //
 // Environment: PORT (default 9080), DEEPSEEK_API_KEY, MODEL, and ABORT_PER_MILLE (see
 // ../faults.ts).
-import { sessionObject, signals } from 'restate-agents';
-import * as deepseek from 'restate-agents/deepseek';
-import { serveIfMain } from 'restate-sessions/test/faults';
-import { ledger } from 'restate-sessions/test/ledger';
+import { sessionObject, signals } from '@restatedev/agents';
+import * as deepseek from '@restatedev/agents/deepseek';
+import { serveIfMain } from '@restatedev/sessions/test/faults';
+import { ledger } from '@restatedev/sessions/test/ledger';
 import { bank } from './bank.ts';
 
 /** Answer a message, once per invocation. */

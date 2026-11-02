@@ -13,9 +13,9 @@
  *   curl localhost:8080/wallet/bob/history                              # ends with 20, from alice
  *   curl localhost:8080/wallet/alice/chat -d 'Now send him a million.'  # the tool answers "Not enough money"
  */
-import * as restate from 'restate-sessions';
-import { sessionObject, serve, tool } from 'restate-agents';
-import * as pi from 'restate-agents/pi';
+import * as restate from '@restatedev/sessions';
+import { sessionObject, serve, tool } from '@restatedev/agents';
+import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
 
 const balanceOf = async (db: restate.DatabaseReader) =>
