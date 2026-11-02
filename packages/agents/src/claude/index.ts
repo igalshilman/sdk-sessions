@@ -35,17 +35,18 @@ import {
   CLAUDE_MODEL,
   type Configure,
   configured,
+  fromTool,
   messagesHandler,
   modelIdOf,
   modelOf,
   nextPromptId,
+  refusal,
   stopSignalOf,
+  storedAnswer,
   toolCallEnded,
   toolCallStarted,
-  Transcript,
   transcribing,
-  refusal,
-  storedAnswer,
+  Transcript,
   UNANSWERED,
 } from '../common.ts';
 import { type Answer, withOutput } from '../output.ts';
@@ -74,6 +75,7 @@ function failing(tools: BetaRunnableTool[]) {
         try {
           return await tool.run(args, context);
         } catch (e) {
+          fromTool(e);
           failure ??= e;
           throw e;
         }

@@ -41,18 +41,19 @@ import {
   chatHandler,
   type Configure,
   configured,
+  fromTool,
   messagesHandler,
   ModelError,
   modelOf,
   nextPromptId,
   providerOf,
+  refusal,
   stopSignalOf,
+  storedAnswer,
   toolCallEnded,
   toolCallStarted,
-  Transcript,
   transcribing,
-  refusal,
-  storedAnswer,
+  Transcript,
   UNANSWERED,
 } from '../common.ts';
 import { type Answer, withOutput } from '../output.ts';
@@ -105,7 +106,10 @@ const failing = (t: StructuredToolInterface, failed: (error: unknown) => void): 
         try {
           return await t.invoke(...args);
         } catch (error) {
-          if (!(error instanceof ToolInputParsingException) && !isGraphInterrupt(error)) failed(error);
+          if (!(error instanceof ToolInputParsingException) && !isGraphInterrupt(error)) {
+            fromTool(error);
+            failed(error);
+          }
           throw error;
         }
       },

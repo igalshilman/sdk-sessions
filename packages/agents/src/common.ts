@@ -364,6 +364,19 @@ export class ToolError extends Error {
   }
 }
 
+/** The errors a framework's own tools (not `tool()`'s) failed with: see {@link fromTool}. */
+const toolErrors = new WeakSet<object>();
+
+/**
+ * `error` is a tool's: a framework's own tool (Claude's, LangChain's...)
+ * that failed, whose error is never taken for the model's provider refusing
+ * (a tool that calls a model API may fail as one does). `tool()`'s are
+ * {@link ToolError}s.
+ */
+export function fromTool(error: unknown) {
+  if (typeof error === 'object' && error !== null) toolErrors.add(error);
+}
+
 /** The Anthropic SDK's errors of a request that fails again however often it is made. */
 const FOR_GOOD = new Set(['AuthenticationError', 'PermissionDeniedError', 'NotFoundError', 'BadRequestError']);
 
@@ -373,7 +386,8 @@ const FOR_GOOD = new Set(['AuthenticationError', 'PermissionDeniedError', 'NotFo
  * (a tool's, an overloaded provider's) fail the attempt, and Restate retries.
  */
 function refused(error: unknown) {
-  if (error instanceof ToolError) return false;
+  if (error instanceof ToolError || (typeof error === 'object' && error !== null && toolErrors.has(error)))
+    return false;
   if (error instanceof Error && FOR_GOOD.has(error.constructor.name)) return true;
   return /API key not found|no API key|Could not resolve authentication method|Provider is not configured|"code":"(AUTH|MISSING_CREDENTIAL)"/i.test(
     String(error),

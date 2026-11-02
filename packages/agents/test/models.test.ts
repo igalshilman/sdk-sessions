@@ -10,6 +10,7 @@ import * as opencode from 'restate-agents/opencode';
 import * as pi from 'restate-agents/pi';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { tool as langchainTool } from '@langchain/core/tools';
 import { Teller } from './fakes/langgraph.ts';
 import { invoke } from 'restate-sessions/internal';
 import { fakeContext } from 'restate-sessions/test/support';
@@ -142,6 +143,22 @@ describe("a tool's error", () => {
       'k',
     ).attempt('inv1', 'Hi');
     await expect(failed).rejects.toThrow('the tool lookup failed: no such page');
+    await expect(failed).rejects.not.toBeInstanceOf(restate.TerminalError);
+  });
+
+  it("is never taken for the provider refusing the model, for a framework's own tool", async () => {
+    // A LangChain tool of its own, whose request fails as a provider's would.
+    const transfer = langchainTool(
+      async () => {
+        throw new NotFoundError('no such account');
+      },
+      { name: 'transfer', description: 'Moves money.', schema: z.object({ amount: z.number() }) },
+    );
+    const failed = conversation(langgraph.chat({ model: new Teller({}), tools: [transfer] }), 'k').attempt(
+      'inv1',
+      'Please move 5 from 1 to 2',
+    );
+    await expect(failed).rejects.toThrow('no such account');
     await expect(failed).rejects.not.toBeInstanceOf(restate.TerminalError);
   });
 });
