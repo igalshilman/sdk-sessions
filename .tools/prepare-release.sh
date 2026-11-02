@@ -68,7 +68,13 @@ done
 # Their formatting, as `pnpm lint` checks it.
 pnpm exec oxfmt "${PACKAGES[@]}" >/dev/null
 
-git commit -aqm "Release $TAG"
+# The packages at the version already (the first release, say): the tag goes
+# on HEAD, without a commit.
+if git diff --quiet; then
+  echo "Every package is at $VERSION already: tagging HEAD"
+else
+  git commit -aqm "Release $TAG"
+fi
 git tag -a "$TAG" -m "Release $TAG"
 
 if UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
