@@ -8,7 +8,7 @@
 // key's invocations move between two warm page caches, one of them small
 // (1 MiB of memory, 8 MiB of disk). Each kind of agent runs in its own: the pi, LangGraph and DeepSeek Harness agents
 // (AGENT_ABORT_PER_MILLE, default 3: a pi or DeepSeek Harness prompt makes
-// some hundreds of state requests), the Claude agents (ABORT_PER_MILLE), and
+// some hundreds of state requests), the Claude agents (the same), and
 // the OpenCode agents (OPENCODE_ABORT_PER_MILLE, default 1: an OpenCode prompt
 // makes some hundreds of state requests too, and its process takes seconds to
 // start).
@@ -85,8 +85,11 @@ const PROCESSES: Process[] = [
   },
   { name: 'agent', groups: ['agent'], port: 9183, perMille: AGENT_PER_MILLE },
   { name: 'langgraph', groups: ['langgraph'], port: 9186, perMille: AGENT_PER_MILLE },
-  // A Claude prompt makes few state requests: it aborts as often as the shop.
-  { name: 'claude', groups: ['claude'], port: 9187, perMille: PER_MILLE },
+  // Late in a conversation, a Claude attempt reads enough of it that at the
+  // shop's rate it rarely survived to its end: its retries, 10 s apart at
+  // most, ran into the next abort for minutes (a livelock the client's 300 s
+  // then failed). At the agents' rate, an attempt survives five times as often.
+  { name: 'claude', groups: ['claude'], port: 9187, perMille: AGENT_PER_MILLE },
   { name: 'deepseek', groups: ['deepseek'], port: 9188, perMille: AGENT_PER_MILLE },
   { name: 'opencode', groups: ['opencode'], port: 9189, perMille: OPENCODE_PER_MILLE },
 ];
@@ -260,9 +263,24 @@ async function call<T = unknown>(path: string, body?: unknown, headers: Record<s
         throw new Error(`${path}: ${response.status} ${text}`);
       }
     }
-    if (Date.now() > deadline) throw new Error(`${path}: no answer`);
+    if (Date.now() > deadline) throw new Error(`${path}: no answer; ${await stuck(path)}`);
     await sleep(100);
   }
+}
+
+/** What Restate holds of the invocations of `path`'s target that did not complete: for a request that got no answer. */
+async function stuck(path: string): Promise<string> {
+  const [service, key, handler] = path.split('/');
+  const r = await fetch(`${ADMIN}/query`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({
+      query: `SELECT id, status, retry_count, next_retry_at, last_failure, last_attempt_deployment_id FROM sys_invocation WHERE target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}' AND status != 'completed'`,
+    }),
+  }).catch(() => null);
+  if (!r?.ok) return 'the admin API did not answer';
+  const { rows } = (await r.json()) as { rows: Record<string, unknown>[] };
+  return rows.length === 0 ? 'Restate holds no invocation of it' : `Restate holds: ${JSON.stringify(rows)}`;
 }
 
 /** Run `tasks` (functions) with at most `width` at a time. */
