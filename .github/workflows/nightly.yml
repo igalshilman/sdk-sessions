@@ -30,3 +30,132 @@ jobs:
         run: cargo test --locked --release --manifest-path packages/sessions/native/Cargo.toml sql::tests::integration::campaign
         env:
           SQL_CAMPAIGN_SEEDS: 5000
+
+  soak:
+    # crash.ts for 45 minutes, in rounds over many more keys: the server
+    # killed every 4 minutes, two shop processes taking turns (one with a
+    # small page cache), cancellations, and every process's memory checked.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/sessions/native
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm --filter e2e crash
+        env:
+          SOAK_MINUTES: 45
+          CRASH_ORDERS: 300
+          CRASH_MOVES: 600
+          CRASH_ACCOUNTS: 100
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-logs
+          path: /tmp/restate-sessions-examples-*
+          if-no-files-found: ignore
+
+  restate-latest:
+    # The tests against a real server, on the newest restate-server release
+    # rather than the one package.json pins: a release that breaks them
+    # shows here before the pin moves.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/sessions/native
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: the newest restate-server
+        run: |
+          npm install --prefix "$RUNNER_TEMP/restate" @restatedev/restate-server@latest
+          echo "RESTATE_SERVER=$RUNNER_TEMP/restate/node_modules/@restatedev/restate-server-linux-x64/bin/restate-server" >> "$GITHUB_ENV"
+      - run: '"$RESTATE_SERVER" --version'
+      - run: pnpm --filter e2e concurrency
+      - run: pnpm --filter e2e versions
+      - run: pnpm --filter e2e tools
+      - run: pnpm --filter e2e crash
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restate-latest-logs
+          path: |
+            /tmp/restate-sessions-examples-*
+            /tmp/restate-sessions-versions-*
+          if-no-files-found: ignore
+
+  platforms:
+    # The package's tests, and the context against a real server, where
+    # every push does not run them: macOS, and arm64 Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/sessions/native
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm --filter @restatedev/sessions test
+      - run: pnpm --filter @restatedev/sessions test:rust
+      - run: pnpm --filter @restatedev/agents test
+      - run: pnpm --filter e2e concurrency
+      - run: pnpm --filter e2e versions
+
+  bench:
+    # The benchmarks, kept as an artifact per night: numbers to compare, not
+    # yet thresholds (those wait until the noise is known).
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/sessions/native
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: mkdir -p "$RUNNER_TEMP/bench"
+      - run: pnpm --filter e2e bench "$RUNNER_TEMP/bench/e2e.json"
+      - name: cargo bench
+        working-directory: packages/sessions/native
+        run: |
+          cargo bench --locked --features bench --bench flush_costs > "$RUNNER_TEMP/bench/flush_costs.txt"
+          cargo bench --locked --features bench --bench amplification -- 3 > "$RUNNER_TEMP/bench/amplification.csv"
+          cargo bench --locked --features bench --bench small_databases -- 3 > "$RUNNER_TEMP/bench/small_databases.csv"
+          cargo bench --locked --features bench --bench cache_cpu -- 3 > "$RUNNER_TEMP/bench/cache_cpu.csv"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_number }}
+          path: ${{ runner.temp }}/bench

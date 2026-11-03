@@ -340,6 +340,7 @@ const proxy = rotate(
 let services = PROCESSES.map((p) => supervise(p, p.perMille));
 // The most memory each process used, sampled every few seconds.
 const rss = new Map<string, number>();
+const memory = () => JSON.stringify(Object.fromEntries([...rss].map(([name, mb]) => [name, Math.round(mb)])));
 const sampling = setInterval(() => {
   PROCESSES.forEach((p, i) => {
     const mb = rssMb(services[i]?.child.pid);
@@ -486,7 +487,7 @@ const work = (async () => {
   do {
     await Promise.all([shopRound(rounds), bankRound(rounds)]);
     rounds++;
-    if (SOAK_MS > 0) console.error(`round ${rounds} done; memory (MiB): ${JSON.stringify(Object.fromEntries(rss))}`);
+    if (SOAK_MS > 0) console.error(`round ${rounds} done; memory, most (MiB): ${memory()}`);
   } while (Date.now() < soakUntil);
 })();
 
@@ -712,9 +713,7 @@ assert.equal(await invocations('Ledger', 'transfer'), AGENTS.length * SESSIONS *
 console.error(`rounds: ${rounds}; orders: ${JSON.stringify(counts)}`);
 console.error(`views read: ${JSON.stringify(viewReads)}`);
 console.error(`shop processes served ${proxy.served.join(' and ')} connections`);
-console.error(
-  `memory, most (MiB): ${JSON.stringify(Object.fromEntries([...rss].map(([k, v]) => [k, Math.round(v)])))}`,
-);
+console.error(`memory, most (MiB): ${memory()}`);
 proxy.served.forEach((n, i) => assert.ok(n > 1, `shop process ${i} took ${n} connections`));
 if (SOAK_MS > 0) {
   for (const [name, mb] of rss) assert.ok(mb < SOAK_RSS_MB, `${name} used ${Math.round(mb)} MiB`);

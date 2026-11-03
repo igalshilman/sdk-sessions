@@ -6,6 +6,51 @@ every suite passes. Lint 2m; TypeScript tests 1,015 (905 agents, 106 sessions,
 `concurrency` 8s, `tools` 12s, `crash` 2m47s with the server killed twice and
 the agents' process restarted up to 32 times.
 
+## Status (3 November 2026)
+
+The plan below is implemented:
+
+| #     | Where                                                          | State                                                                                             |
+| ----- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 1     | `crash.ts`, `sessions/test/random.ts`, `faults.ts`             | Done: `ABORT_SEED`, printed at the start and on failure                                           |
+| 2     | `.github/workflows/nightly.yml` (`campaigns`)                  | Done, at 20000 and 5000 seeds (2000 state seeds take 25 s)                                        |
+| 3     | `e2e/versions.ts`, in PR CI                                    | Done                                                                                              |
+| 4     | `sessions/test/bank.ts`, `crash.ts`                            | Done, with a TerminalError after a commit, a resend past idempotency retention, and cancellations |
+| 5     | `native/src/node.rs`, `PageCacheConfig::sized`                 | Done: `RESTATE_SQL_CACHE_MEMORY`, `RESTATE_SQL_CACHE_DISK`, `RESTATE_SQL_CACHE=off`               |
+| 6     | `native/src/sql/tests/integration/cache.rs`                    | Done: truncated, overwritten and deleted cache files                                              |
+| 7     | `crash.ts` (a rotating proxy in front of `shop`, `shop-small`) | Done                                                                                              |
+| 8     | `crash.ts` (views read all along; `Account/slowStatement`)     | Done; whether a slow view hits "is gone" in a given run is not asserted                           |
+| 9     | `crash.ts` `SOAK_MINUTES`; `nightly.yml` (`soak`, 45 minutes)  | Done                                                                                              |
+| 10–12 | `nightly.yml` (`restate-latest`, `platforms`, `bench`)         | Done; the SDK is not in the matrix: the package pins it for its internals                         |
+| +     | `schema.test.ts`                                               | A failing schema step: done                                                                       |
+
+What the new tests found out:
+
+- **A cancellation could hold back a committed transaction's sends
+  indefinitely** (the soak, then `transaction.test.ts`). A cancellation that
+  reached a commit as it synced ended the session after the commit was
+  stored but before its `tx.send`s were made. No attempt follows a cancelled
+  invocation, so they waited in the outbox for the key's next invocation, which
+  may never come: in the soak, a transfer debited one account and never
+  credited the other. Fixed: a cancelled handler's end opens the database
+  again and makes them, stored only if the commit is.
+
+- **A queued invocation is pinned to a deployment when it starts, not when
+  it is sent** (`versions.ts`). So no invocation runs old code on a newer
+  schema of its key, except after a rollback.
+- **A rollback leaves a data step's work undone** (`versions.ts`). Rows that
+  the old code wrote during a rollback never get the step, since it ran
+  before them and runs once. A step that fills a column should be safe to
+  find rows it never saw, or be a new step.
+- **A failing schema step is terminal** (`schema.test.ts`): every invocation
+  of a key that lacks it fails, not retried, until a fixed version is
+  deployed.
+- **The page cache's memory bound is loose at tiny sizes**: 64 KiB of memory
+  held 211 KB, as a frame can be larger than a shard's share.
+- **A damaged or deleted cache file never made a read wrong.**
+- `crash.ts` takes about 4 minutes (3 before): the proxy cuts connections every
+  3 seconds, and the bank, the views and a second shop process add work.
+
 ## What is covered
 
 | Layer                               | Where                          | What it checks                                                                                                                                                                                                                                                                                                                                                                                                                               | Depth                                                                      |
