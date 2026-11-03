@@ -7,9 +7,14 @@ server, are in its `test/` directory (`pnpm test` at the root runs them all).
 
 - [`crash.ts`](crash.ts): the agents of
   [`@restatedev/agents`'s tests](../agents/test) and the sessions of
-  [`@restatedev/sessions`'s](../sessions/test) (the ledger and the shop), through
-  crashes: the services abort at random, and the server is killed twice
-  (`pnpm --filter e2e crash`). The agents' models are the scripted ones of
+  [`@restatedev/sessions`'s](../sessions/test) (the ledger, the shop, and the bank
+  of one account per key), through crashes: the services abort at random, the
+  server is killed twice, transfers are cancelled, and views are read all
+  along (`pnpm --filter e2e crash`). The shop's services run in two processes
+  behind one deployment, one with a small page cache, and take turns. Every
+  random choice comes from a seed it prints (`ABORT_SEED`), and
+  `SOAK_MINUTES=n` makes it a soak that also checks memory. The agents'
+  models are the scripted ones of
   [`@restatedev/agents/test/fakes`](../agents/test/fakes/fakes.ts).
   [`serve.ts`](serve.ts) serves them all, or some (`node serve.ts ledger shop`).
 - [`versions.ts`](versions.ts): a session object across deployments: an
