@@ -1,16 +1,20 @@
 // Fault injection for crash tests: with ABORT_PER_MILLE, the process aborts
 // before or after random requests of the objects' stores; and with ABORT_AT,
 // at that request (counted from 1), so that it aborts at least once.
+// ABORT_SEED seeds the random aborts: a process given the same seed aborts at
+// the same of its requests (the requests themselves depend on timing).
 import * as restate from '@restatedev/restate-sdk';
 import { setStoreWrapper } from 'restate-sessions/internal';
 import { fileURLToPath } from 'node:url';
+import { seeded, seedFromEnv } from './random.ts';
 
 const perMille = Number(process.env.ABORT_PER_MILLE ?? 0);
 const at = Number(process.env.ABORT_AT ?? 0);
+const random = seeded(seedFromEnv());
 let requests = 0;
 
 const maybeAbort = () => {
-  if (++requests === at || Math.random() * 1000 < perMille) {
+  if (++requests === at || random() * 1000 < perMille) {
     console.error(`aborting at state request ${requests}`);
     // As abruptly as process.abort(), without a core dump or a crash report.
     process.kill(process.pid, 'SIGKILL');
