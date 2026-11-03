@@ -12,6 +12,10 @@ server, are in its `test/` directory (`pnpm test` at the root runs them all).
   (`pnpm --filter e2e crash`). The agents' models are the scripted ones of
   [`restate-agents/test/fakes`](../agents/test/fakes/fakes.ts).
   [`serve.ts`](serve.ts) serves them all, or some (`node serve.ts ledger shop`).
+- [`versions.ts`](versions.ts): a session object across deployments: an
+  invocation queued behind another runs on the deployment registered by the
+  time it starts, a schema step runs once per key, and a rollback and a roll
+  forward keep the database working (`pnpm --filter e2e versions`).
 - [`concurrency.ts`](concurrency.ts): the context without journal replay
   (`pnpm --filter e2e concurrency`).
 - [`restate-tools.ts`](restate-tools.ts): Restate's own agent tools, on a

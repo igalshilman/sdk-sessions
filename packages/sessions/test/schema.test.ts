@@ -77,6 +77,43 @@ describe("an object's schema", () => {
   });
 });
 
+describe('a schema step that fails', () => {
+  it('fails the invocation for good, leaves the database as it was, and a fixed step runs once', async () => {
+    const service = objectWith(NOTES);
+    const map = new Map<string, Uint8Array>();
+    const first = sqlAttempt({ map, service });
+    await first.end(() => first.db.execute("INSERT INTO notes VALUES ('milk')"));
+    // v2: a column, then a step that fails. The steps a database lacks run in
+    // one transaction, so the column goes with the failure.
+    restate.sessionObject({
+      name: service,
+      schema: [NOTES, 'ALTER TABLE notes ADD COLUMN done INT', 'INSERT INTO missing VALUES (1)'],
+      handlers: {},
+      views: {},
+    });
+    const failing = sqlAttempt({ map, service, id: 'failing' });
+    // An SQL error, so terminal: every invocation of the key fails until a fix is deployed.
+    await expect(failing.end(() => failing.db.values('SELECT text FROM notes'))).rejects.toThrow(
+      expect.objectContaining({ name: 'TerminalError', message: expect.stringMatching(/no such table: missing/) }),
+    );
+    expect(await stepsOf(map, service)).toBe('1');
+    // Rolled back to v1: its code finds its database as it left it.
+    restate.sessionObject({ name: service, schema: [NOTES], handlers: {}, views: {} });
+    const v1 = sqlAttempt({ map, service, id: 'v1' });
+    expect(await v1.end(() => v1.db.values("SELECT name FROM pragma_table_info('notes')"))).toEqual([['text']]);
+    // v3 fixes the step: it runs once, with the column.
+    restate.sessionObject({
+      name: service,
+      schema: [NOTES, 'ALTER TABLE notes ADD COLUMN done INT', done],
+      handlers: {},
+      views: {},
+    });
+    const fixed = sqlAttempt({ map, service, id: 'fixed' });
+    expect(await fixed.end(() => fixed.db.values('SELECT text, done FROM notes'))).toEqual([['milk', 1]]);
+    expect(await stepsOf(map, service)).toBe('3');
+  });
+});
+
 describe("a library's schema", () => {
   const LIBRARY = new Schema('library', ['CREATE TABLE library_items (item TEXT)']);
 
