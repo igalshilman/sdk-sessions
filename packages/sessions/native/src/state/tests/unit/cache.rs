@@ -217,3 +217,15 @@ fn namespaces_are_kept_by_the_bytes_of_their_states() {
         .count();
     assert!((8..48).contains(&kept), "{kept} of 64 kept");
 }
+
+#[test]
+fn sizes_are_bytes_or_binary_units() {
+    use crate::state::cache::parse_size;
+    assert_eq!(parse_size("4096"), Some(4096));
+    assert_eq!(parse_size("64KiB"), Some(64 << 10));
+    assert_eq!(parse_size("1 MiB"), Some(1 << 20));
+    assert_eq!(parse_size("2GiB"), Some(2 << 30));
+    assert_eq!(parse_size("1MB"), None);
+    assert_eq!(parse_size("lots"), None);
+    assert_eq!(parse_size(""), None);
+}

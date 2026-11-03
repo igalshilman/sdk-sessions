@@ -89,6 +89,37 @@ impl PageCacheConfig {
             parked_bytes: 64 << 20,
         }
     }
+
+    /// As [`PageCacheConfig::new`], with the namespaces' states and the parked
+    /// values bounded by `memory` too, so that a small cache keeps little,
+    /// and disk blocks small enough that a small disk has 4 of them to reclaim.
+    pub fn sized(memory: usize, disk: usize) -> Self {
+        let config = Self::new(memory, disk);
+        Self {
+            disk_block: config.disk_block.min((disk / 4).max(64 << 10)),
+            namespace_bytes: config.namespace_bytes.min(memory),
+            parked_bytes: config.parked_bytes.min(memory),
+            ..config
+        }
+    }
+}
+
+/// `value` in bytes: a number, or one with KiB, MiB or GiB after it.
+#[cfg_attr(any(test, feature = "bench"), allow(dead_code))]
+pub(crate) fn parse_size(value: &str) -> Option<usize> {
+    let value = value.trim();
+    let (number, unit) = match value.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => value.split_at(at),
+        None => (value, ""),
+    };
+    let unit: usize = match unit.trim() {
+        "" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        _ => return None,
+    };
+    number.parse::<usize>().ok()?.checked_mul(unit)
 }
 
 /// Process-wide cache of packs' ranges; clones share it.
