@@ -484,3 +484,99 @@ fn parked_engines_are_weighed_by_schema() -> Result<()> {
         Ok(())
     })
 }
+
+/// A small cache, as `PageCacheConfig::sized` makes one (as the addon does
+/// for `RESTATE_SQL_CACHE_MEMORY` and `RESTATE_SQL_CACHE_DISK`), opens with
+/// its small disk blocks, and what it cannot hold is read from the store,
+/// right. (Its memory is not a strict bound at this size: a frame may be
+/// larger than a shard's share of it.)
+#[test]
+fn a_small_cache_reads_right() -> Result<()> {
+    use crate::state::{PageCacheConfig, simulation::open_cache};
+    futures::executor::block_on(async {
+        let cache = open_cache(PageCacheConfig::sized(64 << 10, 256 << 10));
+        let store = Arc::new(LatencyKv::new(MemoryKv::default()));
+        let namespace = Namespace::new(&cache, "small");
+        create(store.clone(), cached(&namespace)).await?;
+        let expected = 400 * 900 + 400 * 401 / 2;
+        for _ in 0..3 {
+            assert_eq!(
+                payload_sum(store.clone(), cached(&namespace)).await?,
+                expected
+            );
+        }
+        Ok(())
+    })
+}
+
+/// The cache's disk file, lost or damaged under a running process, never
+/// makes a read wrong: what the cache cannot serve is read from the store.
+#[test]
+fn a_damaged_cache_file_never_makes_a_read_wrong() -> Result<()> {
+    use crate::state::{PageCacheConfig, simulation::open_cache};
+    use std::io::{Seek, Write};
+    type Damage = (&'static str, fn(&std::path::Path));
+    let damages: [Damage; 3] = [
+        ("truncated", |file| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }),
+        ("overwritten", |file| {
+            let mut f = std::fs::OpenOptions::new().write(true).open(file).unwrap();
+            let len = f.metadata().unwrap().len();
+            f.seek(std::io::SeekFrom::Start(0)).unwrap();
+            // Not zeros: bytes that look like data.
+            let garbage: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            f.write_all(&garbage).unwrap();
+            f.sync_all().unwrap();
+        }),
+        ("deleted", |file| std::fs::remove_file(file).unwrap()),
+    ];
+    for (how, damage) in damages {
+        futures::executor::block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("cache-damage-{how}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("cache");
+            // Memory for a few frames: the table goes to the disk tier.
+            let cache = open_cache(PageCacheConfig {
+                file: Some(file.clone()),
+                ..crate::state::simulation::cache_config(64 << 10, 64 << 20)
+            });
+            let store = Arc::new(LatencyKv::new(MemoryKv::default()));
+            let namespace = Namespace::new(&cache, &format!("damaged-{how}"));
+            create(store.clone(), cached(&namespace)).await?;
+            let expected = 400 * 900 + 400 * 401 / 2;
+            // Served by the cache, its disk tier included: the table is larger than its memory.
+            store.inner.reset_stats();
+            assert_eq!(
+                payload_sum(store.clone(), cached(&namespace)).await?,
+                expected,
+                "{how}: before"
+            );
+            assert_eq!(
+                store.inner.stats().kind("pack").gets,
+                0,
+                "{how}: the cache serves the table before the damage"
+            );
+            damage(&file);
+            for round in 0..2 {
+                assert_eq!(
+                    payload_sum(store.clone(), cached(&namespace)).await?,
+                    expected,
+                    "{how}: read {round} after the damage"
+                );
+            }
+            drop(cache);
+            let _ = std::fs::remove_dir_all(&dir);
+            Result::Ok(())
+        })?;
+    }
+    Ok(())
+}

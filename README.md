@@ -214,23 +214,74 @@ and OpenCode requires 24), pnpm, and Rust for the addon.
 ```sh
 pnpm install
 pnpm build        # builds the Rust addon
-pnpm test         # unit tests of every package; no Restate server needed
+pnpm test         # every package's unit tests, and the Rust tests; no Restate server needed
 pnpm lint         # tsc, oxlint, oxfmt --check, rustfmt and clippy
 pnpm format
 ```
 
 `pnpm --filter <package> test` runs a single package's tests, and you can
-add a filter such as `langgraph`. The `e2e` scripts start a Restate server
-themselves: the 1.8.0 release from `@restatedev/restate-server`, or the binary
-in `RESTATE_SERVER` if you set it.
+add a filter such as `langgraph`: `pnpm --filter @restatedev/agents test langgraph`.
+
+### Tests against a real Restate server
+
+The `e2e` scripts start a Restate server themselves: the 1.8.0 release from
+`@restatedev/restate-server`, or the binary in `RESTATE_SERVER` if you set
+it. CI runs the first four on every push, after `pnpm test`:
 
 ```sh
-pnpm --filter @restatedev/agents test langgraph   # one framework's agent tests
-pnpm --filter e2e crash                       # agents and sessions through crashes
-pnpm --filter e2e concurrency                 # concurrent awaits without journal replay
-pnpm --filter e2e tools                       # Restate's own agent tools
-pnpm --filter e2e bench                       # latency, throughput and storage size
+pnpm --filter e2e concurrency   # ~10 s: concurrent awaits without journal replay
+pnpm --filter e2e versions      # ~15 s: an object across deployments, a rollback
+pnpm --filter e2e tools         # ~10 s: Restate's own agent tools
+pnpm --filter e2e crash         # ~4 min: agents and sessions through crashes
 ```
+
+`crash.ts` prints the seed of its random aborts; a failed run prints it again,
+to run it once more with the same aborts. With `SOAK_MINUTES` it runs in
+rounds until then, over as many keys as you give it, and checks every
+service process's memory:
+
+```sh
+ABORT_SEED=1234 pnpm --filter e2e crash
+SOAK_MINUTES=45 CRASH_ORDERS=300 CRASH_MOVES=600 CRASH_ACCOUNTS=100 pnpm --filter e2e crash
+```
+
+### The storage's campaigns
+
+The Rust tests include two seeded campaigns of random faults and crashes:
+every push runs a few seeds, and the nightly workflow thousands. From
+`packages/sessions/native`:
+
+```sh
+STATE_SEEDS=20000 cargo test --release state::tests::campaign
+SQL_CAMPAIGN_SEEDS=5000 cargo test --release sql::tests::integration::campaign
+SQL_CAMPAIGN_SEED=17 SQL_CAMPAIGN_TRACE=1 cargo test sql::tests::integration::campaign -- --nocapture  # one, as a failure names it
+```
+
+### Benchmarks
+
+```sh
+pnpm --filter e2e bench out.json   # latency, throughput and stored size, against a server
+cd packages/sessions/native && cargo bench --locked --features bench --bench flush_costs  # and the others in benches/
+```
+
+### Running them on your machine
+
+Everything above runs locally as it does in CI
+([`checks.yml`](.github/workflows/checks.yml) on every push,
+[`nightly.yml`](.github/workflows/nightly.yml) every night). The Restate
+server comes for Linux and macOS, on x64 and arm64; on Windows, use WSL.
+
+- The `e2e` tests take ports 8080 and 9070 (Restate) and 9180 to 9194 and
+  9301 (the services), and refuse to start while something listens there: run them
+  one at a time.
+- `crash.ts` gives each of its seven service processes a page cache file
+  under the temporary directory: 1 GiB, sparse, or 8 MiB for the process
+  with the small cache. A failed run keeps that directory, with every
+  process's log, and prints its path.
+- The soak's memory check reads `/proc`, so it runs on Linux only;
+  elsewhere the soak checks everything else.
+
+[`coverage.md`](coverage.md) says what each test covers, and what is left.
 
 To run an example, see [Run an example](packages/examples/README.md#run-an-example).
 

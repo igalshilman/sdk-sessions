@@ -78,6 +78,44 @@ const balance = async (o: ReturnType<typeof object>) => {
   return (await b.end(() => b.db.values('SELECT count(*) FROM balance')))[0]![0];
 };
 
+/**
+ * An attempt whose transaction's commit Restate cancels as it waits for its
+ * sync: the commit is stored, but the transaction's await rejects, and the
+ * handler does `onCancelled` with the error. Once: the core delivers the
+ * cancel signal once, and a handler goes on after it.
+ */
+function cancelledCommit(map: Map<string, Uint8Array>, sent: Send[], onCancelled: (e: unknown) => unknown) {
+  let cancel = false;
+  const onSync = async () => {
+    if (!cancel) return;
+    cancel = false;
+    throw new restate.CancelledError();
+  };
+  const a = sqlAttempt({ map, onSync, send: (s: Send) => void sent.push(s) });
+  return a.end(async () => {
+    await a.db.execute('CREATE TABLE balance (v INTEGER)');
+    cancel = true;
+    try {
+      await a.db.transaction(async (tx) => {
+        await tx.execute('INSERT INTO balance VALUES (5)');
+        tx.send(store, 'a').reserve('book');
+      });
+    } catch (e) {
+      return onCancelled(e);
+    }
+    return 'not cancelled';
+  });
+}
+
+/** The send was made by the cancelled attempt's end, once: the key's next invocation finds the commit and nothing to send. */
+async function expectMadeOnce(map: Map<string, Uint8Array>, sent: Send[]) {
+  expect(sent.map(decode)).toEqual(['book']);
+  expect(sent[0]!.idempotencyKey).toMatch(/^transaction\/[\w-]+\/0$/);
+  const next = sqlAttempt({ map, send: (s: Send) => void sent.push(s), id: 'next' });
+  expect(await next.end(() => next.db.values('SELECT v FROM balance'))).toEqual([[5]]);
+  expect(sent).toHaveLength(1);
+}
+
 describe('the sends of a transaction', () => {
   it('sends once the transaction commits, each with a key of the transaction', async () => {
     const o = object();
@@ -148,6 +186,20 @@ describe('the sends of a transaction', () => {
     expect(next.sent.map(decode)).toEqual(['book', 5]);
     expect(await o.outbox()).toEqual([]);
     expect(await balance(o)).toBe(1);
+  });
+
+  it('makes the sends of a commit that a cancellation interrupted, as the handler ends with the CancelledError', async () => {
+    const map = new Map<string, Uint8Array>();
+    const sent: Send[] = [];
+    await expect(cancelledCommit(map, sent, (e) => Promise.reject(e))).rejects.toBeInstanceOf(restate.CancelledError);
+    await expectMadeOnce(map, sent);
+  });
+
+  it('makes them too when the handler catches the CancelledError and returns', async () => {
+    const map = new Map<string, Uint8Array>();
+    const sent: Send[] = [];
+    expect(await cancelledCommit(map, sent, () => 'stopped')).toBe('stopped');
+    await expectMadeOnce(map, sent);
   });
 
   it('empties the outbox it sent again as it opens, before the handler ends', async () => {

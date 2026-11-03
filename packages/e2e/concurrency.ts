@@ -253,8 +253,23 @@ const database = restate.sessionObject({
     mark: async (ctx, i: number) => {
       await ctx.db.execute('INSERT INTO marks VALUES (?)', [i]);
     },
+
+    // Cancels itself inside its transaction: what it committed, it sent, as
+    // the handler ends, though nothing invokes this key again. (Here the
+    // cancellation arrives after the sends are made; one that ends the
+    // handler between a commit and its sends is transaction.test.ts's.)
+    cancelledCommit: async (ctx, i: number) => {
+      await ctx.db.values('SELECT count(*) FROM t'); // opened: the transaction's first wait on Restate is its commit
+      await ctx.db.transaction(async (tx) => {
+        await tx.execute('INSERT INTO t VALUES (?)', [i]);
+        tx.send({ service: 'Db', key: 'cancel-marks', handler: 'mark', input: i });
+        ctx.cancel(ctx.request.id);
+      });
+      return 'not cancelled';
+    },
   },
   views: {
+    committed: async (ctx) => (await ctx.db.query<{ v: number }>('SELECT v FROM t ORDER BY v')).map(({ v }) => v),
     marks: async (ctx) => (await ctx.db.query<{ i: number }>('SELECT i FROM marks ORDER BY i')).map(({ i }) => i),
   },
 });
@@ -459,6 +474,28 @@ await check("a transaction's sends reach their target", async () => {
     await sleep(100);
   } while (Date.now() < deadline);
   assert.deepEqual(marks, [0, 1, 2]);
+});
+
+await check('a handler cancelled in its transaction sent what it committed, with no later invocation', async () => {
+  for (let i = 0; i < 5; i++) {
+    const r = await fetch(`${INGRESS}/Db/cancelled-${i}/cancelledCommit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(i),
+    });
+    assert.equal(r.status, 409, `cancelled-${i}: ${r.status} ${await r.text()}`);
+  }
+  // Each key that committed sent its mark; one that did not, none.
+  const committed: number[] = [];
+  for (let i = 0; i < 5; i++) committed.push(...((await call(`Db/cancelled-${i}/committed`)).value as number[]));
+  const deadline = Date.now() + 10_000;
+  let marks: unknown;
+  do {
+    marks = (await call('Db/cancel-marks/marks')).value;
+    if (JSON.stringify(marks) === JSON.stringify(committed)) break;
+    await sleep(100);
+  } while (Date.now() < deadline);
+  assert.deepEqual(marks, committed);
 });
 
 await check('an SQL error that the handler fails with is terminal', async () => {
