@@ -40,6 +40,7 @@ jobs:
       # promise selector (which pins the SDK), Restate's agent tools, and the
       # agents and sessions through crashes.
       - run: pnpm --filter e2e concurrency
+      - run: pnpm --filter e2e versions
       - run: pnpm --filter e2e tools
       - run: pnpm --filter e2e crash
       # A failed crash run keeps its services' and the server's logs.

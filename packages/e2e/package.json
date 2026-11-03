@@ -8,6 +8,7 @@
   "scripts": {
     "crash": "node crash.ts",
     "concurrency": "node concurrency.ts",
+    "versions": "node versions.ts",
     "tools": "node restate-tools.ts",
     "bench": "node bench.ts",
     "serve": "node serve.ts",

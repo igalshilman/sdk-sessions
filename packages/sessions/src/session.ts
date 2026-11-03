@@ -631,6 +631,20 @@ export class Attempt {
       if ('error' in outcome) throw failed;
       return outcome.value;
     }
+    // A cancellation that interrupted a commit, and so ended the session, may
+    // have left the commit's sends unmade, and no attempt follows a cancelled
+    // one: the key's next invocation would make them, whenever it comes.
+    // Opened again, the session makes them now (see `start`), stored only if
+    // the commit is, as they come after it. Whether the handler let the
+    // CancelledError end it, or caught it and returned.
+    if (!db.isUsable() && this.cancelled !== undefined && this.name === undefined) {
+      await db.close().catch(() => {});
+      await this.start()
+        .then((again) => this.save(again))
+        .catch(() => {});
+      if ('error' in outcome) throw handlerError(outcome.error);
+      return outcome.value;
+    }
     if ('error' in outcome) {
       const error = handlerError(outcome.error);
       // The handler's error stands: what it committed is stored, and an

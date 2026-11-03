@@ -254,19 +254,48 @@ where
 
 /// The page cache shared by the process's databases: 256 MiB of memory and
 /// 1 GiB of disk, in a file under the temporary directory, or the file
-/// `RESTATE_SQL_CACHE_FILE` names.
-async fn page_cache() -> io::Result<PageCache> {
-    static CACHE: futures::lock::Mutex<Option<PageCache>> = futures::lock::Mutex::new(None);
+/// `RESTATE_SQL_CACHE_FILE` names. `RESTATE_SQL_CACHE_MEMORY` and
+/// `RESTATE_SQL_CACHE_DISK` set its sizes (bytes, or with KiB, MiB or GiB);
+/// the memory one also bounds the namespaces' states and the parked engines
+/// it keeps, so a small cache is a cold one. `RESTATE_SQL_CACHE=off` (or `0`,
+/// `false`, `no`) opens every database without a cache (`None`): each session
+/// reads what it needs from the store. A size that is not one fails every
+/// open, with its message: the process serves, and every invocation retries.
+async fn page_cache() -> io::Result<Option<PageCache>> {
+    static CACHE: futures::lock::Mutex<Option<Option<PageCache>>> = futures::lock::Mutex::new(None);
     let mut cache = CACHE.lock().await;
     if let Some(cache) = &*cache {
         return Ok(cache.clone());
     }
-    let opened = PageCache::open(PageCacheConfig {
-        file: std::env::var_os("RESTATE_SQL_CACHE_FILE").map(std::path::PathBuf::from),
-        ..PageCacheConfig::new(256 << 20, 1 << 30)
-    })
-    .await?;
+    let opened = match cache_config()? {
+        Some(config) => Some(PageCache::open(config).await?),
+        None => None,
+    };
     Ok(cache.insert(opened).clone())
+}
+
+/// The page cache's configuration, from the environment: `None` when it is off.
+fn cache_config() -> io::Result<Option<PageCacheConfig>> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let off = var("RESTATE_SQL_CACHE").map(|v| v.to_ascii_lowercase());
+    if matches!(off.as_deref(), Some("off" | "0" | "false" | "no")) {
+        return Ok(None);
+    }
+    let size = |name: &str, default: usize| match var(name) {
+        Some(value) => crate::state::parse_size(&value).ok_or_else(|| {
+            io::Error::other(format!(
+                "{name}={value}: not a size (bytes, or with KiB, MiB or GiB)"
+            ))
+        }),
+        None => Ok(default),
+    };
+    Ok(Some(PageCacheConfig {
+        file: std::env::var_os("RESTATE_SQL_CACHE_FILE").map(std::path::PathBuf::from),
+        ..PageCacheConfig::sized(
+            size("RESTATE_SQL_CACHE_MEMORY", 256 << 20)?,
+            size("RESTATE_SQL_CACHE_DISK", 1 << 30)?,
+        )
+    }))
 }
 
 /// Open the database of `namespace` over `store` (see the module's doc),
@@ -290,7 +319,10 @@ pub(crate) fn open<'env>(
         lists_keys,
     });
     env.spawn_future(async move {
-        let mut open = crate::Database::open(store).cached(&page_cache().await?, &namespace);
+        let mut open = crate::Database::open(store);
+        if let Some(cache) = page_cache().await? {
+            open = open.cached(&cache, &namespace);
+        }
         if reader == Some(true) {
             open = open.reader();
         }

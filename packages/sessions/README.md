@@ -248,8 +248,10 @@ with an idempotency key instead, which gives every attempt the same answer
 A cancellation that comes while a `ctx.db` call waits on Restate fails that
 call with a `CancelledError`, as any other await of the handler does. A
 commit it interrupts may still be stored, so a `CancelledError` from
-`transaction()` doesn't mean the transaction rolled back: if it committed,
-the key's next invocation makes its sends.
+`transaction()` doesn't mean the transaction rolled back. If it committed,
+its sends are made as the handler ends, which opens the database again for
+them: no attempt follows a cancelled one, and the key may never be invoked
+again.
 
 ## Sends in a transaction
 
