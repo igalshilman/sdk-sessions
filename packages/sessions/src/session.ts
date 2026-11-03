@@ -635,7 +635,19 @@ export class Attempt {
       const error = handlerError(outcome.error);
       // The handler's error stands: what it committed is stored, and an
       // outbox left full is made again by the next open.
-      await this.save(db).catch(() => db.close().catch(() => {}));
+      if (db.isUsable() || this.cancelled === undefined || this.name !== undefined) {
+        await this.save(db).catch(() => db.close().catch(() => {}));
+        throw error;
+      }
+      // But a cancellation that interrupted a commit, and so ended the
+      // session, may have left the commit's sends unmade, and no attempt
+      // follows a cancelled one: the key's next invocation would make them,
+      // whenever it comes. Opened again, the session makes them now (see
+      // `start`), stored only if the commit is, as they come after it.
+      await db.close().catch(() => {});
+      await this.start()
+        .then((again) => this.save(again))
+        .catch(() => {});
       throw error;
     }
     // A transaction left open, say, which a retry would leave open again.

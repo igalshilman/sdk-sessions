@@ -150,6 +150,37 @@ describe('the sends of a transaction', () => {
     expect(await balance(o)).toBe(1);
   });
 
+  it('makes the sends of a commit that a cancellation interrupted, as the handler ends', async () => {
+    const map = new Map<string, Uint8Array>();
+    const sent: Send[] = [];
+    let cancel = false;
+    // Restate cancels the invocation while the commit waits for its sync:
+    // the commit is stored, but the transaction's await rejects. Once: a
+    // handler goes on after a cancellation.
+    const onSync = async () => {
+      if (!cancel) return;
+      cancel = false;
+      throw new restate.CancelledError();
+    };
+    const a = sqlAttempt({ map, onSync, send: (s: Send) => void sent.push(s) });
+    await expect(
+      a.end(async () => {
+        await a.db.execute('CREATE TABLE balance (v INTEGER)');
+        cancel = true;
+        await a.db.transaction(async (tx) => {
+          await tx.execute('INSERT INTO balance VALUES (5)');
+          tx.send(store, 'a').reserve('book');
+        });
+      }),
+    ).rejects.toBeInstanceOf(restate.CancelledError);
+    // Made by this attempt's end, not left for the key's next invocation.
+    expect(sent.map(decode)).toEqual(['book']);
+    expect(sent[0]!.idempotencyKey).toMatch(/^transaction\/[\w-]+\/0$/);
+    const next = sqlAttempt({ map, send: (s: Send) => void sent.push(s), id: 'next' });
+    expect(await next.end(() => next.db.values('SELECT v FROM balance'))).toEqual([[5]]);
+    expect(sent).toHaveLength(1);
+  });
+
   it('empties the outbox it sent again as it opens, before the handler ends', async () => {
     const o = object();
     const crashed = o.attempt({ crash: true });
