@@ -695,7 +695,20 @@ for (const deadline = Date.now() + 120_000; ; await sleep(500)) {
   }
   const all = [...statements.values()];
   if (all.flatMap((s) => s.debits).length === all.flatMap((s) => s.credits).length) break;
-  if (Date.now() > deadline) throw new Error('credits did not arrive');
+  if (Date.now() > deadline) {
+    // Which transfers are on one key only, and what they were.
+    const credited = new Set(all.flatMap((s) => s.credits.map((t) => t.id)));
+    const debited = new Set(all.flatMap((s) => s.debits.map((t) => t.id)));
+    const describe = (id: string) => {
+      const m = move(Number(id.slice(1)));
+      return `${id} (${m.from}>${m.to}:${m.amount} via ${m.via}${m.cancel ? ', cancelled' : ''}${m.failAfterCommit ? ', fails after commit' : ''}: ${moved.get(id)})`;
+    };
+    const onlyDebited = [...debited].filter((id) => !credited.has(id)).map(describe);
+    const onlyCredited = [...credited].filter((id) => !debited.has(id)).map(describe);
+    throw new Error(
+      `credits did not arrive: debited only ${JSON.stringify(onlyDebited)}, credited only ${JSON.stringify(onlyCredited)}`,
+    );
+  }
 }
 const debits = new Map<string, string>();
 const credits = new Map<string, string>();
