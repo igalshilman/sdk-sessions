@@ -1,0 +1,32 @@
+# The long runs: what is too slow for every push, on a schedule and on demand.
+# A failure prints its seed; run it again locally as its job's log says.
+name: nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  campaigns:
+    # The storage campaigns with many seeds: rare interleavings of faults,
+    # crashes and reopens. Every push runs 12 and 4 seeds.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/sessions/native
+      - name: state campaign, 20000 seeds
+        run: cargo test --locked --release --manifest-path packages/sessions/native/Cargo.toml state::tests::campaign
+        env:
+          STATE_SEEDS: 20000
+      - name: SQL campaign, 5000 seeds
+        run: cargo test --locked --release --manifest-path packages/sessions/native/Cargo.toml sql::tests::integration::campaign
+        env:
+          SQL_CAMPAIGN_SEEDS: 5000

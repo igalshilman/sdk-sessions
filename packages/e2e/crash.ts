@@ -17,7 +17,12 @@
 // Checks: the warehouses' books balance and agree with every order, and every
 // agent prompt moved money exactly once.
 //
+// Every random choice comes from one seed, printed at the start: ABORT_SEED=n
+// runs with the same abort points (counted in each process's state requests)
+// and the same server kills, though timing still varies the requests.
+//
 //   pnpm --filter e2e crash   (RESTATE_SERVER=/path/to/restate-server to use another)
+//   ABORT_SEED=1234 pnpm --filter e2e crash   (again, as a failed run printed it)
 import { spawn } from 'node:child_process';
 import { mkdtempSync, openSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
@@ -29,6 +34,7 @@ import type { ChildProcess } from 'node:child_process';
 import type { Messages } from '@restatedev/agents';
 import type { Audit } from '@restatedev/sessions/test/ledger';
 import type { Order, Reservation } from '@restatedev/sessions/test/shop';
+import { seeded, seedFromEnv } from '@restatedev/sessions/test/random';
 import { RESTATE_SERVER as SERVER } from './restate-server.ts';
 
 const INGRESS = 'http://127.0.0.1:8080';
@@ -64,6 +70,12 @@ const SESSIONS = 4;
 const PROMPTS = 8;
 const ACCOUNTS = 8;
 const OPENING = 1000;
+
+const SEED = seedFromEnv();
+console.error(`seed ${SEED} (ABORT_SEED=${SEED} runs it again)`);
+process.on('exit', (code) => {
+  if (code !== 0) console.error(`failed with seed ${SEED}: ABORT_SEED=${SEED} pnpm --filter e2e crash`);
+});
 
 const dir = mkdtempSync(join(tmpdir(), 'restate-sessions-examples-'));
 // One descriptor per log, however often its process restarts.
@@ -118,22 +130,33 @@ const listening = (port: number) =>
  */
 function supervise({ name, groups, port }: Process, perMille: number): Supervised {
   let failures = 0;
+  // The process's own random numbers, from the run's seed and its place in
+  // PROCESSES: the order in which processes restart changes nothing it draws.
+  const random = seeded(SEED + 1 + PROCESSES.findIndex((p) => p.name === name));
   // The first start aborts early, at a random request: every process aborts
   // at least once, however few requests its random aborts come to.
-  const run = (first = false) =>
-    spawn(process.execPath, ['--import', FAKES, fileURLToPath(new URL('serve.ts', import.meta.url)), ...groups], {
-      env: {
-        ...process.env,
-        // pi's and OpenCode's model: the teller (the others' are faked by name).
-        ...(['agent', 'opencode'].includes(name) ? { MODEL: 'teller/teller' } : {}),
-        PORT: String(port),
-        ABORT_PER_MILLE: String(perMille),
-        ...(first && perMille > 0 ? { ABORT_AT: String(20 + Math.floor(Math.random() * 180)) } : {}),
-        SHOP_EXPIRY_MS: String(EXPIRY_MS),
-        RESTATE_SQL_CACHE_FILE: join(dir, `${name}.cache`),
+  const run = (first = false) => {
+    // Each start of each process its own seed, from the run's.
+    const seed = Math.floor(random() * 2 ** 32);
+    return spawn(
+      process.execPath,
+      ['--import', FAKES, fileURLToPath(new URL('serve.ts', import.meta.url)), ...groups],
+      {
+        env: {
+          ...process.env,
+          // pi's and OpenCode's model: the teller (the others' are faked by name).
+          ...(['agent', 'opencode'].includes(name) ? { MODEL: 'teller/teller' } : {}),
+          PORT: String(port),
+          ABORT_PER_MILLE: String(perMille),
+          ABORT_SEED: String(seed),
+          ...(first && perMille > 0 ? { ABORT_AT: String(20 + Math.floor(random() * 180)) } : {}),
+          SHOP_EXPIRY_MS: String(EXPIRY_MS),
+          RESTATE_SQL_CACHE_FILE: join(dir, `${name}.cache`),
+        },
+        stdio: ['ignore', 'ignore', log(`${name}.log`)],
       },
-      stdio: ['ignore', 'ignore', log(`${name}.log`)],
-    });
+    );
+  };
   const restart = () => {
     if (state.stopped) return;
     state.starts++;
