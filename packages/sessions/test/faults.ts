@@ -1,8 +1,18 @@
 // Fault injection for crash tests: with ABORT_PER_MILLE, the process aborts
-// before or after random requests of the objects' stores; and with ABORT_AT,
-// at that request (counted from 1), so that it aborts at least once.
-// ABORT_SEED seeds the random aborts: a process given the same seed aborts at
-// the same of its requests (the requests themselves depend on timing).
+// at random requests of the objects' stores to Restate; and with ABORT_AT, at
+// that request (counted from 1), so that it aborts at least once. ABORT_SEED
+// seeds the random aborts: a process given the same seed aborts at the same of
+// its requests (the requests themselves depend on timing).
+//
+// A request is what an attempt awaits of Restate: a read (`get`), the state's
+// keys (`keys`), a sync. It aborts before each, and after a sync too: a
+// commit stored, and the attempt killed before it awaits anything more.
+// Writes (`set`, `clear`) are commands the SDK sends with the next request,
+// so killing the process between two of them is killing it before that
+// request: they are no abort points of their own. As they were, a commit
+// that writes many keys (a checkpoint, deleting a long tail) rolled for an
+// abort at each write, twice, and hardly ever survived; a key whose every
+// commit is one could not commit at all.
 import * as restate from '@restatedev/restate-sdk';
 import { setStoreWrapper } from '@restatedev/sessions/internal';
 import { fileURLToPath } from 'node:url';
@@ -27,19 +37,12 @@ if (perMille > 0) {
       maybeAbort();
       return store.get(key);
     },
-    set: (key, value) => {
-      maybeAbort();
-      store.set(key, value);
-      maybeAbort();
-    },
-    clear: (key) => {
-      maybeAbort();
-      store.clear(key);
-      maybeAbort();
-    },
+    set: (key, value) => store.set(key, value),
+    clear: (key) => store.clear(key),
     sync: async () => {
       maybeAbort();
-      return store.sync();
+      await store.sync();
+      maybeAbort();
     },
     // A store that cannot list its keys stays one: it is never swept.
     keys:

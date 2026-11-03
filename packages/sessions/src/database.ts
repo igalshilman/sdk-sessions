@@ -158,7 +158,71 @@ function load(): Addon {
  * shared handler), the state as of open, and writes nothing.
  */
 export async function open(namespace: string, store: Store, { reader = false } = {}): Promise<Connection> {
-  return new Connection(await addon.open(namespace, store, reader));
+  const boundary = new Boundary(store);
+  try {
+    return new Connection(await addon.open(namespace, boundary, reader), boundary);
+  } catch (error) {
+    throw boundary.failed?.error ?? error;
+  }
+}
+
+/**
+ * The store as the addon calls it. An error of the store's crosses the addon
+ * as text, which ends the session: the first is kept here, and the calls that
+ * fail on the session it ended fail with it as it was thrown (the SDK's
+ * CancelledError, say). And a commit's sync first runs what its transaction
+ * gave {@link ConnectionTransaction.withCommit}: after the commit's writes,
+ * before anything is awaited.
+ */
+class Boundary implements Store {
+  /** The first error of the store's. */
+  failed: { error: unknown } | undefined;
+  /** What the next sync runs first: the committing transaction's. */
+  withSync: (() => void) | undefined;
+  readonly keys?: () => Promise<string[]>;
+  private readonly store: Store;
+
+  constructor(store: Store) {
+    this.store = store;
+    // A store without keys keeps its garbage (see `Store.keys`).
+    const keys = store.keys?.bind(store);
+    if (keys) this.keys = () => this.kept(keys);
+  }
+
+  get(key: string) {
+    return this.kept(() => this.store.get(key));
+  }
+
+  set(key: string, value: Uint8Array) {
+    this.kept(() => this.store.set(key, value));
+  }
+
+  clear(key: string) {
+    this.kept(() => this.store.clear(key));
+  }
+
+  sync() {
+    return this.kept(() => {
+      const run = this.withSync;
+      this.withSync = undefined;
+      run?.();
+      return this.store.sync();
+    });
+  }
+
+  /** `request`'s result, keeping its error, thrown at once or rejected. */
+  private kept<T>(request: () => T): T {
+    const keep = (error: unknown): never => {
+      this.failed ??= { error };
+      throw error;
+    };
+    try {
+      const result = request();
+      return (result instanceof Promise ? result.catch(keep) : result) as T;
+    } catch (error) {
+      return keep(error);
+    }
+  }
 }
 
 /**
@@ -167,9 +231,11 @@ export async function open(namespace: string, store: Store, { reader = false } =
  */
 abstract class Sql implements DatabaseWriter {
   protected readonly native: NativeSession;
+  protected readonly boundary: Boundary;
 
-  constructor(native: NativeSession) {
+  constructor(native: NativeSession, boundary: Boundary) {
     this.native = native;
+    this.boundary = boundary;
   }
 
   abstract queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult>;
@@ -203,9 +269,14 @@ abstract class Sql implements DatabaseWriter {
     }
   }
 
-  /** A request's `error`: an {@link SqlError} if a retry would repeat it. */
+  /**
+   * A request's `error`: an {@link SqlError} if a retry would repeat it; the
+   * store's own error if that ended the session.
+   */
   protected failure(error: unknown): unknown {
     if (error instanceof SqlError) return error;
+    const failed = this.boundary.failed;
+    if (failed !== undefined && !this.native.isUsable()) return failed.error;
     const repeats = (error as { code?: unknown }).code === REFUSED || this.native.isUsable();
     return repeats ? new SqlError((error as Error).message, { cause: error }) : error;
   }
@@ -243,7 +314,7 @@ export class Connection extends Sql {
   transaction<T>(body: (tx: ConnectionTransaction) => Promise<T>): Promise<T> {
     return this.serial(async () => {
       await this.request(() => this.native.begin());
-      const tx = new OpenTransaction(this, this.native, running.getStore());
+      const tx = new OpenTransaction(this, this.native, this.boundary, running.getStore());
       let result: T;
       try {
         result = await running.run(tx, () => body(tx));
@@ -253,6 +324,10 @@ export class Connection extends Sql {
         throw error;
       }
       const records = await tx.end();
+      // Its commit's sync runs what the body gave `withCommit`; one that
+      // wrote nothing synced nothing, and it runs after.
+      this.boundary.withSync = tx.commitRuns();
+      let unsynced: (() => void) | undefined;
       try {
         await this.native.commit(records);
       } catch (error) {
@@ -260,7 +335,11 @@ export class Connection extends Sql {
         // open: without the rollback, the calls after it would run inside it.
         await this.rollback();
         throw this.failure(error);
+      } finally {
+        unsynced = this.boundary.withSync;
+        this.boundary.withSync = undefined;
       }
+      unsynced?.();
       return result;
     });
   }
@@ -324,6 +403,14 @@ export interface ConnectionTransaction extends DatabaseWriter {
   setRecord(name: string, value: Uint8Array): void;
   /** The record `name` as this transaction would commit it: as it set it, or as committed. */
   record(name: string): Promise<Uint8Array>;
+  /**
+   * Run `run` with the commit, right after its writes and before it waits
+   * for them to be stored: the store's host gets what `run` makes after the
+   * writes, and before anything that fails the commit's wait (Restate's
+   * sends, which it stores in order with the writes). Never if the
+   * transaction rolls back.
+   */
+  withCommit(run: () => void): void;
 }
 
 /**
@@ -338,12 +425,14 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   private readonly outer: OpenTransaction | undefined;
   /** The records it sets, by name. */
   private readonly records = new Map<string, Buffer>();
+  /** What runs with its commit (`withCommit`). */
+  private readonly withCommits: (() => void)[] = [];
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
   private ended = false;
 
-  constructor(database: Connection, native: NativeSession, outer: OpenTransaction | undefined) {
-    super(native);
+  constructor(database: Connection, native: NativeSession, boundary: Boundary, outer: OpenTransaction | undefined) {
+    super(native, boundary);
     this.database = database;
     this.outer = outer;
   }
@@ -370,6 +459,17 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   setRecord(name: string, value: Uint8Array): void {
     this.refuseEnded();
     this.records.set(name, Buffer.from(value));
+  }
+
+  withCommit(run: () => void): void {
+    this.refuseEnded();
+    this.withCommits.push(run);
+  }
+
+  /** What runs with its commit, once it ended: see {@link withCommit}. */
+  commitRuns(): (() => void) | undefined {
+    const runs = this.withCommits;
+    return runs.length === 0 ? undefined : () => runs.forEach((run) => run());
   }
 
   record(name: string): Promise<Uint8Array> {

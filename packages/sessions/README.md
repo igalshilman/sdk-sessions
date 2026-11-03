@@ -245,13 +245,39 @@ started once the first attempt's cancel took effect. Get the id from a call
 with an idempotency key instead, which gives every attempt the same answer
 ([calls and sends](#calls-and-sends)).
 
-A cancellation that comes while a `ctx.db` call waits on Restate fails that
-call with a `CancelledError`, as any other await of the handler does. A
-commit it interrupts may still be stored, so a `CancelledError` from
-`transaction()` doesn't mean the transaction rolled back. If it committed,
-its sends are made as the handler ends, which opens the database again for
-them: no attempt follows a cancelled one, and the key may never be invoked
-again.
+A cancellation reaches a handler as Restate's reaches any handler: once, at
+the awaits pending when it comes, which fail with a `CancelledError`. The
+session adds nothing to it. A `ctx.db` call is one such await: the request
+of its own to Restate that a cancellation reaches (a read, or the sync a
+commit waits for) fails, and so does the call. What the call sent to Restate
+before that await stays: a commit's writes, and its transaction's sends,
+which are made right after the writes, before the commit waits for anything.
+So a `CancelledError` from `transaction()` doesn't say whether it committed,
+as no cancelled await does: the database does. If it committed, its sends
+are made, once.
+
+The calls after it work: the next opens the session again, and reads what
+is stored. So a handler can check what committed, and compensate:
+
+```ts
+try {
+  await ctx.db.transaction(async (tx) => {
+    /* ... */
+  });
+} catch (e) {
+  if (!(e instanceof restate.CancelledError)) throw e;
+  await ctx.db.execute('UPDATE orders SET status = ? WHERE id = ?', ['cancelled', id]);
+  throw e;
+}
+```
+
+A transaction whose body awaits something else (a `ctx.rpc`) that a
+cancellation reaches fails with it and rolls back, unless the body catches
+it. A retry of a cancelled invocation, after a crash, gets the cancellation
+at its first await, which may be the open that makes what the crash left in
+the outbox. No attempt follows a cancelled one, so as an attempt ends, a
+session that a failure ended is opened again, which makes what the outbox
+holds and empties it.
 
 ## Sends in a transaction
 
@@ -267,7 +293,9 @@ ctx.db.transaction(async (tx) => {
 ```
 
 The sends are stored in the transaction's commit, in a record called
-`outbox` next to the tables. After the commit, the attempt makes them, each
+`outbox` next to the tables. The attempt makes them right after the
+commit's writes, before it waits for them to be stored (Restate stores an
+attempt's commands in order, so they are stored only if the commit is), each
 with the idempotency key `transaction/<id>/<index>` (or the send's own key),
 where `<id>` is a random id of the transaction. Then, before `transaction()`
 resolves, a second commit empties the outbox. Restate stores an attempt's

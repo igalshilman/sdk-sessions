@@ -32,8 +32,10 @@ What the new tests found out:
   stored but before its `tx.send`s were made. No attempt follows a cancelled
   invocation, so they waited in the outbox for the key's next invocation, which
   may never come: in the soak, a transfer debited one account and never
-  credited the other. Fixed: a cancelled handler's end opens the database
-  again and makes them, stored only if the commit is.
+  credited the other. Fixed: a transaction's sends are made right after
+  its commit's writes, before it awaits anything, so a cancellation of that
+  await comes after them; and an attempt whose session a failure ended opens
+  it again as it ends, which empties the outbox.
 
 - **A queued invocation is pinned to a deployment when it starts, not when
   it is sent** (`versions.ts`). So no invocation runs old code on a newer
