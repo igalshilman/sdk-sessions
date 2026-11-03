@@ -286,10 +286,6 @@ abstract class Sql implements DatabaseWriter {
 // ended the session (its `Refused`), and of arguments it cannot convert.
 const REFUSED = 'InvalidArg';
 
-// The transaction whose body is running, in that body's asynchronous context:
-// the innermost, which knows the ones it runs inside.
-const running = new AsyncLocalStorage<OpenTransaction>();
-
 /**
  * A session of a database: calls run one at a time, in call order, and a
  * transaction holds the session until it commits or rolls back. Calls made
@@ -297,6 +293,8 @@ const running = new AsyncLocalStorage<OpenTransaction>();
  * as it would wait for that body: the body uses its `tx`.
  */
 export class Connection extends Sql {
+  /** This session's transaction whose body is running, in that body's asynchronous context. */
+  private readonly running = new AsyncLocalStorage<OpenTransaction>();
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
 
@@ -314,10 +312,10 @@ export class Connection extends Sql {
   transaction<T>(body: (tx: ConnectionTransaction) => Promise<T>): Promise<T> {
     return this.serial(async () => {
       await this.request(() => this.native.begin());
-      const tx = new OpenTransaction(this, this.native, this.boundary, running.getStore());
+      const tx = new OpenTransaction(this.native, this.boundary);
       let result: T;
       try {
-        result = await running.run(tx, () => body(tx));
+        result = await this.running.run(tx, () => body(tx));
       } catch (error) {
         await tx.end();
         await this.rollback();
@@ -373,7 +371,7 @@ export class Connection extends Sql {
 
   /** Run `call` once the calls before it have, unless it comes from the body of a transaction it would wait for. */
   private serial<T>(call: () => Promise<T>): Promise<T> {
-    if (running.getStore()?.holds(this)) {
+    if (this.running.getStore()?.open) {
       return Promise.reject(new SqlError('inside a transaction, use the transaction handle its body gets'));
     }
     const result = this.queue.then(call);
@@ -420,9 +418,6 @@ export interface ConnectionTransaction extends DatabaseWriter {
  * before its commit or rollback, so none outlives it.
  */
 class OpenTransaction extends Sql implements ConnectionTransaction {
-  private readonly database: Connection;
-  /** The transaction whose body this one's runs in, if any: of another database, since a database's own are refused. */
-  private readonly outer: OpenTransaction | undefined;
   /** The records it sets, by name. */
   private readonly records = new Map<string, Buffer>();
   /** What runs with its commit (`withCommit`). */
@@ -431,15 +426,9 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   private queue: Promise<unknown> = Promise.resolve();
   private ended = false;
 
-  constructor(database: Connection, native: NativeSession, boundary: Boundary, outer: OpenTransaction | undefined) {
-    super(native, boundary);
-    this.database = database;
-    this.outer = outer;
-  }
-
-  /** Whether this transaction, or one it runs inside, is open and holds `database`. */
-  holds(database: Connection): boolean {
-    return (!this.ended && this.database === database) || (this.outer?.holds(database) ?? false);
+  /** Whether it is open: its body runs, and holds its session. */
+  get open(): boolean {
+    return !this.ended;
   }
 
   /**

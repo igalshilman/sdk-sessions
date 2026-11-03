@@ -28,8 +28,6 @@
 import * as restate from '@restatedev/sessions';
 import type { Database } from '@restatedev/sessions';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { ChatAnthropic } from '@langchain/anthropic';
-import type { ChatOpenAI } from '@langchain/openai';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { AIMessage, type BaseMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
 import { type StructuredToolInterface, tool, ToolInputParsingException } from '@langchain/core/tools';
@@ -128,21 +126,18 @@ const providerOfModel = (named: string) => {
 
 /**
  * The chat model `provider/model-id` names: OpenAI's or Anthropic's, through
- * LangChain's integration of the provider, loaded once, when a model of it is
- * first used: only that one need be installed.
+ * LangChain's integration of the provider, loaded when a model of it is
+ * used (Node loads a module once): only that one need be installed.
  */
 const chatModel = async (named: string): Promise<BaseChatModel> => {
   const [provider, id] = providerOfModel(named);
   if (provider === 'openai') {
-    openai ??= integration('@langchain/openai', () => import('@langchain/openai'));
-    return new (await openai).ChatOpenAI({ model: id });
+    const { ChatOpenAI } = await integration('@langchain/openai', () => import('@langchain/openai'));
+    return new ChatOpenAI({ model: id });
   }
-  anthropic ??= integration('@langchain/anthropic', () => import('@langchain/anthropic'));
-  return new (await anthropic).ChatAnthropic({ model: id });
+  const { ChatAnthropic } = await integration('@langchain/anthropic', () => import('@langchain/anthropic'));
+  return new ChatAnthropic({ model: id });
 };
-
-let openai: Promise<{ ChatOpenAI: typeof ChatOpenAI }> | undefined;
-let anthropic: Promise<{ ChatAnthropic: typeof ChatAnthropic }> | undefined;
 
 /** The integration `name`, which its user installs beside @restatedev/agents. */
 async function integration<T>(name: string, load: () => Promise<T>): Promise<T> {

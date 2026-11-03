@@ -33,6 +33,7 @@
 // it was interrupted).
 import * as restate from '@restatedev/sessions';
 import type { Database } from '@restatedev/sessions';
+import { Scoped } from '@restatedev/sessions/internal';
 import type { Context } from '@earendil-works/chord';
 import { awaitWithContext, BACKGROUND_CONTEXT, withCancel, withoutAbortSignal } from '@earendil-works/chord/context';
 import { mkdir } from 'node:fs/promises';
@@ -336,12 +337,11 @@ export const messages = () => messagesHandler();
  * never change, and a new one takes a greater id than any before it (they
  * are committed one at a time), so each read adds the entries after it.
  */
-const transcripts = new WeakMap<Database, { last?: EntryId; transcript: Transcript }>();
+const TRANSCRIPT = new Scoped<{ last?: EntryId; transcript: Transcript }>('the transcript');
 
 /** The root conversation in `db`, `root` of a Harness on it, from pi-durable's entries, as `messages` gives it. */
 const transcribe = async (db: Database, root: Conversation, context: Context) => {
-  const read = transcripts.get(db) ?? { transcript: new Transcript() };
-  transcripts.set(db, read);
+  const read = TRANSCRIPT.of(db, () => ({ transcript: new Transcript() }));
   const { transcript } = read;
   // From the last entry read (the bound is inclusive), or the first.
   const query = { order: 'ascending' as const, ...(read.last === undefined ? {} : { minEntryId: read.last }) };

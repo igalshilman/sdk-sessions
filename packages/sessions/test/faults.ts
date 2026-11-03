@@ -14,7 +14,7 @@
 // abort at each write, twice, and hardly ever survived; a key whose every
 // commit is one could not commit at all.
 import * as restate from '@restatedev/restate-sdk';
-import { setStoreWrapper } from '@restatedev/sessions/internal';
+import { type Store, withStoreWrapper } from '@restatedev/sessions/internal';
 import { fileURLToPath } from 'node:url';
 import { seeded, seedFromEnv } from './random.ts';
 
@@ -31,32 +31,35 @@ const maybeAbort = () => {
   }
 };
 
-if (perMille > 0) {
-  setStoreWrapper((store) => ({
-    get: async (key) => {
+/** `store`, aborting the process at its requests (see above). */
+const faulty = (store: Store): Store => ({
+  get: async (key) => {
+    maybeAbort();
+    return store.get(key);
+  },
+  set: (key, value) => store.set(key, value),
+  clear: (key) => store.clear(key),
+  sync: async () => {
+    maybeAbort();
+    await store.sync();
+    maybeAbort();
+  },
+  // A store that cannot list its keys stays one: it is never swept.
+  keys:
+    store.keys &&
+    (async () => {
       maybeAbort();
-      return store.get(key);
-    },
-    set: (key, value) => store.set(key, value),
-    clear: (key) => store.clear(key),
-    sync: async () => {
-      maybeAbort();
-      await store.sync();
-      maybeAbort();
-    },
-    // A store that cannot list its keys stays one: it is never swept.
-    keys:
-      store.keys &&
-      (async () => {
-        maybeAbort();
-        return store.keys!();
-      }),
-  }));
-}
+      return store.keys!();
+    }),
+});
+
+/** `services`, their session objects' stores aborting the process with ABORT_PER_MILLE. */
+export const withFaults = (services: restate.ServeOptions['services']): restate.ServeOptions['services'] =>
+  perMille > 0 ? services.map((service) => withStoreWrapper(service, faulty)) : services;
 
 /** Serve `services` when `meta` is the entry module's `import.meta`. */
 export function serveIfMain(meta: ImportMeta, services: restate.ServeOptions['services']) {
   if (process.argv[1] && fileURLToPath(meta.url) === process.argv[1]) {
-    void restate.serve({ services, port: Number(process.env.PORT ?? 9080) });
+    void restate.serve({ services: withFaults(services), port: Number(process.env.PORT ?? 9080) });
   }
 }

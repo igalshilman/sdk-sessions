@@ -23,8 +23,6 @@ import * as langgraph from '@restatedev/agents/langgraph';
 import { prompt } from './langgraph.ts';
 import { bank } from './bank.ts';
 
-vi.mock('@langchain/openai', () => import('./fakes/langgraph.ts'));
-
 /** The rows of `table` in an object's database. */
 const count = (table: string) => async (ctx: ViewContext) =>
   Number((await ctx.db.values(`SELECT COUNT(*) FROM ${table}`))[0]![0]);

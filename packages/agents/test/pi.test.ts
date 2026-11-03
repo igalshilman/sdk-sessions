@@ -233,9 +233,9 @@ describe('pi.chat', () => {
   });
 
   it('in the background, publishes only the end of a turn', async () => {
-    pi.agent({ name: 'unwatched', background: true });
+    const unwatched = pi.agent({ name: 'unwatched', background: true });
     const { published } = await followedWhileWorking((tools) => pi.chat({ tools }), pi.messages(), {
-      service: 'unwatched',
+      object: unwatched,
     });
     expect(published).toBe(1);
   });

@@ -20,6 +20,7 @@
 // empty tables. This repository's libraries (@restatedev/agents) keep their tables
 // in a schema of their own name, which `schema.ensure(ctx.db)` applies where
 // they use them, in any object: internal, from @restatedev/sessions/internal.
+import { Scoped } from './scoped.ts';
 import type { Connection, DatabaseReader, DatabaseWriter, ConnectionTransaction } from './database.ts';
 
 /**
@@ -56,22 +57,13 @@ export class Schema {
    * handler's are its own, vanishing with its session.
    */
   ensure(db: DatabaseReader | Connection): Promise<void> {
-    const session = sessions.get(db);
-    return session ? session([this]) : apply(db as Connection, [this]);
+    const ensure = ENSURE.get(db);
+    return ensure ? ensure([this]) : apply(db as Connection, [this]);
   }
 }
 
-/** The handlers' sessions (`ctx.db`), each with how it applies schemas. */
-export const sessions = new WeakMap<object, (schemas: readonly Schema[]) => Promise<void>>();
-
-// The schema of each session object, by its name.
-const objects = new Map<string, Schema>();
-
-/** The session object `name`'s own schema: its steps, which each of its databases is made by. */
-export const register = (name: string, steps: readonly Step[]) => void objects.set(name, new Schema(name, steps));
-
-/** The session object `name`'s own schema, if it has one. */
-export const ofObject = (name: string) => objects.get(name);
+/** How a handler's session (`ctx.db`, and its reader) applies schemas: on it. */
+export const ENSURE = new Scoped<(schemas: readonly Schema[]) => Promise<void>>('Schema.ensure');
 
 /** Apply the steps of `schemas` that `db` lacks, in one transaction, with how far each got. */
 export async function apply(db: Connection, schemas: readonly Schema[], { reader = false } = {}) {

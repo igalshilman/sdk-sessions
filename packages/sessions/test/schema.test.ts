@@ -6,12 +6,9 @@ import { open, Schema } from '@restatedev/sessions/internal';
 import { describe, expect, it } from 'vitest';
 import { memoryStore, sqlAttempt } from './support.ts';
 
-/** A new object's name, its schema `steps`. */
-const objectWith = (...steps: restate.Step[]) => {
-  const name = `schema-${randomUUID()}`;
+/** An object of its own, its schema `steps`; with `name`, a version of that object. */
+const objectWith = (steps: restate.Step[], name = `schema-${randomUUID()}`) =>
   restate.sessionObject({ name, schema: steps, handlers: {}, views: {} });
-  return name;
-};
 
 const NOTES = 'CREATE TABLE notes (text TEXT NOT NULL)';
 
@@ -31,11 +28,12 @@ const done = (tx: restate.DatabaseWriter) => tx.execute('UPDATE notes SET done =
 
 describe("an object's schema", () => {
   it('is applied once, where a key is first opened', async () => {
-    const service = objectWith(NOTES);
+    const object = objectWith([NOTES]);
+    const service = object.name;
     const map = new Map<string, Uint8Array>();
-    const first = sqlAttempt({ map, service });
+    const first = sqlAttempt({ map, object });
     await first.end(() => first.db.execute("INSERT INTO notes VALUES ('milk')"));
-    const later = sqlAttempt({ map, service, id: 'later' });
+    const later = sqlAttempt({ map, object, id: 'later' });
     // The database holds the object's tables, and only them: how far the
     // schema got is a record beside them.
     expect(await later.end(() => later.db.values(TABLES))).toEqual([['notes']]);
@@ -43,72 +41,58 @@ describe("an object's schema", () => {
   });
 
   it('runs a step added later on each existing database, once', async () => {
-    const service = objectWith(NOTES);
+    const object = objectWith([NOTES]);
+    const service = object.name;
     const map = new Map<string, Uint8Array>();
-    const first = sqlAttempt({ map, service });
+    const first = sqlAttempt({ map, object });
     await first.end(() => first.db.execute("INSERT INTO notes VALUES ('milk')"));
-    restate.sessionObject({
-      name: service,
-      schema: [NOTES, 'ALTER TABLE notes ADD COLUMN done INT', done],
-      handlers: {},
-      views: {},
-    });
-    const later = sqlAttempt({ map, service, id: 'later' });
+    const v2 = objectWith([NOTES, 'ALTER TABLE notes ADD COLUMN done INT', done], service);
+    const later = sqlAttempt({ map, object: v2, id: 'later' });
     expect(await later.end(() => later.db.values('SELECT text, done FROM notes'))).toEqual([['milk', 1]]);
   });
 
   it('reads a key never written as empty tables, in a shared handler, storing nothing', async () => {
-    const service = objectWith(NOTES);
+    const object = objectWith([NOTES]);
     const map = new Map<string, Uint8Array>();
-    const reader = sqlAttempt({ map, service, shared: true });
+    const reader = sqlAttempt({ map, object, shared: true });
     expect(await reader.end(() => reader.db.values('SELECT text FROM notes'))).toEqual([]);
     expect(map.size).toBe(0);
   });
 
   it('is applied by a writer after a shared handler read a key never written', async () => {
-    const service = objectWith(NOTES);
+    const object = objectWith([NOTES]);
     const map = new Map<string, Uint8Array>();
-    const reader = sqlAttempt({ map, service, shared: true, id: 'reader' });
+    const reader = sqlAttempt({ map, object, shared: true, id: 'reader' });
     await reader.end(() => reader.db.values('SELECT text FROM notes'));
-    const writer = sqlAttempt({ map, service, id: 'writer' });
+    const writer = sqlAttempt({ map, object, id: 'writer' });
     await writer.end(() => writer.db.execute("INSERT INTO notes VALUES ('milk')"));
-    const later = sqlAttempt({ map, service, id: 'later' });
+    const later = sqlAttempt({ map, object, id: 'later' });
     expect(await later.end(() => later.db.values('SELECT text FROM notes'))).toEqual([['milk']]);
   });
 });
 
 describe('a schema step that fails', () => {
   it('fails the invocation for good, leaves the database as it was, and a fixed step runs once', async () => {
-    const service = objectWith(NOTES);
+    const object = objectWith([NOTES]);
+    const service = object.name;
     const map = new Map<string, Uint8Array>();
-    const first = sqlAttempt({ map, service });
+    const first = sqlAttempt({ map, object });
     await first.end(() => first.db.execute("INSERT INTO notes VALUES ('milk')"));
     // v2: a column, then a step that fails. The steps a database lacks run in
     // one transaction, so the column goes with the failure.
-    restate.sessionObject({
-      name: service,
-      schema: [NOTES, 'ALTER TABLE notes ADD COLUMN done INT', 'INSERT INTO missing VALUES (1)'],
-      handlers: {},
-      views: {},
-    });
-    const failing = sqlAttempt({ map, service, id: 'failing' });
+    const v2 = objectWith([NOTES, 'ALTER TABLE notes ADD COLUMN done INT', 'INSERT INTO missing VALUES (1)'], service);
+    const failing = sqlAttempt({ map, object: v2, id: 'failing' });
     // An SQL error, so terminal: every invocation of the key fails until a fix is deployed.
     await expect(failing.end(() => failing.db.values('SELECT text FROM notes'))).rejects.toThrow(
       expect.objectContaining({ name: 'TerminalError', message: expect.stringMatching(/no such table: missing/) }),
     );
     expect(await stepsOf(map, service)).toBe('1');
     // Rolled back to v1: its code finds its database as it left it.
-    restate.sessionObject({ name: service, schema: [NOTES], handlers: {}, views: {} });
-    const v1 = sqlAttempt({ map, service, id: 'v1' });
+    const v1 = sqlAttempt({ map, object, id: 'v1' });
     expect(await v1.end(() => v1.db.values("SELECT name FROM pragma_table_info('notes')"))).toEqual([['text']]);
     // v3 fixes the step: it runs once, with the column.
-    restate.sessionObject({
-      name: service,
-      schema: [NOTES, 'ALTER TABLE notes ADD COLUMN done INT', done],
-      handlers: {},
-      views: {},
-    });
-    const fixed = sqlAttempt({ map, service, id: 'fixed' });
+    const v3 = objectWith([NOTES, 'ALTER TABLE notes ADD COLUMN done INT', done], service);
+    const fixed = sqlAttempt({ map, object: v3, id: 'fixed' });
     expect(await fixed.end(() => fixed.db.values('SELECT text, done FROM notes'))).toEqual([['milk', 1]]);
     expect(await stepsOf(map, service)).toBe('3');
   });
@@ -118,9 +102,10 @@ describe("a library's schema", () => {
   const LIBRARY = new Schema('library', ['CREATE TABLE library_items (item TEXT)']);
 
   it('is ensured where it is used, beside the object’s own', async () => {
-    const service = objectWith(NOTES);
+    const object = objectWith([NOTES]);
+    const service = object.name;
     const map = new Map<string, Uint8Array>();
-    const attempt = sqlAttempt({ map, service });
+    const attempt = sqlAttempt({ map, object });
     const tables = await attempt.end(async () => {
       await LIBRARY.ensure(attempt.db);
       await attempt.db.execute("INSERT INTO library_items VALUES ('a')");

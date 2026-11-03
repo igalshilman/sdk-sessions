@@ -15,7 +15,7 @@
 // start, a row of `restate_agent_log_start`), so a client following it reads
 // on, and drops the messages before `first`.
 import type { Database, DatabaseReader, DatabaseWriter } from '@restatedev/sessions';
-import { Schema } from '@restatedev/sessions/internal';
+import { Schema, Scoped } from '@restatedev/sessions/internal';
 import type { ChatMessage, Messages, MessagesRequest } from './common.ts';
 
 const TABLE = 'restate_agent_log';
@@ -77,11 +77,11 @@ interface Head {
  * stored it: the next compares the transcript with it, rather than read the
  * whole log again at each step.
  */
-const heads = new WeakMap<Database, Head>();
+const HEAD = new Scoped<Head>('the log');
 
 /** The log's head in `db`: as this session stored it last, or else as the log has it. */
 async function headOf(db: Database): Promise<Head> {
-  const cached = heads.get(db);
+  const cached = HEAD.get(db);
   if (cached) return cached;
   const rows = (await db.values(`SELECT id, message FROM ${TABLE} WHERE position IS NOT NULL ORDER BY position`)).map(
     ([id, json]) => ({ id: Number(id), message: JSON.parse(String(json)) as Said, json: String(json) }),
@@ -134,10 +134,10 @@ export async function sync(db: Database, messages: Said[]) {
     });
   } catch (error) {
     // Rolled back: the log is as it was, which the next sync reads again.
-    heads.delete(db);
+    HEAD.delete(db);
     throw error;
   }
-  heads.set(db, { rows, seq, next: id });
+  HEAD.set(db, { rows, seq, next: id });
 }
 
 /**

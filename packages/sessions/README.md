@@ -503,10 +503,17 @@ in-memory copy of the object's state, through crashes and fencing.
 - `contextOf`: a handler's or view's context over such a context;
 - `Attempt` and `withAttempt`: an attempt's database;
 - `open` and `asDatabase`: a database over a store of your own;
-- `setStoreWrapper`: fault injection in the store.
+- `withStoreWrapper`: fault injection in a session object's store;
+- `configOf`: what a session object's attempts get, for attempts of a test's own.
 
 It also has what this repository's other libraries need: `Schema` (tables a
 library owns, applied where it uses them), `database` (another database of
 the same key), `reset` (empty the key's database in a transaction), and
 `cancelled` and `cancelCalls` (explicit cancellation, for a handler with
-`explicitCancellation: true`).
+`explicitCancellation: true`), and `Scoped` and `definitionOf`, for what a
+library keeps per context, per `ctx.db` or per object.
+
+Nothing is kept per process, but the native page cache. What the package
+keeps for a context, its `ctx.db` or a transaction is on that object
+(`Scoped`), and lives as long as it does; what a session object is given
+(its schema, its store's wrapper) is on its definition.

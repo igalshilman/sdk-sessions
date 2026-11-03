@@ -5,10 +5,21 @@
 // own copy, so that a library's journaled handlers serve beside its objects).
 export * as sdk from '@restatedev/restate-sdk';
 export { Schema } from './schema.ts';
-export { asDatabase, lazyDatabase, database, reset, setStoreWrapper, Attempt, withAttempt } from './session.ts';
-export type { SqlHost } from './session.ts';
+export { asDatabase, lazyDatabase, database, reset, Attempt, withAttempt } from './session.ts';
+export type { ObjectConfig, SqlHost } from './session.ts';
+export { Scoped } from './scoped.ts';
 export { open, type Connection, type Store, type ConnectionTransaction } from './database.ts';
 export { PromiseSelector } from './selector.ts';
 export { needing, served } from './serve.ts';
-export { cancelCalls, cancelled, contextOf, HEAD_KEY, invoke, type AttemptContext } from './object.ts';
+export {
+  cancelCalls,
+  cancelled,
+  configOf,
+  contextOf,
+  definitionOf,
+  HEAD_KEY,
+  invoke,
+  withStoreWrapper,
+  type AttemptContext,
+} from './object.ts';
 export type { DoProgressResult, Selectable, UnresolvedFuture } from './selector.ts';

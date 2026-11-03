@@ -85,7 +85,7 @@ export function sqlAttempt(options: AttemptOptions & { route?: (call: Made) => P
     key: options.key ?? 'k',
     request: () => ({
       ...base.request(),
-      target: { service: options.service ?? 'agent', key: options.key ?? 'k', handler: 'chat' },
+      target: { service: options.object?.name ?? options.service ?? 'agent', key: options.key ?? 'k', handler: 'chat' },
     }),
     genericCall: async (c: Made) => route(c),
     genericSend: (c: Made) => void route(c),
@@ -94,8 +94,9 @@ export function sqlAttempt(options: AttemptOptions & { route?: (call: Made) => P
     invocation: (id: string) => ({ cancel: () => options.cancel?.(id) }),
   } as unknown as AttemptContext;
   // A chat handler's: with explicit cancellation.
-  const ctx = contextOf(sdk, base.db, { explicitCancellation: true });
-  return { ...base, ctx, view: contextOf(sdk, base.db, { view: true }) };
+  const definition = options.object;
+  const ctx = contextOf(sdk, base.db, { explicitCancellation: true, definition });
+  return { ...base, ctx, view: contextOf(sdk, base.db, { view: true, definition }) };
 }
 
 /** A handler: a function, or one with options (as `chat()` gives). */
@@ -414,7 +415,7 @@ export async function endedWhileWorking(chat: (tools: Tool[]) => PromptHandler) 
 export async function followedWhileWorking(
   chat: (tools: Tool[]) => PromptHandler,
   messages: (ctx: restate.ViewContext, request: object) => Promise<{ messages: { parts: unknown[] }[] }>,
-  { service }: { service?: string } = {},
+  { object }: { object?: { readonly name: string } } = {},
 ) {
   const map = new Map<string, Uint8Array>();
   const transfer = tool({
@@ -424,7 +425,7 @@ export async function followedWhileWorking(
     run: () => 'moved 5 from account 1 to account 2',
   });
   const attempt = (id: string, shared = false) => {
-    const sql = sqlAttempt({ map, key: 'follow', id, shared, service });
+    const sql = sqlAttempt({ map, key: 'follow', id, shared, object });
     return { sql, ctx: sql.ctx, view: sql.view };
   };
   const turn = attempt('inv1');
