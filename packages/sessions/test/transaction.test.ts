@@ -202,6 +202,31 @@ describe('the sends of a transaction', () => {
     await expectMadeOnce(map, sent);
   });
 
+  it('makes them on the attempt after a crash of the cancelled invocation, whose open the cancel signal fails', async () => {
+    const o = object();
+    const crashed = o.attempt({ crash: true });
+    await expect(transfer(crashed)).rejects.toThrow('crashed'); // committed; the sends are lost
+    crashed.abort();
+    const lost = await o.outbox();
+    expect(lost).toHaveLength(2);
+    // The invocation is cancelled: Restate delivers the signal to the next
+    // attempt at its first await, the open, once.
+    let signal = true;
+    const sent: Send[] = [];
+    const next = sqlAttempt({
+      map: o.map,
+      send: (s: Send) => void sent.push(s),
+      onRequest: () => {
+        if (!signal) return;
+        signal = false;
+        throw new restate.CancelledError();
+      },
+    });
+    await expect(next.end(() => next.db.values('SELECT 1'))).rejects.toBeInstanceOf(restate.CancelledError);
+    expect(sent.map((s) => s.idempotencyKey)).toEqual(lost);
+    expect(await o.outbox()).toEqual([]);
+  });
+
   it('empties the outbox it sent again as it opens, before the handler ends', async () => {
     const o = object();
     const crashed = o.attempt({ crash: true });

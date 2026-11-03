@@ -616,6 +616,18 @@ export class Attempt {
     try {
       db = await session;
     } catch (error) {
+      // An open that the invocation's cancellation failed: this attempt
+      // follows a crash of the cancelled invocation (one that interrupted the
+      // end of its attempt below, say), and the outbox may hold the sends of
+      // a commit the cancellation interrupted, which no attempt after this
+      // one makes. Restate delivers the cancel signal once per attempt, at
+      // its first await, so a second open goes through: it makes them (see
+      // `start`).
+      if (this.cancelled !== undefined && this.name === undefined && !this.ctx.shared) {
+        await this.start()
+          .then((again) => this.save(again))
+          .catch(() => {});
+      }
       // The open failed, and its error went to the call that made it; one
       // made as the attempt started that no call saw fails the attempt, as
       // its outbox is still to be made.
