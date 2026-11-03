@@ -62,8 +62,14 @@ export interface AttemptOptions {
   cancel?: (invocationId: string) => void;
   /** Before each of the attempt's state requests. */
   onRequest?: () => void;
-  /** The `ctx.run` that syncs a commit's writes: it may reject, as one Restate cancelled does. */
+  /** The `ctx.run` that syncs a commit's writes: it may reject, as one the attempt's end left, or the SDK cancelled, does. */
   onSync?: () => Promise<void>;
+  /**
+   * Each request the attempt awaits (a state get, the state's keys, a sync),
+   * as the SDK settles it: it may reject with a CancelledError, as one the SDK
+   * cancels does.
+   */
+  onAwait?: () => Promise<void>;
   /** A shared handler's attempt: its `ctx.db` reads beside the owner's, and writes nothing. */
   shared?: boolean;
   /** The object's name (by default, one of its own), such as one with a schema. */
@@ -86,6 +92,7 @@ export function sqlAttempt({
   cancel = () => {},
   onRequest = () => {},
   onSync = async () => {},
+  onAwait = async () => {},
   shared = false,
   service = `test-${randomUUID()}`,
 }: AttemptOptions) {
@@ -107,7 +114,9 @@ export function sqlAttempt({
     defaultSerde: restate.serde.json,
     get: async (k: string) => {
       onRequest();
-      return map.get(k) ?? null;
+      const value = map.get(k) ?? null;
+      await onAwait();
+      return value;
     },
     set: (k: string, value: Uint8Array) => {
       check();
@@ -119,9 +128,14 @@ export function sqlAttempt({
     },
     stateKeys: async () => {
       onRequest();
-      return [...map.keys()];
+      const keys = [...map.keys()];
+      await onAwait();
+      return keys;
     },
-    run: () => onSync(),
+    run: async () => {
+      await onSync();
+      await onAwait();
+    },
     genericSend: (s: restate.GenericSend<Uint8Array>) => {
       check();
       send(s);
@@ -148,6 +162,8 @@ export function sqlAttempt({
     ctx: contextOf(sdkOf(ctx, cancel), attempt.db),
     /** A view's context, over this attempt's `ctx.db`. */
     view: contextOf(sdkOf(ctx, cancel), attempt.db, { view: true }),
+    /** Open the session now, as an exclusive attempt starts. */
+    openNow: () => attempt.openNow(),
     /** `handler`'s result, once its session ended. */
     end: <T>(handler: () => Promise<T>) => withAttempt(handler, attempt).finally(ended),
     /** The attempt ends, as when Restate fences or suspends it. */

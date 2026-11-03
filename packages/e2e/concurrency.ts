@@ -254,18 +254,33 @@ const database = restate.sessionObject({
       await ctx.db.execute('INSERT INTO marks VALUES (?)', [i]);
     },
 
-    // Cancels itself inside its transaction: what it committed, it sent, as
-    // the handler ends, though nothing invokes this key again. (Here the
-    // cancellation arrives after the sends are made; one that ends the
-    // handler between a commit and its sends is transaction.test.ts's.)
+    // Cancels itself inside its transaction, then compensates in its database.
+    // The cancellation reaches one await of the handler's, once, as in any
+    // handler: whichever of these it reaches, what came before that await is
+    // stored, so the transaction committed and its mark is sent though
+    // nothing invokes this key again, and the compensation is stored too.
+    // The result: how many awaits failed with the cancellation.
     cancelledCommit: async (ctx, i: number) => {
-      await ctx.db.values('SELECT count(*) FROM t'); // opened: the transaction's first wait on Restate is its commit
-      await ctx.db.transaction(async (tx) => {
-        await tx.execute('INSERT INTO t VALUES (?)', [i]);
-        tx.send({ service: 'Db', key: 'cancel-marks', handler: 'mark', input: i });
-        ctx.cancel(ctx.request.id);
-      });
-      return 'not cancelled';
+      let cancellations = 0;
+      const counting = async (step: () => Promise<unknown>) => {
+        try {
+          await step();
+        } catch (e) {
+          if (!(e instanceof restate.CancelledError)) throw e;
+          cancellations++;
+        }
+      };
+      await counting(() => ctx.db.values('SELECT count(*) FROM t'));
+      await counting(() =>
+        ctx.db.transaction(async (tx) => {
+          await tx.execute('INSERT INTO t VALUES (?)', [i]);
+          tx.send({ service: 'Db', key: 'cancel-marks', handler: 'mark', input: i });
+          ctx.cancel(ctx.request.id);
+        }),
+      );
+      await counting(() => ctx.db.execute('INSERT INTO t VALUES (?)', [-1 - i]));
+      await counting(() => pause(ctx, `cancelled-${i}`, 500)); // by now, the cancellation came
+      return cancellations;
     },
   },
   views: {
@@ -476,27 +491,25 @@ await check("a transaction's sends reach their target", async () => {
   assert.deepEqual(marks, [0, 1, 2]);
 });
 
-await check('a handler cancelled in its transaction sent what it committed, with no later invocation', async () => {
-  for (let i = 0; i < 5; i++) {
-    const r = await fetch(`${INGRESS}/Db/cancelled-${i}/cancelledCommit`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(i),
-    });
-    assert.equal(r.status, 409, `cancelled-${i}: ${r.status} ${await r.text()}`);
-  }
-  // Each key that committed sent its mark; one that did not, none.
-  const committed: number[] = [];
-  for (let i = 0; i < 5; i++) committed.push(...((await call(`Db/cancelled-${i}/committed`)).value as number[]));
-  const deadline = Date.now() + 10_000;
-  let marks: unknown;
-  do {
-    marks = (await call('Db/cancel-marks/marks')).value;
-    if (JSON.stringify(marks) === JSON.stringify(committed)) break;
-    await sleep(100);
-  } while (Date.now() < deadline);
-  assert.deepEqual(marks, committed);
-});
+await check(
+  'a cancellation fails one await, once; what committed is sent, and the handler compensates after it',
+  async () => {
+    for (let i = 0; i < 5; i++) {
+      assert.equal((await call(`Db/cancelled-${i}/cancelledCommit`, i)).value, 1, `cancelled-${i}: cancellations seen`);
+      // The transaction, and the compensation after the cancellation.
+      assert.deepEqual((await call(`Db/cancelled-${i}/committed`)).value, [-1 - i, i], `cancelled-${i}: rows`);
+    }
+    // Each transaction's send went out, though nothing invoked its key again.
+    const deadline = Date.now() + 10_000;
+    let marks: unknown;
+    do {
+      marks = (await call('Db/cancel-marks/marks')).value;
+      if (JSON.stringify(marks) === '[0,1,2,3,4]') break;
+      await sleep(100);
+    } while (Date.now() < deadline);
+    assert.deepEqual(marks, [0, 1, 2, 3, 4]);
+  },
+);
 
 await check('an SQL error that the handler fails with is terminal', async () => {
   const started = Date.now();

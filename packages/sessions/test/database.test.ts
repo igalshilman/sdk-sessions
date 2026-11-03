@@ -522,13 +522,15 @@ for (const { how, keys } of [
     await db.execute('CREATE TABLE t(b BLOB)');
     let committed = 0;
     // A commit that checkpoints collects, once the tail holds a few rows: it
-    // succeeds, and the call after it finds the session ended.
+    // succeeds, and the call after it finds the session ended, of the
+    // listing's error.
     await assert.rejects(async () => {
       while (committed < 40) {
         await db.execute('INSERT INTO t VALUES (randomblob(3000))');
         committed++;
       }
-    }, /session ended/);
+    }, /listing failed/);
+    assert.equal(db.isUsable(), false);
     assert.ok(committed > 0 && committed < 40, `${committed} committed`);
     const reopened = await open(ns, backend.request());
     assert.deepEqual(await reopened.values('SELECT count(*) FROM t'), [[committed]]);
@@ -581,4 +583,53 @@ test('a reader of a namespace without a database reads none', async () => {
   const reader = await open(fresh(), readerOf(new Backend()), { reader: true });
   assert.deepEqual(await reader.values('SELECT count(*) FROM sqlite_schema'), [[0]]);
   await reader.close();
+});
+
+/** `store`, recording its writes and syncs in `events`. */
+const traced = (store: Store, events: string[]): Store => ({
+  ...store,
+  set: (key, value) => (events.push(`set ${key}`), store.set(key, value)),
+  sync: () => (events.push('sync'), store.sync()),
+});
+
+test('withCommit runs with the commit, after its writes and before its sync; never on a rollback', async () => {
+  const events: string[] = [];
+  const db = await open(fresh(), traced(new Backend().request(), events));
+  await db.execute('CREATE TABLE t(v INTEGER)');
+  events.length = 0;
+  await db.transaction(async (tx) => {
+    await tx.execute('INSERT INTO t VALUES (1)');
+    tx.withCommit(() => events.push('withCommit'));
+  });
+  const at = events.indexOf('withCommit');
+  assert.ok(at > 0 && events.slice(0, at).every((e) => e.startsWith('set ')), events.join(', '));
+  assert.equal(events[at + 1], 'sync');
+  // Rolled back, it never runs; with nothing written, it runs after the commit.
+  const ran: string[] = [];
+  await assert.rejects(
+    db.transaction(async (tx) => {
+      tx.withCommit(() => ran.push('rolled back'));
+      throw new Error('no');
+    }),
+    /no/,
+  );
+  await db.transaction(async (tx) => tx.withCommit(() => ran.push('wrote nothing')));
+  assert.deepEqual(ran, ['wrote nothing']);
+  await db.close();
+});
+
+test("a store's error that ends the session is what its calls fail with, as it was thrown", async () => {
+  const backend = new Backend();
+  const ns = fresh();
+  const setup = await open(ns, backend.request());
+  await setup.execute('CREATE TABLE t(v INTEGER)');
+  await setup.save();
+  const cancelled = new (class Cancelled extends Error {})('cancelled');
+  const store = backend.request();
+  const db = await open(ns, { ...store, sync: () => Promise.reject(cancelled) });
+  // The commit's, and every call after it on the session it ended.
+  await assert.rejects(db.execute('INSERT INTO t VALUES (1)'), (e) => e === cancelled);
+  await assert.rejects(db.values('SELECT 1'), (e) => e === cancelled);
+  assert.equal(db.isUsable(), false);
+  await db.close();
 });

@@ -5,7 +5,7 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import type * as restate from '@restatedev/restate-sdk';
-import { CancelledError, serde, TerminalError } from '@restatedev/restate-sdk';
+import { serde, TerminalError } from '@restatedev/restate-sdk';
 import { millisOrDurationToMillis, type Serde } from '@restatedev/restate-sdk-core';
 import {
   open,
@@ -158,22 +158,12 @@ const unbeside = (name: string) => (key: string) => {
  * stores in order; `sync` is an empty `ctx.run`, acknowledged after the
  * commands before it. A `get` or `sync` the attempt's end leaves waiting
  * rejects, so the session that made it ends instead of holding its lock for
- * the life of the process.
+ * the life of the process. One the SDK cancels fails as any await does: the
+ * session it ends fails its calls with the CancelledError (see `open`).
  */
-function objectStore(
-  ctx: SqlHost,
-  end: AttemptEnd,
-  dbName: string | undefined,
-  cancelled: (error: CancelledError) => void,
-): Store {
+function objectStore(ctx: SqlHost, end: AttemptEnd, dbName: string | undefined): Store {
   const keyOf = dbName === undefined ? (key: string) => key : beside(dbName);
-  // The addon gets a request's failure as text: a cancellation is kept here,
-  // for the call that failed of it to fail with it (see `Attempt.call`).
-  const request = <T>(promise: PromiseLike<T>) =>
-    end.race(promise).catch((error: unknown) => {
-      if (error instanceof CancelledError) cancelled(error);
-      throw error;
-    });
+  const request = <T>(promise: PromiseLike<T>) => end.race(promise);
   // TODO: read with protocol v8's ephemeral get, left out of the journal, once
   // a Restate release ships v8 and the SDK lets a library make one. Restate 1.8
   // negotiates v7 at most: a journaled get.
@@ -286,8 +276,8 @@ const refusedSend: Send = () => {
 
 // A transaction's sends commit with it, in the database's record `outbox`
 // (beside its tables, in none of them), which holds each committed
-// transaction's sends until they are stored. They are made once the
-// transaction commits; a later open makes again those still in the outbox,
+// transaction's sends until they are stored. They are made with its commit
+// (see `Attempt.transaction`); a later open makes again those still in the outbox,
 // with the same idempotency keys (`transaction/<id>/<index>`, with a random
 // id of the transaction), so making them again is dropped. Restate keeps an attempt's commands in the
 // order they were made, so a send made before a commit is stored whenever the
@@ -334,11 +324,6 @@ function storedSend(send: restate.GenericSend<unknown>): Outgoing['sends'][numbe
 /** How a handler ended. */
 type Outcome<T> = { value: T } | { error: unknown };
 
-function settle<T>(outcome: Outcome<T>): T {
-  if ('error' in outcome) throw outcome.error;
-  return outcome.value;
-}
-
 // The attempts, by their `ctx.db`: for `database`.
 const attempts = new WeakMap<object, Attempt>();
 
@@ -359,60 +344,109 @@ export function database(db: Database, name: string): Database {
   return attempt.database(name);
 }
 
+/** The sends of one transaction, as its body makes them (`tx.send`), until it ends. */
+class Sends {
+  private readonly sends: Outgoing['sends'] = [];
+  private open = true;
+  readonly send: Send = sendOf((send) => {
+    if (!this.open) throw new TerminalError('the transaction has ended: send from inside its body');
+    this.sends.push(storedSend(send));
+  });
+
+  /** The body ended: the transaction's sends, if it made any, their delays counted from now. */
+  close(): Outgoing | undefined {
+    this.open = false;
+    if (this.sends.length === 0) return undefined;
+    const now = Date.now();
+    for (const send of this.sends) if (send.delay !== undefined) send.due = now + send.delay;
+    return { id: randomUUID(), sends: this.sends };
+  }
+}
+
+/**
+ * One session of an attempt's database, from its open on. A failure ends it:
+ * its open's, or a request's since. It closes as the attempt ends, unless the
+ * attempt ends it first ({@link end}).
+ */
+class Session {
+  readonly ready: Promise<Connection>;
+  /** A call failed on it once a failure ended it: the next call opens another. */
+  retired = false;
+  private connection: Connection | undefined;
+  private failed = false;
+  private release: () => void = () => {};
+
+  constructor(ready: Promise<Connection>, end: AttemptEnd) {
+    this.ready = ready;
+    void this.track(end);
+  }
+
+  /** Whether a failure ended it. */
+  get ended(): boolean {
+    return this.failed || this.connection?.isUsable() === false;
+  }
+
+  /** Its connection, or none if the open failed; the attempt's end no longer closes it. */
+  async end(): Promise<Connection | undefined> {
+    const db = await this.ready.catch(() => undefined);
+    this.release();
+    return db;
+  }
+
+  /** Close it now. */
+  close(): void {
+    void this.end()
+      .then((db) => db?.close())
+      .catch(() => {});
+  }
+
+  private async track(end: AttemptEnd) {
+    try {
+      const db = await this.ready;
+      this.connection = db;
+      // A handler still waiting for something else when the attempt ends (a
+      // model request, say) keeps the session no longer: it closes once no
+      // statement runs, and the handler's later calls fail.
+      this.release = end.onEnd(() => void db.close().catch(() => {}));
+    } catch {
+      this.failed = true;
+    }
+  }
+}
+
 /**
  * An attempt's SQL session: opened on its first use, or as an exclusive
  * attempt starts ({@link openNow}), shared by everything the handler does,
- * and saved when the handler ends ({@link end}). With `name`, of the key's database `name`
- * ({@link database}), which has neither the object's schema nor an outbox.
+ * and saved when the handler ends ({@link end}). With `name`, of the key's
+ * database `name` ({@link database}), which has neither the object's schema
+ * nor an outbox.
  */
 export class Attempt {
   /** `ctx.db`. */
   readonly db: Database;
   private readonly ctx: SqlHost;
   private readonly name: string | undefined;
+  /** Whether it is the object's own database of an exclusive handler: the one with an outbox. */
+  private readonly hasOutbox: boolean;
   /** The key's other databases this attempt opened, by name. */
   private readonly databases = new Map<string, Attempt>();
   /** The session, from its first use on. */
-  private session: Promise<Connection> | undefined;
+  private session: Session | undefined;
   /** The ids of the outbox's transactions this attempt made the sends of. */
   private readonly made = new Set<string>();
   /** The schemas this attempt's database has all the steps of. */
   private readonly ensured = new Map<string, Schema>();
   private ended = false;
-  /** Opened when the attempt started ({@link openNow}), and no call has seen how it went yet. */
-  private unseenOpen = false;
-  /** Stops closing the session when the attempt ends. */
-  private keepOpen: () => void = () => {};
-  /** The invocation's cancellation, once a request of the session failed of it. */
-  private cancelled: CancelledError | undefined;
 
   constructor(ctx: SqlHost, name?: string) {
     this.ctx = ctx;
     this.name = name;
+    this.hasOutbox = !ctx.shared && name === undefined;
     this.db = {
       ...sqlOver((sql, params) => this.call((db) => db.queryColumns(sql, params)), handlerError),
-      // A shared handler's writes stay in its session: it has no outbox.
-      transaction: <T>(body: (tx: Transaction) => Promise<T>) =>
-        this.ctx.shared
-          ? this.call((db) => db.transaction((tx) => body({ ...forBody(tx), send: refusedSend })))
-          : this.name !== undefined
-            ? this.call((db) =>
-                db.transaction((handle) => {
-                  const transaction: Transaction = { ...forBody(handle), send: refusedSend };
-                  resets.set(transaction, () => this.reset(handle));
-                  return body(transaction);
-                }),
-              )
-            : this.withSends((tx, record, handle) => {
-                const transaction: Transaction = { ...tx, send: sendOf(record) };
-                resets.set(transaction, () => this.reset(handle));
-                return body(transaction);
-              }),
+      transaction: (body) => this.transaction(body),
     };
-    sessions.set(this.db, (schemas) => {
-      this.unseenOpen = false;
-      return this.opened().then((db) => this.ensureSchemas(db, schemas));
-    });
+    sessions.set(this.db, (schemas) => this.call((db) => this.ensureSchemas(db, schemas)));
     attempts.set(this.db, this);
   }
 
@@ -425,61 +459,17 @@ export class Attempt {
   }
 
   /**
-   * One transaction of the session, whose sends are made once it commits,
-   * and kept in the outbox until they are stored: `body` gets its SQL, and
-   * `record`, which records a send.
+   * Open the session now, as the attempt starts, rather than on its first
+   * call: the open makes the sends a crashed attempt committed and left
+   * unmade, which must not wait for a handler that uses the database.
    */
-  private async withSends<T>(
-    body: (
-      db: DatabaseWriter,
-      record: (send: restate.GenericSend<unknown>) => void,
-      handle: ConnectionTransaction,
-    ) => Promise<T>,
-  ): Promise<T> {
-    const sends: Outgoing['sends'] = [];
-    let recording = true;
-    const record = (send: restate.GenericSend<unknown>) => {
-      if (!recording) throw new TerminalError('the transaction has ended: send from inside its body');
-      sends.push(storedSend(send));
-    };
-    let outgoing: Outgoing | undefined;
-    const value = await this.call((db) =>
-      db.transaction(async (handle) => {
-        let result: T;
-        try {
-          result = await body(forBody(handle), record, handle);
-        } finally {
-          recording = false;
-        }
-        // The outbox as committed, but the sends stored since, and this
-        // transaction's: unchanged, it is not written again.
-        const outbox = await this.unstored(handle);
-        if (sends.length > 0) {
-          // A delay counts from the commit: one made again waits what remains.
-          const now = Date.now();
-          for (const send of sends) if (send.delay !== undefined) send.due = now + send.delay;
-          outgoing = { id: randomUUID(), sends };
-          outbox.push(outgoing);
-        }
-        handle.setRecord(OUTBOX, encodeOutbox(outbox));
-        return result;
-      }),
-    );
-    if (outgoing !== undefined) {
-      this.make(outgoing);
-      // Emptied at once, by a commit after the sends, which Restate stores
-      // before it: left in the outbox until the handler's end, they would be
-      // made again by an attempt that resumes a long wait (an approval), past
-      // the idempotency retention that drops a repeat.
-      await this.call((db) => this.flush(db));
-    }
-    return value;
+  openNow() {
+    if (this.hasOutbox && this.session === undefined) this.current().ready.catch(() => {});
   }
 
   /**
-   * The handler ended with `outcome`: an SQL error that escaped it becomes
-   * terminal, then the outbox is emptied, and the session is saved. One that
-   * a storage error ended closes now, rather than when it is collected.
+   * The handler ended with `outcome`: the key's other databases end, then
+   * this one ({@link endSession}).
    */
   async end<T>(outcome: Outcome<T>): Promise<T> {
     // The key's other databases end first, as the handler left them.
@@ -491,45 +481,182 @@ export class Attempt {
   }
 
   /**
-   * Open the session now, as the attempt starts, rather than on its first
-   * call: the open makes the sends a crashed attempt committed and left
-   * unmade, which must not wait for a handler that uses the database.
+   * `body` as one transaction. In the object's own database of an exclusive
+   * handler, its sends commit with it, in the outbox, and are made with its
+   * commit, right after its writes and before it waits for anything
+   * (`withCommit`): Restate stores an attempt's commands in order, so they
+   * are stored only if the commit is, and whatever fails the commit's wait (a
+   * cancellation, say) comes after them. A second commit empties the outbox
+   * before `transaction` resolves: left until the handler's end, they would
+   * be made again by an attempt that resumes a long wait (an approval), past
+   * the idempotency retention that drops a repeat.
    */
-  openNow() {
-    if (this.ctx.shared || this.name !== undefined || this.session !== undefined) return;
-    this.unseenOpen = true;
-    this.opened().catch(() => {});
+  private async transaction<T>(body: (tx: Transaction) => Promise<T>): Promise<T> {
+    let outgoing: Outgoing | undefined;
+    const value = await this.call((db) =>
+      db.transaction(async (handle) => {
+        const sends = this.hasOutbox ? new Sends() : undefined;
+        const tx: Transaction = { ...forBody(handle), send: sends?.send ?? refusedSend };
+        // A view's writes stay in its session: it has nothing to reset.
+        if (!this.ctx.shared) resets.set(tx, () => this.reset(handle));
+        let result: T;
+        try {
+          result = await body(tx);
+        } finally {
+          outgoing = sends?.close();
+        }
+        if (this.hasOutbox) await this.commitOutbox(handle, outgoing);
+        return result;
+      }),
+    );
+    if (outgoing !== undefined) await this.call((db) => this.flush(db));
+    return value;
   }
 
-  /** Empty the database in the transaction `handle` ({@link reset}), and apply the schemas this attempt applied again. */
-  private async reset(handle: ConnectionTransaction) {
-    // Another database of the key has none of the object's schema.
-    const own = this.name === undefined ? ofObject(this.ctx.request().target.service) : undefined;
-    const schemas = [...(own ? [own] : []), ...[...this.ensured.values()].filter((s) => s !== own)];
-    await dropAll(handle, schemas);
+  /**
+   * Commit with `handle` the outbox as committed, but the sends stored since,
+   * and with `outgoing`, which the commit makes. Unchanged, it is not
+   * written again.
+   */
+  private async commitOutbox(handle: ConnectionTransaction, outgoing: Outgoing | undefined) {
+    const outbox = await this.unstored(handle);
+    if (outgoing !== undefined) {
+      outbox.push(outgoing);
+      handle.withCommit(() => this.make(outgoing));
+    }
+    handle.setRecord(OUTBOX, encodeOutbox(outbox));
   }
 
   /**
    * `call` on the session, opening it on the first; its failure as the
-   * handler fails with it, or the invocation's cancellation, if a request of
-   * the session failed of it: a call it ended fails with a CancelledError,
-   * as any of the handler's awaits does.
+   * handler fails with it. The call that fails on a session that a failure
+   * ended is its last: the next opens another, which reads what is stored.
+   * So the failure of an open made as the attempt started goes to the first
+   * call, as it would had that call opened it.
    */
   private async call<T>(call: (db: Connection) => Promise<T>): Promise<T> {
-    this.unseenOpen = false;
+    const session = this.current();
     try {
-      const db = await this.opened();
-      return await forHandler(call(db));
+      return await call(await session.ready);
     } catch (error) {
-      throw this.cancelled ?? error;
+      if (session.ended) session.retired = true;
+      throw handlerError(error);
     }
+  }
+
+  /** The session, opening one if there is none, or the one there is was retired. */
+  private current(): Session {
+    if (this.ended) throw new Error('the handler has ended: its SQL session is closed');
+    if (this.session?.retired) this.session.close();
+    if (this.session === undefined || this.session.retired) this.session = this.open();
+    return this.session;
+  }
+
+  private open(): Session {
+    const end = new AttemptEnd(this.ctx.invocationEndPromise.promise);
+    return new Session(this.start(end), end);
+  }
+
+  private async start(end: AttemptEnd): Promise<Connection> {
+    const ctx = this.ctx;
+    // The page cache's: the key escaped, so that no key reads as another's
+    // database (a name has no `/`).
+    const key = `${ctx.request().target.service}/${encodeURIComponent(ctx.key)}`;
+    const namespace = this.name === undefined ? key : `${key}/${this.name}`;
+    const object = objectStore(ctx, end, this.name);
+    const db = await open(namespace, wrapStore ? wrapStore(object) : object, { reader: ctx.shared });
+    try {
+      // A view writes nothing: a write fails, rather than vanish with the attempt.
+      if (ctx.shared) await db.execute('PRAGMA query_only = 1');
+      if (this.hasOutbox) {
+        // What a crash left unmade; an open again in this attempt finds what
+        // this attempt made, stored before it, as made.
+        const left = decodeOutbox(await db.record(OUTBOX));
+        for (const outgoing of left) if (!this.made.has(outgoing.id)) this.make(outgoing, true);
+        // Emptied at once, as a transaction's own sends are (see `transaction`).
+        if (left.length > 0) await this.flush(db);
+      }
+      // A view's too, whose writes are never stored: a key never written reads as empty tables.
+      const own = this.ownSchema();
+      if (own) await this.ensureSchemas(db, [own]);
+    } catch (error) {
+      await db.close();
+      throw error;
+    }
+    return db;
+  }
+
+  /**
+   * End the session, then settle as the handler did: an SQL error that
+   * escaped it becomes terminal. The handler's error stands: what it
+   * committed is stored, and an outbox left full is made by the next open.
+   * A failure to end the session fails a handler that succeeded, which a
+   * retry then ends (a transaction it left open, say).
+   */
+  private async endSession<T>(outcome: Outcome<T>): Promise<T> {
+    this.ended = true;
+    const failed = await this.close().then(
+      () => undefined,
+      (error: unknown) => ({ error }),
+    );
+    if ('error' in outcome) throw handlerError(outcome.error);
+    if (failed !== undefined) throw handlerError(failed.error);
+    return outcome.value;
+  }
+
+  /**
+   * Close the session as the attempt ends. A view's closes: it read the
+   * snapshot it opened on, and one that outlived 16 commits failed its read
+   * ("is gone"), which is retried. Another is saved, its outbox emptied. One
+   * that a failure ended closes, and the object's own database is opened
+   * again and saved: it may hold sends unmade (a crash left them, and this
+   * attempt's open failed) or made and not emptied (the commit's wait
+   * failed), and no attempt may follow this one (a cancelled invocation's),
+   * nor the key's next invocation come within the idempotency retention.
+   */
+  private async close(): Promise<void> {
+    if (this.session === undefined) return;
+    const db = await this.session.end();
+    if (this.ctx.shared) return db?.close();
+    if (db?.isUsable()) return this.save(db);
+    await db?.close().catch(() => {});
+    if (!this.hasOutbox) return;
+    const again = this.open();
+    try {
+      await this.save(await again.ready);
+    } finally {
+      void again.end();
+    }
+  }
+
+  /** Empty the outbox and save the session, which closes if that fails. */
+  private async save(db: Connection) {
+    try {
+      if (this.hasOutbox) await this.flush(db);
+      await db.save();
+    } catch (error) {
+      await db.close().catch(() => {});
+      throw error;
+    }
+  }
+
+  /** The object's schema, which the key's other databases have none of. */
+  private ownSchema(): Schema | undefined {
+    return this.name === undefined ? ofObject(this.ctx.request().target.service) : undefined;
+  }
+
+  /** Empty the database in the transaction `handle` ({@link reset}), and apply the schemas this attempt applied again. */
+  private async reset(handle: ConnectionTransaction) {
+    const own = this.ownSchema();
+    const schemas = [...(own ? [own] : []), ...[...this.ensured.values()].filter((s) => s !== own)];
+    await dropAll(handle, schemas);
   }
 
   /** Apply the steps of `schemas` that the database lacks, each schema once per attempt. */
   private async ensureSchemas(db: Connection, schemas: readonly Schema[]) {
     const lacking = schemas.filter((s) => !this.ensured.has(s.name));
     if (lacking.length === 0) return;
-    await forHandler(apply(db, lacking, { reader: this.ctx.shared }));
+    await apply(db, lacking, { reader: this.ctx.shared });
     for (const s of lacking) this.ensured.set(s.name, s);
   }
 
@@ -562,106 +689,6 @@ export class Attempt {
     // Read in the transaction that writes it: one that committed sends since
     // the read above keeps them.
     await db.transaction(async (tx) => tx.setRecord(OUTBOX, encodeOutbox(await this.unstored(tx))));
-  }
-
-  /** The session, opening it on the first call. */
-  private opened(): Promise<Connection> {
-    if (this.ended) return Promise.reject(new Error('the handler has ended: its SQL session is closed'));
-    this.session ??= this.start();
-    return this.session;
-  }
-
-  private async start(): Promise<Connection> {
-    const ctx = this.ctx;
-    // The page cache's: the key escaped, so that no key reads as another's
-    // database (a name has no `/`).
-    const key = `${ctx.request().target.service}/${encodeURIComponent(ctx.key)}`;
-    const namespace = this.name === undefined ? key : `${key}/${this.name}`;
-    const end = new AttemptEnd(ctx.invocationEndPromise.promise);
-    const object = objectStore(ctx, end, this.name, (error) => (this.cancelled ??= error));
-    const db = await open(namespace, wrapStore ? wrapStore(object) : object, { reader: ctx.shared });
-    // A handler still waiting for something else when the attempt ends (a
-    // model request, say) keeps the session no longer: it closes once no
-    // statement runs, and the handler's later calls fail.
-    this.keepOpen = end.onEnd(() => void db.close().catch(() => {}));
-    // The object's schema: in a shared handler's session too, whose writes are never stored, so a
-    // key never written reads as empty tables.
-    const own = this.name === undefined ? ofObject(ctx.request().target.service) : undefined;
-    try {
-      // A view writes nothing: a write fails, rather than vanish with the attempt.
-      if (ctx.shared) await db.execute('PRAGMA query_only = 1');
-      // What a crash may have left unmade.
-      if (!ctx.shared && this.name === undefined) {
-        const left = decodeOutbox(await db.record(OUTBOX));
-        left.forEach((outgoing) => this.make(outgoing, true));
-        // Emptied at once, as a transaction's own sends are (see `withSends`):
-        // kept until the handler's end, an attempt that resumes a long wait
-        // would make them again, past the idempotency retention.
-        if (left.length > 0) await this.flush(db);
-      }
-      if (own) await this.ensureSchemas(db, [own]);
-    } catch (error) {
-      const failed = handlerError(error);
-      await db.close();
-      throw failed;
-    }
-    return db;
-  }
-
-  private async endSession<T>(outcome: Outcome<T>): Promise<T> {
-    this.ended = true;
-    const session = this.session;
-    if (session === undefined) return settle(outcome);
-    let db: Connection;
-    try {
-      db = await session;
-    } catch (error) {
-      // The open failed, and its error went to the call that made it; one
-      // made as the attempt started that no call saw fails the attempt, as
-      // its outbox is still to be made.
-      if (this.unseenOpen) throw error;
-      return settle(outcome);
-    }
-    this.keepOpen();
-    if (this.ctx.shared) {
-      // It read the snapshot it opened on, whatever committed since; one that
-      // outlived 16 commits failed its read ("is gone"), and is retried.
-      const failed = 'error' in outcome ? handlerError(outcome.error) : undefined;
-      await db.close();
-      if ('error' in outcome) throw failed;
-      return outcome.value;
-    }
-    // A cancellation that interrupted a commit, and so ended the session, may
-    // have left the commit's sends unmade, and no attempt follows a cancelled
-    // one: the key's next invocation would make them, whenever it comes.
-    // Opened again, the session makes them now (see `start`), stored only if
-    // the commit is, as they come after it. Whether the handler let the
-    // CancelledError end it, or caught it and returned.
-    if (!db.isUsable() && this.cancelled !== undefined && this.name === undefined) {
-      await db.close().catch(() => {});
-      await this.start()
-        .then((again) => this.save(again))
-        .catch(() => {});
-      if ('error' in outcome) throw handlerError(outcome.error);
-      return outcome.value;
-    }
-    if ('error' in outcome) {
-      const error = handlerError(outcome.error);
-      // The handler's error stands: what it committed is stored, and an
-      // outbox left full is made again by the next open.
-      await this.save(db).catch(() => db.close().catch(() => {}));
-      throw error;
-    }
-    // A transaction left open, say, which a retry would leave open again.
-    await forHandler(this.save(db));
-    return outcome.value;
-  }
-
-  /** Empty the outbox and save the session; one a storage error ended only closes. */
-  private async save(db: Connection) {
-    if (!db.isUsable()) return db.close();
-    await this.flush(db);
-    await db.save();
   }
 }
 
