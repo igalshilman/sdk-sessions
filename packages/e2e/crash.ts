@@ -30,7 +30,7 @@
 //
 // A soak: SOAK_MINUTES=n runs the shop and the bank in rounds until n
 // minutes passed, killing the server every KILL_EVERY_MINUTES (default 4),
-// and checks every process's memory (RSS) stays under SOAK_RSS_MB (default
+// and checks every service process's memory (RSS) stays under SOAK_RSS_MB (default
 // 1536). CRASH_ORDERS, CRASH_MOVES (per round) and CRASH_ACCOUNTS (default
 // 60, 120 and 12) set how many keys a run touches.
 //
@@ -287,8 +287,7 @@ function rotate(port: number, backends: number[], rotateMs: number) {
   let next = 0;
   const proxy = createServer((client) => {
     const at = next++ % backends.length;
-    served[at]!++;
-    const upstream = connect(backends[at]!, '127.0.0.1');
+    const upstream = connect(backends[at]!, '127.0.0.1', () => served[at]!++); // reached: it counts
     open.add(client);
     const close = () => {
       open.delete(client);
@@ -437,12 +436,27 @@ const transfer = async ({ from, ...m }: ReturnType<typeof move>) => {
     throw e;
   }
 };
+/** The status of the invocation `id` as Restate has it, or undefined once it is gone. */
+const invocationStatus = async (id: string) => {
+  const r = await fetch(`${ADMIN}/query`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ query: `SELECT status FROM sys_invocation WHERE id = '${id}'` }),
+  }).catch(() => null);
+  if (!r?.ok) return null; // the server is away
+  return ((await r.json()) as { rows: { status: string }[] }).rows[0]?.status;
+};
+// What state the cancellations found their transfers in: only one `running`
+// can interrupt a handler; the rest are of the inbox, or too late.
+const cancelledWhile: Record<string, number> = {};
 /** Send transfer `m`, cancel it soon after, and wait until it ended, however. */
 const cancelled = async ({ from, ...m }: ReturnType<typeof move>) => {
   const { invocationId } = await call<{ invocationId: string }>(`Account/${from}/transfer/send`, m, {
     'idempotency-key': m.id,
   });
   await sleep(m.amount * 5);
+  const found = (await invocationStatus(invocationId)) ?? 'gone';
+  cancelledWhile[found] = (cancelledWhile[found] ?? 0) + 1;
   for (;;) {
     const r = await fetch(`${ADMIN}/invocations/${invocationId}/cancel`, { method: 'PATCH' }).catch(() => null);
     if (r && r.status < 500) break;
@@ -451,13 +465,8 @@ const cancelled = async ({ from, ...m }: ReturnType<typeof move>) => {
   // Ended once Restate no longer runs it: completed, or already gone (the
   // Account keeps finished invocations only as long as its idempotency keys).
   for (;;) {
-    const r = await fetch(`${ADMIN}/query`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({ query: `SELECT status FROM sys_invocation WHERE id = '${invocationId}'` }),
-    }).catch(() => null);
-    const rows = r?.ok ? ((await r.json()) as { rows: { status: string }[] }).rows : undefined;
-    if (rows && (rows.length === 0 || rows[0]!.status === 'completed')) return 'cancelled';
+    const status = await invocationStatus(invocationId);
+    if (status === undefined || status === 'completed') return 'cancelled';
     await sleep(100);
   }
 };
@@ -712,6 +721,7 @@ assert.equal(await invocations('Ledger', 'transfer'), AGENTS.length * SESSIONS *
 
 console.error(`rounds: ${rounds}; orders: ${JSON.stringify(counts)}`);
 console.error(`views read: ${JSON.stringify(viewReads)}`);
+console.error(`cancellations found their transfer: ${JSON.stringify(cancelledWhile)}`);
 console.error(`shop processes served ${proxy.served.join(' and ')} connections`);
 console.error(`memory, most (MiB): ${memory()}`);
 proxy.served.forEach((n, i) => assert.ok(n > 1, `shop process ${i} took ${n} connections`));

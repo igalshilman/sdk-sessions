@@ -238,7 +238,7 @@ pnpm --filter e2e crash         # ~4 min: agents and sessions through crashes
 `crash.ts` prints the seed of its random aborts; a failed run prints it again,
 to run it once more with the same aborts. With `SOAK_MINUTES` it runs in
 rounds until then, over as many keys as you give it, and checks every
-process's memory:
+service process's memory:
 
 ```sh
 ABORT_SEED=1234 pnpm --filter e2e crash
@@ -271,12 +271,13 @@ Everything above runs locally as it does in CI
 [`nightly.yml`](.github/workflows/nightly.yml) every night). The Restate
 server comes for Linux and macOS, on x64 and arm64; on Windows, use WSL.
 
-- The `e2e` tests take ports 8080 and 9070 (Restate) and 9180 to 9194 (the
-  services), and refuse to start while something listens there: run them
+- The `e2e` tests take ports 8080 and 9070 (Restate) and 9180 to 9194 and
+  9301 (the services), and refuse to start while something listens there: run them
   one at a time.
-- `crash.ts` gives each of its seven service processes a page cache of
-  1 GiB on disk, in a sparse file under the temporary directory. A failed
-  run keeps that directory, with every process's log, and prints its path.
+- `crash.ts` gives each of its seven service processes a page cache file
+  under the temporary directory: 1 GiB, sparse, or 8 MiB for the process
+  with the small cache. A failed run keeps that directory, with every
+  process's log, and prints its path.
 - The soak's memory check reads `/proc`, so it runs on Linux only;
   elsewhere the soak checks everything else.
 

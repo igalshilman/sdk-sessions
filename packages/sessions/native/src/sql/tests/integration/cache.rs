@@ -553,10 +553,17 @@ fn a_damaged_cache_file_never_makes_a_read_wrong() -> Result<()> {
             let namespace = Namespace::new(&cache, &format!("damaged-{how}"));
             create(store.clone(), cached(&namespace)).await?;
             let expected = 400 * 900 + 400 * 401 / 2;
+            // Served by the cache, its disk tier included: the table is larger than its memory.
+            store.inner.reset_stats();
             assert_eq!(
                 payload_sum(store.clone(), cached(&namespace)).await?,
                 expected,
                 "{how}: before"
+            );
+            assert_eq!(
+                store.inner.stats().kind("pack").gets,
+                0,
+                "{how}: the cache serves the table before the damage"
             );
             damage(&file);
             for round in 0..2 {

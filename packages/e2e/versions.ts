@@ -182,13 +182,16 @@ async function main() {
   await post('Notes/j/add', { id: 'a', text: 'by v1' });
 
   // v1 holds k; two more invocations of k queue behind it; then v2 is registered.
-  const held = await send('Notes/k/hold', { id: 'b', text: 'held', ms: 3000 });
+  // Long enough for v2 to start and register on a slow machine, which the
+  // check after the deploy confirms: otherwise the queued ones ran on v1.
+  const held = await send('Notes/k/hold', { id: 'b', text: 'held', ms: 15_000 });
   await until('the hold did not start', async () => (await invocation(held))?.pinned_deployment_id === v1);
   const queued = [
     await send('Notes/k/add', { id: 'c', text: 'queued' }),
     await send('Notes/k/add', { id: 'd', text: 'queued' }),
   ];
   const v2 = await deploy('v2', 9192);
+  assert.equal((await invocation(held))?.status, 'running', 'v1 still holds k once v2 is registered');
 
   await check('an invocation runs on the deployment it started on', async () => {
     assert.equal(await attach(held), 'v1');

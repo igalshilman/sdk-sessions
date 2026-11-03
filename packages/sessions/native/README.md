@@ -57,7 +57,8 @@ with the process, or the file `RESTATE_SQL_CACHE_FILE` names.
 `RESTATE_SQL_CACHE_MEMORY` and `RESTATE_SQL_CACHE_DISK` set its sizes (bytes,
 or with `KiB`, `MiB` or `GiB`; the memory also bounds the database states and
 idle engines it keeps), and `RESTATE_SQL_CACHE=off` turns it off: each session
-then reads what it needs from Restate. It keeps a
+then reads what it needs from Restate. A size that is not one fails every
+database open with its message, so check the process's log. It keeps a
 database's packs, which never change, and its last head: a session reads the
 ranges of packs it has from the cache, and reuses the idle engine when the
 head is the one the cache saw last. `save()` (or `close()`) ends a session,

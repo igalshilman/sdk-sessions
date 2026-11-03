@@ -257,9 +257,10 @@ where
 /// `RESTATE_SQL_CACHE_FILE` names. `RESTATE_SQL_CACHE_MEMORY` and
 /// `RESTATE_SQL_CACHE_DISK` set its sizes (bytes, or with KiB, MiB or GiB);
 /// the memory one also bounds the namespaces' states and the parked engines
-/// it keeps, so a small cache is a cold one. `RESTATE_SQL_CACHE=off` opens
-/// every database without a cache (`None`): each session reads what it needs
-/// from the store.
+/// it keeps, so a small cache is a cold one. `RESTATE_SQL_CACHE=off` (or `0`,
+/// `false`, `no`) opens every database without a cache (`None`): each session
+/// reads what it needs from the store. A size that is not one fails every
+/// open, with its message: the process serves, and every invocation retries.
 async fn page_cache() -> io::Result<Option<PageCache>> {
     static CACHE: futures::lock::Mutex<Option<Option<PageCache>>> = futures::lock::Mutex::new(None);
     let mut cache = CACHE.lock().await;
@@ -276,7 +277,8 @@ async fn page_cache() -> io::Result<Option<PageCache>> {
 /// The page cache's configuration, from the environment: `None` when it is off.
 fn cache_config() -> io::Result<Option<PageCacheConfig>> {
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    if var("RESTATE_SQL_CACHE").as_deref() == Some("off") {
+    let off = var("RESTATE_SQL_CACHE").map(|v| v.to_ascii_lowercase());
+    if matches!(off.as_deref(), Some("off" | "0" | "false" | "no")) {
         return Ok(None);
     }
     let size = |name: &str, default: usize| match var(name) {
