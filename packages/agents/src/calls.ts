@@ -19,7 +19,7 @@
 // terminal error is its result too. Once stored, the model has its result,
 // and an identical call it makes later is a call of its own.
 import type * as restate from '@restatedev/sessions';
-import { Schema, Scoped } from '@restatedev/sessions/internal';
+import { Schema, ScopeKey } from '@restatedev/sessions/internal';
 import { randomUUID } from 'node:crypto';
 
 /** A tool's call: the tool, its input as JSON, the ids it was made with (the first is its own), and the attempt that last made it. */
@@ -72,7 +72,7 @@ async function load(ctx: CallsContext, invocation: string): Promise<Calls> {
 }
 
 /** Each attempt's id, and its calls, by its context. */
-const ATTEMPT = new Scoped<{ id: string; calls: Promise<Calls> }>('the calls of an attempt');
+const ATTEMPT = new ScopeKey<{ id: string; calls: Promise<Calls> }>('the calls of an attempt');
 
 /** The attempt of `ctx`: its id, and the calls of its invocation. */
 function attemptOf(ctx: CallsContext) {

@@ -7,7 +7,7 @@ export * as sdk from '@restatedev/restate-sdk';
 export { Schema } from './schema.ts';
 export { asDatabase, lazyDatabase, database, reset, Attempt, withAttempt } from './session.ts';
 export type { ObjectConfig, SqlHost } from './session.ts';
-export { Scoped } from './scoped.ts';
+export { type Scope, ScopeKey, scopeOf } from './scope.ts';
 export { open, type Connection, type Store, type ConnectionTransaction } from './database.ts';
 export { PromiseSelector } from './selector.ts';
 export { needing, served } from './serve.ts';

@@ -1,7 +1,7 @@
 // Virtual objects set up for SQL and agents.
 import * as restate from '@restatedev/sessions';
 import { reset } from '@restatedev/sessions/internal';
-import { cleared, isAgent, type Messages, type MessagesRequest, refusal, type Turn } from './common.ts';
+import { cleared, isAgent, type Messages, type MessagesRequest, refusalOf, type Turn } from './common.ts';
 import * as log from './log.ts';
 import {
   type Notifications,
@@ -313,7 +313,7 @@ function answering(entry: restate.Entry<restate.SessionContext>): restate.Entry<
       try {
         return await handler(ctx, input);
       } catch (error) {
-        throw refusal(error) ?? error;
+        throw refusalOf(ctx, error) ?? error;
       }
     },
   };

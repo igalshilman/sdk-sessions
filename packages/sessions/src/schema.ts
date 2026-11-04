@@ -20,7 +20,6 @@
 // empty tables. This repository's libraries (@restatedev/agents) keep their tables
 // in a schema of their own name, which `schema.ensure(ctx.db)` applies where
 // they use them, in any object: internal, from @restatedev/sessions/internal.
-import { Scoped } from './scoped.ts';
 import type { Connection, DatabaseReader, DatabaseWriter, ConnectionTransaction } from './database.ts';
 
 /**
@@ -57,13 +56,23 @@ export class Schema {
    * handler's are its own, vanishing with its session.
    */
   ensure(db: DatabaseReader | Connection): Promise<void> {
-    const ensure = ENSURE.get(db);
+    const ensure = ensureOf(db);
     return ensure ? ensure([this]) : apply(db as Connection, [this]);
   }
 }
 
-/** How a handler's session (`ctx.db`, and its reader) applies schemas: on it. */
-export const ENSURE = new Scoped<(schemas: readonly Schema[]) => Promise<void>>('Schema.ensure');
+/** How a database applies schemas: a handler's (`ctx.db`, its reader), or one of `asDatabase`. */
+type Ensure = (schemas: readonly Schema[]) => Promise<void>;
+
+/** A database's {@link Ensure}, on it: not enumerable. */
+const ENSURE = Symbol('Schema.ensure');
+
+/** `db`, which applies schemas with `ensure` (see {@link Schema.ensure}). */
+export const ensuring = <D extends object>(db: D, ensure: Ensure): D =>
+  Object.defineProperty(db, ENSURE, { value: ensure });
+
+/** How `db` applies schemas, if it is a database of this package's. */
+export const ensureOf = (db: object): Ensure | undefined => (db as { [ENSURE]?: Ensure })[ENSURE];
 
 /** Apply the steps of `schemas` that `db` lacks, in one transaction, with how far each got. */
 export async function apply(db: Connection, schemas: readonly Schema[], { reader = false } = {}) {

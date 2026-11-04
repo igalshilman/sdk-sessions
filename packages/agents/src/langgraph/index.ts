@@ -45,7 +45,7 @@ import {
   modelOf,
   nextPromptId,
   providerOf,
-  refusal,
+  refusalOf,
   stopSignalOf,
   storedAnswer,
   toolCallEnded,
@@ -87,7 +87,7 @@ function toolsNode(ctx: restate.SessionContext, tools: StructuredToolInterface[]
     const { promise: failure, reject: failed } = Promise.withResolvers<never>();
     failure.catch(() => {});
     const node = new ToolNode(
-      tools.map((t) => failing(t, failed)),
+      tools.map((t) => failing(ctx, t, failed)),
       { handleToolErrors: true },
     );
     const ran: { messages: BaseMessage[] } = await Promise.race([node.invoke(state, config), failure]);
@@ -97,7 +97,11 @@ function toolsNode(ctx: restate.SessionContext, tools: StructuredToolInterface[]
 }
 
 /** `t`, its errors given to `failed`, but for its input's (arguments that do not fit) and LangGraph's interrupts. */
-const failing = (t: StructuredToolInterface, failed: (error: unknown) => void): StructuredToolInterface =>
+const failing = (
+  ctx: restate.SessionContext,
+  t: StructuredToolInterface,
+  failed: (error: unknown) => void,
+): StructuredToolInterface =>
   Object.create(t, {
     invoke: {
       value: async (...args: Parameters<StructuredToolInterface['invoke']>) => {
@@ -105,7 +109,7 @@ const failing = (t: StructuredToolInterface, failed: (error: unknown) => void): 
           return await t.invoke(...args);
         } catch (error) {
           if (!(error instanceof ToolInputParsingException) && !isGraphInterrupt(error)) {
-            fromTool(error);
+            fromTool(ctx, error);
             failed(error);
           }
           throw error;
@@ -244,7 +248,7 @@ const answerOnce = async (
       }
       // Refused for good (a wrong API key): the run ends unanswered, and
       // fails as terminal. An earlier prompt's, this one goes on.
-      const refused = refusal(error);
+      const refused = refusalOf(ctx, error);
       if (!refused) throw error;
       await close(app, config, UNANSWERED);
       if (!interrupted || last === id) throw refused;

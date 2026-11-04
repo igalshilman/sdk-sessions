@@ -20,8 +20,7 @@ import {
   type Store,
   type ConnectionTransaction,
 } from './database.ts';
-import { apply, dropAll, ENSURE, type Schema } from './schema.ts';
-import { Scoped } from './scoped.ts';
+import { apply, dropAll, ensureOf, ensuring, type Schema } from './schema.ts';
 import { type Send, sendOf } from './calls.ts';
 
 export type { DatabaseReader, DatabaseWriter, Row, SqlParam, SqlValue };
@@ -225,12 +224,11 @@ export function asDatabase(connection: Connection): Database {
     ...sqlOver((sql, params) => connection.queryColumns(sql, params)),
     transaction: (body) => connection.transaction((tx) => body({ ...forBody(tx), send: refusedSend })),
   };
-  ENSURE.set(db, (schemas) => apply(connection, schemas));
-  return db;
+  return ensuring(db, (schemas) => apply(connection, schemas));
 }
 
-/** How a transaction of `ctx.db` empties the database (`reset`): on it. */
-const RESET = new Scoped<() => Promise<void>>('reset');
+/** How a transaction of `ctx.db` empties the database ({@link reset}), on it: not enumerable. */
+const RESET = Symbol('reset');
 
 /**
  * Empty the key's database in `tx`, a transaction of an exclusive handler's
@@ -240,7 +238,7 @@ const RESET = new Scoped<() => Promise<void>>('reset');
  * new database's first rows, in the same commit.
  */
 export function reset(tx: Transaction): Promise<void> {
-  const of = RESET.get(tx);
+  const of = (tx as { [RESET]?: () => Promise<void> })[RESET];
   if (of === undefined) throw new TerminalError("reset takes a transaction of an exclusive handler's ctx.db");
   return forHandler(of());
 }
@@ -259,14 +257,13 @@ export function lazyDatabase(opener: () => Promise<Database>): Database {
     execute: async (sql, params) => (await db()).execute(sql, params),
     transaction: async (body) => (await db()).transaction(body),
   };
-  ENSURE.set(lazy, async (schemas) => {
+  return ensuring(lazy, async (schemas) => {
     const inner = await db();
-    const ensure = ENSURE.get(inner);
+    const ensure = ensureOf(inner);
     if (ensure === undefined)
       throw new TerminalError("lazyDatabase opens a handler's ctx.db, or a database of asDatabase");
     await ensure(schemas);
   });
-  return lazy;
 }
 
 /** The sends of a transaction that has no outbox: a shared handler's, or another database's. */
@@ -324,8 +321,8 @@ function storedSend(send: restate.GenericSend<unknown>): Outgoing['sends'][numbe
 /** How a handler ended. */
 type Outcome<T> = { value: T } | { error: unknown };
 
-/** The attempt of a `ctx.db`, on it: for `database`. */
-const ATTEMPT = new Scoped<Attempt>('database');
+/** The attempt of a `ctx.db`, on it (not enumerable): for {@link database}. */
+const ATTEMPT = Symbol('database');
 
 // A database's name (`database`).
 const DATABASE_NAME = /^[\w.-]{1,64}$/;
@@ -339,7 +336,7 @@ const DATABASE_NAME = /^[\w.-]{1,64}$/;
  */
 export function database(db: Database, name: string): Database {
   if (!DATABASE_NAME.test(name)) throw new TerminalError(`database: ${JSON.stringify(name)} is not a database name`);
-  const attempt = ATTEMPT.get(db);
+  const attempt = (db as { [ATTEMPT]?: Attempt })[ATTEMPT];
   if (attempt === undefined) throw new TerminalError("database takes a handler's ctx.db");
   return attempt.database(name);
 }
@@ -449,8 +446,8 @@ export class Attempt {
       ...sqlOver((sql, params) => this.call((db) => db.queryColumns(sql, params)), handlerError),
       transaction: (body) => this.transaction(body),
     };
-    ENSURE.set(this.db, (schemas) => this.call((db) => this.ensureSchemas(db, schemas)));
-    ATTEMPT.set(this.db, this);
+    ensuring(this.db, (schemas) => this.call((db) => this.ensureSchemas(db, schemas)));
+    Object.defineProperty(this.db, ATTEMPT, { value: this });
   }
 
   /** The key's database `name`, in this attempt: see {@link database}. */
@@ -501,7 +498,7 @@ export class Attempt {
         const sends = this.hasOutbox ? new Sends() : undefined;
         const tx: Transaction = { ...forBody(handle), send: sends?.send ?? refusedSend };
         // A view's writes stay in its session: it has nothing to reset.
-        if (!this.ctx.shared) RESET.set(tx, () => this.reset(handle));
+        if (!this.ctx.shared) Object.defineProperty(tx, RESET, { value: () => this.reset(handle) });
         let result: T;
         try {
           result = await body(tx);

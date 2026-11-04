@@ -510,10 +510,12 @@ It also has what this repository's other libraries need: `Schema` (tables a
 library owns, applied where it uses them), `database` (another database of
 the same key), `reset` (empty the key's database in a transaction), and
 `cancelled` and `cancelCalls` (explicit cancellation, for a handler with
-`explicitCancellation: true`), and `Scoped` and `definitionOf`, for what a
-library keeps per context, per `ctx.db` or per object.
+`explicitCancellation: true`), and `ScopeKey` and `definitionOf`, for what a
+library keeps for an attempt or for an object.
 
-Nothing is kept per process, but the native page cache. What the package
-keeps for a context, its `ctx.db` or a transaction is on that object
-(`Scoped`), and lives as long as it does; what a session object is given
-(its schema, its store's wrapper) is on its definition.
+Nothing is kept per process, but the native page cache. Each attempt has a
+scope, which its context holds: what code keeps for the attempt (an agent's
+turn, say) is in it, by a `ScopeKey`, and ends with the attempt. What a
+session object is given (its schema, its store's wrapper) is on its
+definition, and a database or transaction this package makes holds its own
+link to its session.

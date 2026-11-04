@@ -3,7 +3,7 @@
 // cancellation, publishing for the clients that follow it), and
 // the `messages` handler with its `Transcript`.
 import * as restate from '@restatedev/sessions';
-import { cancelCalls, cancelled, definitionOf, Scoped } from '@restatedev/sessions/internal';
+import { cancelCalls, cancelled, definitionOf, ScopeKey } from '@restatedev/sessions/internal';
 import { settle } from './calls.ts';
 import * as log from './log.ts';
 import type { Said } from './log.ts';
@@ -23,7 +23,7 @@ export const configured = async <T>(value: Configure<T>, ctx: restate.SessionCon
   typeof value === 'function' ? (value as (ctx: restate.SessionContext) => T | Promise<T>)(ctx) : value;
 
 /** The prompts each invocation made so far, by its context. */
-const PROMPTS = new Scoped<number>('nextPromptId');
+const PROMPTS = new ScopeKey<number>('nextPromptId');
 
 /**
  * The id of the next prompt of the invocation of `ctx`: the invocation's id,
@@ -133,7 +133,7 @@ export interface Turn {
 }
 
 /** What stops each turn, by its context: see {@link stopSignalOf}. */
-const TURN = new Scoped<AbortSignal>('stopSignalOf');
+const TURN = new ScopeKey<AbortSignal>('stopSignalOf');
 
 /**
  * Why a turn stopped when its attempt ended before it did: Restate suspended
@@ -161,15 +161,17 @@ export const stopSignalOf = (ctx: object): AbortSignal | undefined => TURN.get(c
 /** What `clear` also empties, beside the agent's database. */
 type Clear = (ctx: restate.SessionContext) => Promise<void>;
 
-/**
- * An agent's own, on its definition: whether it runs in the background
- * (`background: true`: no one follows it as it works), and what its `clear`
- * also empties.
- */
-const AGENT = new Scoped<{ background: boolean; clear?: Clear }>('an agent');
+/** An agent's own: whether it runs in the background (`background: true`: no one follows it as it works), and what its `clear` also empties. */
+interface Agent {
+  background: boolean;
+  clear?: Clear;
+}
+
+/** An agent's own, on its definition: not enumerable. */
+const AGENT = Symbol('an agent');
 
 /** What a framework's `messages` view clears beside the agent's database, on the view: see {@link alsoClearing}. */
-const VIEW_CLEARS = new Scoped<Clear>('alsoClearing');
+const CLEARS = Symbol('alsoClearing');
 
 /**
  * The `messages` view `view` of a framework that keeps a conversation apart
@@ -177,8 +179,7 @@ const VIEW_CLEARS = new Scoped<Clear>('alsoClearing');
  * with this view is cleared.
  */
 export const alsoClearing = <V extends object>(view: V, clear: Clear) => {
-  VIEW_CLEARS.set(view, clear);
-  return view;
+  return Object.defineProperty(view, CLEARS, { value: clear });
 };
 
 /**
@@ -189,14 +190,15 @@ export const isAgent = <D extends object>(
   definition: D,
   { background = false, messages = undefined as object | undefined },
 ) => {
-  AGENT.set(definition, { background, clear: messages && VIEW_CLEARS.get(messages) });
-  return definition;
+  const clear = messages && (Reflect.get(messages, CLEARS) as Clear | undefined);
+  const agent: Agent = { background, clear };
+  return Object.defineProperty(definition, AGENT, { value: agent });
 };
 
 /** The agent of `ctx`'s own (see {@link isAgent}). */
 const agentOf = (ctx: restate.SessionContext) => {
   const definition = definitionOf(ctx);
-  return definition && AGENT.get(definition);
+  return definition && (Reflect.get(definition, AGENT) as Agent | undefined);
 };
 
 /** Clear what the agent of `ctx` keeps beside its database. */
@@ -310,7 +312,7 @@ export const chatHandler = <A = string>(answer: (ctx: restate.SessionContext, me
         throw error;
       }
       // Any other error fails the attempt, and Restate retries the turn.
-      const terminal = refusal(error);
+      const terminal = refusalOf(ctx, error);
       if (!terminal) throw error;
       await end();
       throw terminal;
@@ -333,18 +335,17 @@ export class ToolError extends Error {
   }
 }
 
-/** That an error is one a framework's own tool (not `tool()`'s) failed with, on it: see {@link fromTool}. */
-const FROM_TOOL = new Scoped<boolean>('fromTool');
+/** The errors the attempt's framework tools (not `tool()`'s) failed with: see {@link fromTool}. */
+const TOOL_ERRORS = new ScopeKey<WeakSet<object>>('fromTool');
 
 /**
- * `error` is a tool's: a framework's own tool (Claude's, LangChain's...)
- * that failed, whose error is never taken for the model's provider refusing
- * (a tool that calls a model API may fail as one does). `tool()`'s are
- * {@link ToolError}s.
+ * `error` is a tool's, in the attempt of `ctx`: a framework's own tool
+ * (Claude's, LangChain's...) that failed, whose error is never taken for
+ * the model's provider refusing (a tool that calls a model API may fail as
+ * one does). `tool()`'s are {@link ToolError}s.
  */
-export function fromTool(error: unknown) {
-  // An error that takes no property (a frozen one) stays unmarked.
-  if (typeof error === 'object' && error !== null && Object.isExtensible(error)) FROM_TOOL.set(error, true);
+export function fromTool(ctx: restate.SessionContext, error: unknown) {
+  if (typeof error === 'object' && error !== null) TOOL_ERRORS.of(ctx, () => new WeakSet()).add(error);
 }
 
 /** The Anthropic SDK's errors of a request that fails again however often it is made. */
@@ -361,11 +362,17 @@ const FOR_GOOD: ReadonlySet<string> = new Set([
  * (a tool's, an overloaded provider's) fail the attempt, and Restate retries.
  */
 function refused(error: unknown) {
-  if (error instanceof ToolError || (typeof error === 'object' && error !== null && FROM_TOOL.get(error))) return false;
+  if (error instanceof ToolError) return false;
   if (error instanceof Error && FOR_GOOD.has(error.constructor.name)) return true;
   return /API key not found|no API key|Could not resolve authentication method|Provider is not configured|"code":"(AUTH|MISSING_CREDENTIAL)"/i.test(
     String(error),
   );
+}
+
+/** {@link refusal}, but not of an error a framework's tool failed with in the attempt of `ctx` ({@link fromTool}). */
+export function refusalOf(ctx: restate.SessionContext, error: unknown): restate.TerminalError | undefined {
+  const failedTool = typeof error === 'object' && error !== null && TOOL_ERRORS.get(ctx)?.has(error);
+  return failedTool ? undefined : refusal(error);
 }
 
 /**
@@ -510,16 +517,16 @@ export class Transcript {
 export type Read = () => Promise<Transcript>;
 
 /** The transcript of the turn of a context, while it answers: on it. */
-const READING = new Scoped<Read>('transcribing');
+const READING = new ScopeKey<Read>('transcribing');
 
 /** The log writes of a context, one after another (tool calls in parallel publish at once): on it. */
-const WRITING = new Scoped<Promise<void>>('the log');
+const WRITING = new ScopeKey<Promise<void>>('the log');
 
 /** The log of the conversation of `ctx` takes its transcript as `read` gives it. */
 function logged(ctx: restate.SessionContext, read: Read): Promise<void> {
   const write = async () => {
     const transcript = await read();
-    await log.sync(ctx.db, transcript.messages());
+    await log.sync(ctx, transcript.messages());
     // The calls whose results the framework stored are made: see calls.ts.
     await settle(ctx, (id, failed) => transcript.answered(id, failed));
   };

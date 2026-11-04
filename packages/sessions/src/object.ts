@@ -19,8 +19,8 @@ import * as restate from '@restatedev/restate-sdk';
 import type { VirtualObjectDefinition } from '@restatedev/restate-sdk-core';
 import { type Rpc, rpcOf, type Send, sendOf } from './calls.ts';
 import type { DatabaseReader, Store } from './database.ts';
-import { ENSURE, Schema, type Step } from './schema.ts';
-import { holding, Scoped } from './scoped.ts';
+import { ensureOf, ensuring, Schema, type Step } from './schema.ts';
+import { Scope, scopeOf } from './scope.ts';
 import { hookSelector } from './selector.ts';
 import { type Database, Attempt, type ObjectConfig, type SqlHost, withAttempt } from './session.ts';
 
@@ -156,17 +156,11 @@ interface Own {
   definition?: object;
 }
 
-/** The SDK's context behind a context, for @restatedev/sessions/internal: on it. */
-const SDK = new Scoped<restate.ObjectContext | restate.ObjectSharedContext>('the SDK context');
+/** A session object's own, on its definition (not enumerable): for {@link invoke} and {@link withStoreWrapper}. */
+const OWN = Symbol('a session object');
 
-/** Whether a context is a handler's with `explicitCancellation: true`: for {@link cancelled}. */
-const EXPLICIT = new Scoped<boolean>('explicitCancellation');
-
-/** The definition of the object whose handler a context is of: see {@link definitionOf}. */
-const DEFINITION = new Scoped<object>('definitionOf');
-
-/** A session object's own, on its definition: for {@link invoke} and {@link withStoreWrapper}. */
-const OWN = new Scoped<{ own: Own; entries: Map<string, OwnEntry> }>('a session object');
+/** What `definition` is as a session object's, if it is one. */
+const ownOf = (definition: object) => (definition as { [OWN]?: { own: Own; entries: Map<string, OwnEntry> } })[OWN];
 
 /** A handler or view of a session object: its function, kind, and object. */
 interface OwnEntry {
@@ -180,10 +174,10 @@ interface OwnEntry {
  * The definition (`sessionObject`'s) of the object whose handler or view
  * `ctx` is the context of: what a library keeps per object lives on it.
  */
-export const definitionOf = (ctx: SessionContext | ViewContext): object | undefined => DEFINITION.get(ctx);
+export const definitionOf = (ctx: SessionContext | ViewContext): object | undefined => scopeOf(ctx)?.definition;
 
 /** What `definition`'s attempts get, if it is a session object: for a test's attempts of its own. */
-export const configOf = (definition: object): ObjectConfig | undefined => OWN.get(definition)?.own.config;
+export const configOf = (definition: object): ObjectConfig | undefined => ownOf(definition)?.own.config;
 
 /**
  * Wrap the stores of `definition`'s attempts with `wrap`: fault injection, in
@@ -191,22 +185,20 @@ export const configOf = (definition: object): ObjectConfig | undefined => OWN.ge
  * it is.
  */
 export function withStoreWrapper<D extends object>(definition: D, wrapper: (store: Store) => Store): D {
-  const object = OWN.get(definition);
+  const object = ownOf(definition);
   if (object !== undefined) object.own.config.wrapStore = wrapper;
   return definition;
 }
 
 /** The reads of `db`, which apply a library's schema as `db` does (`Schema.ensure`). */
 function readerOf(db: Database): DatabaseReader {
-  // With a place for what a library keeps per `ctx.db` (scoped.ts), then frozen.
-  const reader: DatabaseReader = holding({
+  const reader: DatabaseReader = {
     query: (sql, params) => db.query(sql, params),
     get: (sql, params) => db.get(sql, params),
     values: (sql, params) => db.values(sql, params),
-  });
-  const ensure = ENSURE.get(db);
-  if (ensure) ENSURE.set(reader, ensure);
-  return Object.freeze(reader);
+  };
+  const ensure = ensureOf(db);
+  return Object.freeze(ensure ? ensuring(reader, ensure) : reader);
 }
 
 /**
@@ -232,8 +224,9 @@ export function contextOf(
 ): SessionContext | ViewContext {
   const rpc = rpcOf(ctx);
   const cancel = cancelOf(ctx);
-  // Made with a place for what is kept per context (scoped.ts), then frozen.
-  const context: SessionContext | ViewContext = holding(
+  // It holds the attempt's scope (scope.ts), then is frozen.
+  const scope = new Scope(ctx, { explicitCancellation, definition });
+  const context: SessionContext | ViewContext = scope.hold(
     view
       ? { key: ctx.key, request: ctx.request(), db: readerOf(db), rpc, cancel }
       : {
@@ -245,9 +238,6 @@ export function contextOf(
           cancel,
         },
   );
-  SDK.set(context, ctx as unknown as restate.ObjectContext);
-  if (explicitCancellation) EXPLICIT.set(context, true);
-  if (definition !== undefined) DEFINITION.set(context, definition);
   return Object.freeze(context);
 }
 
@@ -286,7 +276,7 @@ function wrap(entry: OwnEntry) {
  * context of a test's own, without Restate: for tests.
  */
 export function invoke(definition: { name: string }, name: string, ctx: AttemptContext, input?: unknown) {
-  const entry = OWN.get(definition)?.entries.get(name);
+  const entry = ownOf(definition)?.entries.get(name);
   if (entry === undefined) throw new Error(`${definition.name}.${name} is no handler or view of a session object`);
   return attempt(entry, ctx, input);
 }
@@ -378,18 +368,18 @@ export function sessionObject<
     options: { ...sqlOptions, ...options },
   });
   own.definition = made;
-  OWN.set(made, { own, entries });
+  Object.defineProperty(made, OWN, { value: { own, entries } });
   return made;
 }
 
 /** The SDK's context behind `ctx`, a handler's with `explicitCancellation: true`. */
 function explicitOf(ctx: SessionContext, of: string) {
-  const sdk = SDK.get(ctx);
-  if (sdk === undefined) throw new restate.TerminalError(`${of} takes a session object's ctx`);
-  if (EXPLICIT.get(ctx) !== true) {
+  const scope = scopeOf(ctx);
+  if (scope === undefined) throw new restate.TerminalError(`${of} takes a session object's ctx`);
+  if (!scope.explicitCancellation) {
     throw new restate.TerminalError(`${of} takes the ctx of a handler with explicitCancellation: true`);
   }
-  return restate.internal.asInternal(sdk);
+  return restate.internal.asInternal(scope.sdk as restate.ObjectContext);
 }
 
 /**
