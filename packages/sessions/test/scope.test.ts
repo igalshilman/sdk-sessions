@@ -30,7 +30,9 @@ describe("an attempt's scope", () => {
 
   it('is only a context’s', () => {
     const turn = new ScopeKey<string>('turn');
-    expect(() => turn.get({})).toThrow(/turn takes the context of a session object's handler or view/);
+    expect(() => turn.get({} as restate.SessionContext)).toThrow(
+      /turn takes the context of a session object's handler or view/,
+    );
   });
 });
 

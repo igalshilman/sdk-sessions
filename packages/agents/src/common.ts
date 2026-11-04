@@ -3,7 +3,7 @@
 // cancellation, publishing for the clients that follow it), and
 // the `messages` handler with its `Transcript`.
 import * as restate from '@restatedev/sessions';
-import { cancelCalls, cancelled, definitionOf, ScopeKey } from '@restatedev/sessions/internal';
+import { cancelCalls, cancelled, definitionOf, Link, ScopeKey } from '@restatedev/sessions/internal';
 import { settle } from './calls.ts';
 import * as log from './log.ts';
 import type { Said } from './log.ts';
@@ -156,7 +156,7 @@ export class AttemptEnded extends Error {
  * {@link AttemptEnded} once the attempt ends first (the work stops, and
  * answers nothing).
  */
-export const stopSignalOf = (ctx: object): AbortSignal | undefined => TURN.get(ctx);
+export const stopSignalOf = (ctx: restate.SessionContext): AbortSignal | undefined => TURN.get(ctx);
 
 /** What `clear` also empties, beside the agent's database. */
 type Clear = (ctx: restate.SessionContext) => Promise<void>;
@@ -167,11 +167,11 @@ interface Agent {
   clear?: Clear;
 }
 
-/** An agent's own, on its definition: not enumerable. */
-const AGENT = Symbol('an agent');
+/** An agent's own, on its definition. */
+const AGENT = new Link<Agent>('an agent');
 
-/** What a framework's `messages` view clears beside the agent's database, on the view: see {@link alsoClearing}. */
-const CLEARS = Symbol('alsoClearing');
+/** What a framework's `messages` view clears beside the agent's database: see {@link alsoClearing}. */
+const CLEARS = new Link<Clear>('alsoClearing');
 
 /**
  * The `messages` view `view` of a framework that keeps a conversation apart
@@ -179,7 +179,7 @@ const CLEARS = Symbol('alsoClearing');
  * with this view is cleared.
  */
 export const alsoClearing = <V extends object>(view: V, clear: Clear) => {
-  return Object.defineProperty(view, CLEARS, { value: clear });
+  return CLEARS.on(view, clear);
 };
 
 /**
@@ -190,15 +190,13 @@ export const isAgent = <D extends object>(
   definition: D,
   { background = false, messages = undefined as object | undefined },
 ) => {
-  const clear = messages && (Reflect.get(messages, CLEARS) as Clear | undefined);
-  const agent: Agent = { background, clear };
-  return Object.defineProperty(definition, AGENT, { value: agent });
+  return AGENT.on(definition, { background, clear: messages && CLEARS.of(messages) });
 };
 
 /** The agent of `ctx`'s own (see {@link isAgent}). */
 const agentOf = (ctx: restate.SessionContext) => {
   const definition = definitionOf(ctx);
-  return definition && (Reflect.get(definition, AGENT) as Agent | undefined);
+  return definition && AGENT.of(definition);
 };
 
 /** Clear what the agent of `ctx` keeps beside its database. */
@@ -516,10 +514,10 @@ export class Transcript {
  */
 export type Read = () => Promise<Transcript>;
 
-/** The transcript of the turn of a context, while it answers: on it. */
+/** The transcript of the attempt's turn, while it answers. */
 const READING = new ScopeKey<Read>('transcribing');
 
-/** The log writes of a context, one after another (tool calls in parallel publish at once): on it. */
+/** The attempt's log writes, one after another: tool calls in parallel publish at once. */
 const WRITING = new ScopeKey<Promise<void>>('the log');
 
 /** The log of the conversation of `ctx` takes its transcript as `read` gives it. */

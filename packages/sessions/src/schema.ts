@@ -21,6 +21,7 @@
 // in a schema of their own name, which `schema.ensure(ctx.db)` applies where
 // they use them, in any object: internal, from @restatedev/sessions/internal.
 import type { Connection, DatabaseReader, DatabaseWriter, ConnectionTransaction } from './database.ts';
+import { Link } from './link.ts';
 
 /**
  * The database's record of its schemas: how many steps of each it has, by
@@ -64,15 +65,14 @@ export class Schema {
 /** How a database applies schemas: a handler's (`ctx.db`, its reader), or one of `asDatabase`. */
 type Ensure = (schemas: readonly Schema[]) => Promise<void>;
 
-/** A database's {@link Ensure}, on it: not enumerable. */
-const ENSURE = Symbol('Schema.ensure');
+/** A database's {@link Ensure}. */
+const ENSURE = new Link<Ensure>('Schema.ensure');
 
 /** `db`, which applies schemas with `ensure` (see {@link Schema.ensure}). */
-export const ensuring = <D extends object>(db: D, ensure: Ensure): D =>
-  Object.defineProperty(db, ENSURE, { value: ensure });
+export const ensuring = <D extends object>(db: D, ensure: Ensure): D => ENSURE.on(db, ensure);
 
 /** How `db` applies schemas, if it is a database of this package's. */
-export const ensureOf = (db: object): Ensure | undefined => (db as { [ENSURE]?: Ensure })[ENSURE];
+export const ensureOf = (db: object): Ensure | undefined => ENSURE.of(db);
 
 /** Apply the steps of `schemas` that `db` lacks, in one transaction, with how far each got. */
 export async function apply(db: Connection, schemas: readonly Schema[], { reader = false } = {}) {
