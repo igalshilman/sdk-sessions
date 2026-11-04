@@ -1,6 +1,6 @@
 {
   "name": "@restatedev/sessions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Session objects on Restate: virtual objects with a SQL database per key, kept in the object's state (ctx.db)",
   "license": "MIT",
   "repository": {
