@@ -15,20 +15,21 @@
 //!
 //! Every database of the process is kept warm in one page cache
 //! ([`page_cache`]); a session itself, and its commits, is a
-//! [`crate::Database`].
+//! [`sql::Database`].
 //!
 //! A call runs on the JavaScript thread as far as it can ([`answer`]): one
 //! that needs nothing from the store, such as SQL on cached pages or a
 //! statement inside a transaction, returns its value, or throws its error;
 //! one that waits for the store goes on in the runtime and returns a promise.
 //! The caller `await`s either.
-use crate::{KvStore, Numeric, PageCache, PageCacheConfig, Value};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{JsValue, sys};
 use napi_derive::napi;
+use restate_sdk_shared_core::sql::{self, Numeric, Value};
+use restate_sdk_shared_core::state::{self, KvStore, PageCache, PageCacheConfig};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -219,19 +220,19 @@ impl KvStore for JsQueue {
 }
 
 /// A failure of the database as JavaScript gets it: one a retry would repeat
-/// ([`crate::Refused`]) has the code `InvalidArg`, which `src/database.ts`
+/// ([`sql::Refused`]) has the code `InvalidArg`, which `src/database.ts`
 /// tells apart, as it may have ended the session.
 fn error(error: Box<dyn std::error::Error + Send + Sync>) -> Error {
-    match error.is::<crate::Refused>() {
+    match error.is::<sql::Refused>() {
         true => Error::new(Status::InvalidArg, error.to_string()),
         false => Error::from_reason(error.to_string()),
     }
 }
 
-/// One session of a namespace's database (see [`crate::Database`]): every
+/// One session of a namespace's database (see [`sql::Database`]): every
 /// SQL commit is durable when its call resolves.
 #[napi]
-pub struct Database(Arc<crate::Database>);
+pub struct Database(Arc<sql::Database>);
 
 /// `call`'s value if it is ready at once, polled here on the JavaScript
 /// thread; else a promise of it, as it goes on in the runtime. Ready, a call
@@ -282,7 +283,7 @@ fn cache_config() -> io::Result<Option<PageCacheConfig>> {
         return Ok(None);
     }
     let size = |name: &str, default: usize| match var(name) {
-        Some(value) => crate::state::parse_size(&value).ok_or_else(|| {
+        Some(value) => state::parse_size(&value).ok_or_else(|| {
             io::Error::other(format!(
                 "{name}={value}: not a size (bytes, or with KiB, MiB or GiB)"
             ))
@@ -299,7 +300,7 @@ fn cache_config() -> io::Result<Option<PageCacheConfig>> {
 }
 
 /// Open the database of `namespace` over `store` (see the module's doc),
-/// kept warm in the process's page cache; see [`crate::Open::reader`] for a
+/// kept warm in the process's page cache; see [`sql::Open::reader`] for a
 /// `reader`.
 #[napi(
     ts_args_type = "namespace: string, store: Store, reader?: boolean",
@@ -319,7 +320,7 @@ pub(crate) fn open<'env>(
         lists_keys,
     });
     env.spawn_future(async move {
-        let mut open = crate::Database::open(store);
+        let mut open = sql::Database::open(store);
         if let Some(cache) = page_cache().await? {
             open = open.cached(&cache, &namespace);
         }
@@ -359,14 +360,14 @@ impl Database {
         })
     }
 
-    /// See [`crate::Database::begin`].
+    /// See [`sql::Database::begin`].
     #[napi(ts_return_type = "Answer<void>")]
     pub fn begin<'env>(&self, env: &'env Env) -> Result<Either<(), PromiseRaw<'env, ()>>> {
         let db = self.0.clone();
         answer(env, async move { db.begin().await.map_err(error) })
     }
 
-    /// See [`crate::Database::commit`]: `records` by name.
+    /// See [`sql::Database::commit`]: `records` by name.
     #[napi(
         ts_args_type = "records?: Record<string, Buffer>",
         ts_return_type = "Answer<void>"
@@ -383,20 +384,20 @@ impl Database {
         answer(env, async move { db.commit(records).await.map_err(error) })
     }
 
-    /// See [`crate::Database::rollback`].
+    /// See [`sql::Database::rollback`].
     #[napi(ts_return_type = "Answer<void>")]
     pub fn rollback<'env>(&self, env: &'env Env) -> Result<Either<(), PromiseRaw<'env, ()>>> {
         let db = self.0.clone();
         answer(env, async move { db.rollback().await.map_err(error) })
     }
 
-    /// See [`crate::Database::is_usable`].
+    /// See [`sql::Database::is_usable`].
     #[napi]
     pub fn is_usable(&self) -> bool {
         self.0.is_usable()
     }
 
-    /// See [`crate::Database::record`].
+    /// See [`sql::Database::record`].
     #[napi(ts_return_type = "Answer<Buffer>")]
     pub fn record<'env>(
         &self,
@@ -410,14 +411,14 @@ impl Database {
         })
     }
 
-    /// See [`crate::Database::save`].
+    /// See [`sql::Database::save`].
     #[napi(ts_return_type = "Answer<void>")]
     pub fn save<'env>(&self, env: &'env Env) -> Result<Either<(), PromiseRaw<'env, ()>>> {
         let db = self.0.clone();
         answer(env, async move { db.save().await.map_err(error) })
     }
 
-    /// See [`crate::Database::close`].
+    /// See [`sql::Database::close`].
     #[napi]
     pub async fn close(&self) {
         self.0.close().await

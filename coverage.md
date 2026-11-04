@@ -17,7 +17,7 @@ The plan below is implemented:
 | 3     | `e2e/versions.ts`, in PR CI                                    | Done                                                                                              |
 | 4     | `sessions/test/bank.ts`, `crash.ts`                            | Done, with a TerminalError after a commit, a resend past idempotency retention, and cancellations |
 | 5     | `native/src/node.rs`, `PageCacheConfig::sized`                 | Done: `RESTATE_SQL_CACHE_MEMORY`, `RESTATE_SQL_CACHE_DISK`, `RESTATE_SQL_CACHE=off`               |
-| 6     | `native/src/sql/tests/integration/cache.rs`                    | Done: truncated, overwritten and deleted cache files                                              |
+| 6     | `src/sql/tests/integration/cache.rs` (sdk-shared-core)         | Done: truncated, overwritten and deleted cache files                                              |
 | 7     | `crash.ts` (a rotating proxy in front of `shop`, `shop-small`) | Done                                                                                              |
 | 8     | `crash.ts` (views read all along; `Account/slowStatement`)     | Done; whether a slow view hits "is gone" in a given run is not asserted                           |
 | 9     | `crash.ts` `SOAK_MINUTES`; `nightly.yml` (`soak`, 45 minutes)  | Done                                                                                              |

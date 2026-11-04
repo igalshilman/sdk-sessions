@@ -2,8 +2,8 @@
 
 The storage of [`@restatedev/sessions`](../README.md): SQLite-compatible SQL over
 a key/value store implemented in JavaScript, the object's state. A native
-addon ([napi-rs](https://napi.rs)), one Rust crate, with the [state and SQL
-on it](#inside-the-layers) inside. [`src/database.ts`](../src/database.ts)
+addon ([napi-rs](https://napi.rs)), one Rust crate, over the [state and SQL
+on it](#inside-the-layers) of sdk-shared-core. [`src/database.ts`](../src/database.ts)
 opens it over a store, and `ctx.db` builds that store on the object's state
 ([`src/session.ts`](../src/session.ts)):
 
@@ -115,13 +115,13 @@ opens a new one, reading whatever head last landed.
 flush: what the host keeps beside the SQL, such as the sends committed with
 the rows (the outbox), opaque to the storage.
 
-All of it is one Rust crate, the addon, of two private modules: `state`
-([`src/state`](src/state/README.md): its
-[architecture](src/state/docs/ARCHITECTURE.md), [design](src/state/docs/DESIGN.md)
-and [format](src/state/docs/FORMAT.md)), the storage of one file and its
-records, and `sql` ([`src/sql`](src/sql/README.md)), the `Database` on it.
-Its one public type is `Database` (`src/lib.rs`), and
-[`src/node.rs`](src/node.rs) is the napi bindings, around it.
+The storage and the SQL on it live in
+[sdk-shared-core](https://github.com/restatedev/sdk-shared-core), as its
+modules `state` (`src/state/README.md` there: its architecture, design and
+format, under `src/state/docs/`), the storage of one file and its records,
+and `sql` (`src/sql/README.md`), the `Database` on it; its feature `sql`
+turns them on. This crate is [`src/node.rs`](src/node.rs), the
+napi bindings around that `Database`.
 
 ## Build and test
 
@@ -131,9 +131,8 @@ addon, and `pnpm test` runs its tests with the rest:
 ```sh
 pnpm build                          # release build, into this machine's package (npm/<platform>)
 pnpm build:debug
-pnpm test:rust                      # cargo test: the state and SQL, their API, crashes and fault campaigns
-pnpm lint:rust                      # rustfmt, and clippy with and without the crate's features
-cd native && cargo bench --features bench   # the benchmarks (benches/README.md)
+pnpm test:rust                      # cargo test (the state's and SQL's own tests run in sdk-shared-core)
+pnpm lint:rust                      # rustfmt and clippy
 ```
 
 `pnpm test` runs [`test/database.test.ts`](../test/database.test.ts) with
@@ -141,5 +140,6 @@ the package's other tests: SQL and value round trips, SQL errors and
 rollback, a write the store rejects, and lost writes: for every position of
 a request that loses its writes (its `sync` failing, or the session closed
 first), the owner and a reader with no cached state read exactly the stored
-rows. `pnpm test:rust` runs the state's and SQL's own tests, in the crate
-(`src/state/tests`, `src/sql/tests`), with the simulated stores.
+rows. The state's and SQL's own tests, with the simulated stores, run in
+sdk-shared-core (`src/state/tests`, `src/sql/tests` there), as do its
+benchmarks (`benches/`).

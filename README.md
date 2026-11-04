@@ -261,7 +261,7 @@ SQL_CAMPAIGN_SEED=17 SQL_CAMPAIGN_TRACE=1 cargo test sql::tests::integration::ca
 
 ```sh
 pnpm --filter e2e bench out.json   # latency, throughput and stored size, against a server
-cd packages/sessions/native && cargo bench --locked --features bench --bench flush_costs  # and the others in benches/
+cargo bench --locked --features sql,simulation --bench flush_costs  # in sdk-shared-core; and the others in its benches/
 ```
 
 ### Running them on your machine
