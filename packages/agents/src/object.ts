@@ -1,7 +1,7 @@
 // Virtual objects set up for SQL and agents.
 import * as restate from '@restatedev/sessions';
 import { reset } from '@restatedev/sessions/internal';
-import { cleared, onClear, inBackground, type Messages, type MessagesRequest, refusal, type Turn } from './common.ts';
+import { cleared, isAgent, type Messages, type MessagesRequest, refusalOf, type Turn } from './common.ts';
 import * as log from './log.ts';
 import {
   type Notifications,
@@ -264,7 +264,6 @@ export const sessionObject = <
   },
 ): restate.VirtualObjectDefinition<P, With<H, V>> => {
   const { name, description, schema, background, handlers = {}, views = {}, metadata, options } = definition;
-  if (background) inBackground(name);
   const own = [
     ...Object.keys(BUILT_IN),
     ...Object.keys(followed(async () => ({}) as Messages)),
@@ -285,21 +284,23 @@ export const sessionObject = <
     ]),
   );
   const messages = (views as Record<string, restate.Entry<restate.ViewContext>>).messages;
-  onClear(name, messages);
   const page = (typeof messages === 'function' ? messages : messages?.handler) as
     | ((ctx: restate.ViewContext, request: MessagesRequest) => Promise<Messages>)
     | undefined;
   const agent = page === undefined ? {} : followed(page);
   return withCompanion(
-    restate.sessionObject({
-      name,
-      description,
-      schema,
-      handlers: { ...(messages === undefined ? {} : INTERNAL), ...yours },
-      views: { ...BUILT_IN, ...agent, ...views },
-      metadata,
-      options: { ...OPTIONS, ...options },
-    }),
+    isAgent(
+      restate.sessionObject({
+        name,
+        description,
+        schema,
+        handlers: { ...(messages === undefined ? {} : INTERNAL), ...yours },
+        views: { ...BUILT_IN, ...agent, ...views },
+        metadata,
+        options: { ...OPTIONS, ...options },
+      }),
+      { background, messages },
+    ),
   );
 };
 
@@ -312,7 +313,7 @@ function answering(entry: restate.Entry<restate.SessionContext>): restate.Entry<
       try {
         return await handler(ctx, input);
       } catch (error) {
-        throw refusal(error) ?? error;
+        throw refusalOf(ctx, error) ?? error;
       }
     },
   };

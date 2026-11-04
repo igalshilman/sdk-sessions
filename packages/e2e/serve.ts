@@ -3,6 +3,7 @@
 // `node serve.ts ledger shop`; with the agents' `signals` object.
 import * as restate from '@restatedev/restate-sdk';
 import { signals } from '@restatedev/agents';
+import { withFaults } from '@restatedev/sessions/test/faults';
 
 type Services = restate.ServeOptions['services'];
 
@@ -32,4 +33,4 @@ const services = (
     }),
   )
 ).flat();
-await restate.serve({ services: [...services, signals], port: Number(process.env.PORT ?? 9080) });
+await restate.serve({ services: withFaults([...services, signals]), port: Number(process.env.PORT ?? 9080) });

@@ -21,6 +21,7 @@
 // in a schema of their own name, which `schema.ensure(ctx.db)` applies where
 // they use them, in any object: internal, from @restatedev/sessions/internal.
 import type { Connection, DatabaseReader, DatabaseWriter, ConnectionTransaction } from './database.ts';
+import { Link } from './link.ts';
 
 /**
  * The database's record of its schemas: how many steps of each it has, by
@@ -56,22 +57,22 @@ export class Schema {
    * handler's are its own, vanishing with its session.
    */
   ensure(db: DatabaseReader | Connection): Promise<void> {
-    const session = sessions.get(db);
-    return session ? session([this]) : apply(db as Connection, [this]);
+    const ensure = ensureOf(db);
+    return ensure ? ensure([this]) : apply(db as Connection, [this]);
   }
 }
 
-/** The handlers' sessions (`ctx.db`), each with how it applies schemas. */
-export const sessions = new WeakMap<object, (schemas: readonly Schema[]) => Promise<void>>();
+/** How a database applies schemas: a handler's (`ctx.db`, its reader), or one of `asDatabase`. */
+type Ensure = (schemas: readonly Schema[]) => Promise<void>;
 
-// The schema of each session object, by its name.
-const objects = new Map<string, Schema>();
+/** A database's {@link Ensure}. */
+const ENSURE = new Link<Ensure>('Schema.ensure');
 
-/** The session object `name`'s own schema: its steps, which each of its databases is made by. */
-export const register = (name: string, steps: readonly Step[]) => void objects.set(name, new Schema(name, steps));
+/** `db`, which applies schemas with `ensure` (see {@link Schema.ensure}). */
+export const ensuring = <D extends object>(db: D, ensure: Ensure): D => ENSURE.on(db, ensure);
 
-/** The session object `name`'s own schema, if it has one. */
-export const ofObject = (name: string) => objects.get(name);
+/** How `db` applies schemas, if it is a database of this package's. */
+export const ensureOf = (db: object): Ensure | undefined => ENSURE.of(db);
 
 /** Apply the steps of `schemas` that `db` lacks, in one transaction, with how far each got. */
 export async function apply(db: Connection, schemas: readonly Schema[], { reader = false } = {}) {

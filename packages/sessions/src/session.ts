@@ -20,7 +20,8 @@ import {
   type Store,
   type ConnectionTransaction,
 } from './database.ts';
-import { apply, dropAll, ofObject, type Schema, sessions } from './schema.ts';
+import { Link } from './link.ts';
+import { apply, dropAll, ensureOf, ensuring, type Schema } from './schema.ts';
 import { type Send, sendOf } from './calls.ts';
 
 export type { DatabaseReader, DatabaseWriter, Row, SqlParam, SqlValue };
@@ -71,12 +72,11 @@ export interface SqlHost {
   genericSend(send: restate.GenericSend<Uint8Array>): unknown;
 }
 
-type Wrap = (store: Store) => Store;
-let wrapStore: Wrap | undefined;
-
-/** Wrap each object's store, such as for fault injection in tests. */
-export function setStoreWrapper(wrap: Wrap) {
-  wrapStore = wrap;
+/** What a session object gives its attempts: its schema, and a wrapper of its store (fault injection, in tests). */
+export interface ObjectConfig {
+  /** The object's own schema, which each of its databases is made by. */
+  readonly schema?: Schema;
+  wrapStore?: (store: Store) => Store;
 }
 
 /** The end of an attempt, as `invocationEndPromise` rejects with it, for the requests that would otherwise wait for it. */
@@ -225,12 +225,11 @@ export function asDatabase(connection: Connection): Database {
     ...sqlOver((sql, params) => connection.queryColumns(sql, params)),
     transaction: (body) => connection.transaction((tx) => body({ ...forBody(tx), send: refusedSend })),
   };
-  sessions.set(db, (schemas) => apply(connection, schemas));
-  return db;
+  return ensuring(db, (schemas) => apply(connection, schemas));
 }
 
-// The transactions of `ctx.db`, each with how it empties the database (`reset`).
-const resets = new WeakMap<Transaction, () => Promise<void>>();
+/** How a transaction of `ctx.db` empties the database ({@link reset}). */
+const RESET = new Link<() => Promise<void>>('reset');
 
 /**
  * Empty the key's database in `tx`, a transaction of an exclusive handler's
@@ -240,7 +239,7 @@ const resets = new WeakMap<Transaction, () => Promise<void>>();
  * new database's first rows, in the same commit.
  */
 export function reset(tx: Transaction): Promise<void> {
-  const of = resets.get(tx);
+  const of = RESET.of(tx);
   if (of === undefined) throw new TerminalError("reset takes a transaction of an exclusive handler's ctx.db");
   return forHandler(of());
 }
@@ -259,14 +258,13 @@ export function lazyDatabase(opener: () => Promise<Database>): Database {
     execute: async (sql, params) => (await db()).execute(sql, params),
     transaction: async (body) => (await db()).transaction(body),
   };
-  sessions.set(lazy, async (schemas) => {
+  return ensuring(lazy, async (schemas) => {
     const inner = await db();
-    const ensure = sessions.get(inner);
+    const ensure = ensureOf(inner);
     if (ensure === undefined)
       throw new TerminalError("lazyDatabase opens a handler's ctx.db, or a database of asDatabase");
     await ensure(schemas);
   });
-  return lazy;
 }
 
 /** The sends of a transaction that has no outbox: a shared handler's, or another database's. */
@@ -324,8 +322,8 @@ function storedSend(send: restate.GenericSend<unknown>): Outgoing['sends'][numbe
 /** How a handler ended. */
 type Outcome<T> = { value: T } | { error: unknown };
 
-// The attempts, by their `ctx.db`: for `database`.
-const attempts = new WeakMap<object, Attempt>();
+/** The attempt of a `ctx.db`: for {@link database}. */
+const ATTEMPT = new Link<Attempt>('database');
 
 // A database's name (`database`).
 const DATABASE_NAME = /^[\w.-]{1,64}$/;
@@ -339,7 +337,7 @@ const DATABASE_NAME = /^[\w.-]{1,64}$/;
  */
 export function database(db: Database, name: string): Database {
   if (!DATABASE_NAME.test(name)) throw new TerminalError(`database: ${JSON.stringify(name)} is not a database name`);
-  const attempt = attempts.get(db);
+  const attempt = ATTEMPT.of(db);
   if (attempt === undefined) throw new TerminalError("database takes a handler's ctx.db");
   return attempt.database(name);
 }
@@ -425,6 +423,8 @@ export class Attempt {
   /** `ctx.db`. */
   readonly db: Database;
   private readonly ctx: SqlHost;
+  /** Its object's: the key's other databases share its store's wrapper, and have none of its schema. */
+  private readonly config: ObjectConfig;
   private readonly name: string | undefined;
   /** Whether it is the object's own database of an exclusive handler: the one with an outbox. */
   private readonly hasOutbox: boolean;
@@ -438,23 +438,24 @@ export class Attempt {
   private readonly ensured = new Map<string, Schema>();
   private ended = false;
 
-  constructor(ctx: SqlHost, name?: string) {
+  constructor(ctx: SqlHost, config: ObjectConfig = {}, name?: string) {
     this.ctx = ctx;
+    this.config = config;
     this.name = name;
     this.hasOutbox = !ctx.shared && name === undefined;
     this.db = {
       ...sqlOver((sql, params) => this.call((db) => db.queryColumns(sql, params)), handlerError),
       transaction: (body) => this.transaction(body),
     };
-    sessions.set(this.db, (schemas) => this.call((db) => this.ensureSchemas(db, schemas)));
-    attempts.set(this.db, this);
+    ensuring(this.db, (schemas) => this.call((db) => this.ensureSchemas(db, schemas)));
+    ATTEMPT.on(this.db, this);
   }
 
   /** The key's database `name`, in this attempt: see {@link database}. */
   database(name: string): Database {
     if (this.ended) throw new Error('the handler has ended: its SQL session is closed');
     let other = this.databases.get(name);
-    if (other === undefined) this.databases.set(name, (other = new Attempt(this.ctx, name)));
+    if (other === undefined) this.databases.set(name, (other = new Attempt(this.ctx, this.config, name)));
     return other.db;
   }
 
@@ -498,7 +499,7 @@ export class Attempt {
         const sends = this.hasOutbox ? new Sends() : undefined;
         const tx: Transaction = { ...forBody(handle), send: sends?.send ?? refusedSend };
         // A view's writes stay in its session: it has nothing to reset.
-        if (!this.ctx.shared) resets.set(tx, () => this.reset(handle));
+        if (!this.ctx.shared) RESET.on(tx, () => this.reset(handle));
         let result: T;
         try {
           result = await body(tx);
@@ -564,7 +565,8 @@ export class Attempt {
     const key = `${ctx.request().target.service}/${encodeURIComponent(ctx.key)}`;
     const namespace = this.name === undefined ? key : `${key}/${this.name}`;
     const object = objectStore(ctx, end, this.name);
-    const db = await open(namespace, wrapStore ? wrapStore(object) : object, { reader: ctx.shared });
+    const wrap = this.config.wrapStore;
+    const db = await open(namespace, wrap ? wrap(object) : object, { reader: ctx.shared });
     try {
       // A view writes nothing: a write fails, rather than vanish with the attempt.
       if (ctx.shared) await db.execute('PRAGMA query_only = 1');
@@ -642,7 +644,7 @@ export class Attempt {
 
   /** The object's schema, which the key's other databases have none of. */
   private ownSchema(): Schema | undefined {
-    return this.name === undefined ? ofObject(this.ctx.request().target.service) : undefined;
+    return this.name === undefined ? this.config.schema : undefined;
   }
 
   /** Empty the database in the transaction `handle` ({@link reset}), and apply the schemas this attempt applied again. */

@@ -28,8 +28,6 @@
 import * as restate from '@restatedev/sessions';
 import type { Database } from '@restatedev/sessions';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { ChatAnthropic } from '@langchain/anthropic';
-import type { ChatOpenAI } from '@langchain/openai';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { AIMessage, type BaseMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
 import { type StructuredToolInterface, tool, ToolInputParsingException } from '@langchain/core/tools';
@@ -47,7 +45,7 @@ import {
   modelOf,
   nextPromptId,
   providerOf,
-  refusal,
+  refusalOf,
   stopSignalOf,
   storedAnswer,
   toolCallEnded,
@@ -89,7 +87,7 @@ function toolsNode(ctx: restate.SessionContext, tools: StructuredToolInterface[]
     const { promise: failure, reject: failed } = Promise.withResolvers<never>();
     failure.catch(() => {});
     const node = new ToolNode(
-      tools.map((t) => failing(t, failed)),
+      tools.map((t) => failing(ctx, t, failed)),
       { handleToolErrors: true },
     );
     const ran: { messages: BaseMessage[] } = await Promise.race([node.invoke(state, config), failure]);
@@ -99,7 +97,11 @@ function toolsNode(ctx: restate.SessionContext, tools: StructuredToolInterface[]
 }
 
 /** `t`, its errors given to `failed`, but for its input's (arguments that do not fit) and LangGraph's interrupts. */
-const failing = (t: StructuredToolInterface, failed: (error: unknown) => void): StructuredToolInterface =>
+const failing = (
+  ctx: restate.SessionContext,
+  t: StructuredToolInterface,
+  failed: (error: unknown) => void,
+): StructuredToolInterface =>
   Object.create(t, {
     invoke: {
       value: async (...args: Parameters<StructuredToolInterface['invoke']>) => {
@@ -107,7 +109,7 @@ const failing = (t: StructuredToolInterface, failed: (error: unknown) => void): 
           return await t.invoke(...args);
         } catch (error) {
           if (!(error instanceof ToolInputParsingException) && !isGraphInterrupt(error)) {
-            fromTool(error);
+            fromTool(ctx, error);
             failed(error);
           }
           throw error;
@@ -128,21 +130,18 @@ const providerOfModel = (named: string) => {
 
 /**
  * The chat model `provider/model-id` names: OpenAI's or Anthropic's, through
- * LangChain's integration of the provider, loaded once, when a model of it is
- * first used: only that one need be installed.
+ * LangChain's integration of the provider, loaded when a model of it is
+ * used (Node loads a module once): only that one need be installed.
  */
 const chatModel = async (named: string): Promise<BaseChatModel> => {
   const [provider, id] = providerOfModel(named);
   if (provider === 'openai') {
-    openai ??= integration('@langchain/openai', () => import('@langchain/openai'));
-    return new (await openai).ChatOpenAI({ model: id });
+    const { ChatOpenAI } = await integration('@langchain/openai', () => import('@langchain/openai'));
+    return new ChatOpenAI({ model: id });
   }
-  anthropic ??= integration('@langchain/anthropic', () => import('@langchain/anthropic'));
-  return new (await anthropic).ChatAnthropic({ model: id });
+  const { ChatAnthropic } = await integration('@langchain/anthropic', () => import('@langchain/anthropic'));
+  return new ChatAnthropic({ model: id });
 };
-
-let openai: Promise<{ ChatOpenAI: typeof ChatOpenAI }> | undefined;
-let anthropic: Promise<{ ChatAnthropic: typeof ChatAnthropic }> | undefined;
 
 /** The integration `name`, which its user installs beside @restatedev/agents. */
 async function integration<T>(name: string, load: () => Promise<T>): Promise<T> {
@@ -249,7 +248,7 @@ const answerOnce = async (
       }
       // Refused for good (a wrong API key): the run ends unanswered, and
       // fails as terminal. An earlier prompt's, this one goes on.
-      const refused = refusal(error);
+      const refused = refusalOf(ctx, error);
       if (!refused) throw error;
       await close(app, config, UNANSWERED);
       if (!interrupted || last === id) throw refused;

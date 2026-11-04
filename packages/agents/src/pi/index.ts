@@ -32,7 +32,7 @@
 // and a coding tool cut off by a crash is not run again (the model is told
 // it was interrupted).
 import * as restate from '@restatedev/sessions';
-import type { Database } from '@restatedev/sessions';
+import { ScopeKey } from '@restatedev/sessions/internal';
 import type { Context } from '@earendil-works/chord';
 import { awaitWithContext, BACKGROUND_CONTEXT, withCancel, withoutAbortSignal } from '@earendil-works/chord/context';
 import { mkdir } from 'node:fs/promises';
@@ -286,7 +286,7 @@ export const withPi = async <T>(
 
   try {
     // The log reads the root conversation through this Harness, while it is open.
-    const read = async () => transcribe(ctx.db, await harness.root(context), context);
+    const read = async () => transcribe(ctx, await harness.root(context), context);
     return await transcribing(ctx, read, () =>
       Promise.race([abortOn(), work({ harness, context, conversation, prompt })]),
     );
@@ -336,12 +336,11 @@ export const messages = () => messagesHandler();
  * never change, and a new one takes a greater id than any before it (they
  * are committed one at a time), so each read adds the entries after it.
  */
-const transcripts = new WeakMap<Database, { last?: EntryId; transcript: Transcript }>();
+const TRANSCRIPT = new ScopeKey<{ last?: EntryId; transcript: Transcript }>('the transcript');
 
-/** The root conversation in `db`, `root` of a Harness on it, from pi-durable's entries, as `messages` gives it. */
-const transcribe = async (db: Database, root: Conversation, context: Context) => {
-  const read = transcripts.get(db) ?? { transcript: new Transcript() };
-  transcripts.set(db, read);
+/** The root conversation in the database of `ctx`, `root` of a Harness on it, from pi-durable's entries, as `messages` gives it. */
+const transcribe = async (ctx: restate.SessionContext, root: Conversation, context: Context) => {
+  const read = TRANSCRIPT.of(ctx, () => ({ transcript: new Transcript() }));
   const { transcript } = read;
   // From the last entry read (the bound is inclusive), or the first.
   const query = { order: 'ascending' as const, ...(read.last === undefined ? {} : { minEntryId: read.last }) };

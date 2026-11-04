@@ -24,7 +24,7 @@
 // - A reply cut off at `maxTokens`, or declined, ends the prompt: its tool
 //   calls do not run, and the handler fails with a terminal error.
 import * as restate from '@restatedev/sessions';
-import type { Database } from '@restatedev/sessions';
+import { ScopeKey } from '@restatedev/sessions/internal';
 import Anthropic from '@anthropic-ai/sdk';
 import type { BetaRunnableTool, BetaToolRunContext } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 import {
@@ -40,7 +40,7 @@ import {
   modelIdOf,
   modelOf,
   nextPromptId,
-  refusal,
+  refusalOf,
   stopSignalOf,
   storedAnswer,
   toolCallEnded,
@@ -66,7 +66,7 @@ export const callId = (context?: BetaToolRunContext) => {
  * to the model as the tool's result, so each one is kept, for `check()` to
  * throw once the tools ran.
  */
-function failing(tools: BetaRunnableTool[]) {
+function failing(ctx: restate.SessionContext, tools: BetaRunnableTool[]) {
   let failure: unknown;
   return {
     tools: tools.map((tool): BetaRunnableTool => ({
@@ -75,7 +75,7 @@ function failing(tools: BetaRunnableTool[]) {
         try {
           return await tool.run(args, context);
         } catch (e) {
-          fromTool(e);
+          fromTool(ctx, e);
           failure ??= e;
           throw e;
         }
@@ -114,7 +114,7 @@ async function run(
   id: string,
   signal?: AbortSignal,
 ) {
-  const { tools, check } = failing(all);
+  const { tools, check } = failing(ctx, all);
   const runner = client.beta.messages.toolRunner(
     {
       model,
@@ -219,14 +219,14 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   output?: O;
 }
 
-/** The client of the agents without one of their own, made when first used. */
-let shared: Anthropic | undefined;
+/** The client of an agent without one of its own, on the context of the turn it answers. */
+const CLIENT = new ScopeKey<Anthropic>('the Anthropic client');
 
 /** {@link prompt}, answering with the agent's text. */
 const promptText = (ctx: restate.SessionContext, text: string, options: Options): Promise<string> =>
   transcribing(
     ctx,
-    () => transcribe(ctx.db),
+    () => transcribe(ctx),
     () => answerOnce(ctx, text, options),
   );
 
@@ -236,7 +236,7 @@ const answerOnce = async (
   { model: named, system, tools = [], client, maxTokens = 16_000, effort }: Options,
 ): Promise<string> => {
   const agent = {
-    client: client ?? (shared ??= new Anthropic()),
+    client: client ?? CLIENT.of(ctx, () => new Anthropic()),
     model: modelIdOf(modelOf(named, CLAUDE_MODEL), 'anthropic'),
     maxTokens,
     effort,
@@ -278,7 +278,7 @@ const answerOnce = async (
       }
       // Refused for good (a wrong API key): the prompt ends unanswered, and
       // fails as terminal. An earlier one's, this one goes on.
-      const refused = refusal(error);
+      const refused = refusalOf(ctx, error);
       if (!refused) throw error;
       await conversation.close(pending, UNANSWERED);
       if (pending === id) throw refused;
@@ -325,12 +325,12 @@ export const messages = () => messagesHandler();
  * attempt), as far as it was read: the conversation only grows, so each
  * read adds the messages stored since.
  */
-const transcripts = new WeakMap<Database, { seq: number; transcript: Transcript }>();
+const TRANSCRIPT = new ScopeKey<{ seq: number; transcript: Transcript }>('the transcript');
 
-/** The conversation in `db`, as `messages` gives it. */
-const transcribe = async (db: Database): Promise<Transcript> => {
-  const read = transcripts.get(db) ?? { seq: 0, transcript: new Transcript() };
-  transcripts.set(db, read);
+/** The conversation in the database of `ctx`, as `messages` gives it. */
+const transcribe = async (ctx: restate.SessionContext): Promise<Transcript> => {
+  const { db } = ctx;
+  const read = TRANSCRIPT.of(ctx, () => ({ seq: 0, transcript: new Transcript() }));
   const { transcript } = read;
   for (const [seq, m] of await (await Conversation.open(db)).since(read.seq)) {
     read.seq = seq;

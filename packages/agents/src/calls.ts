@@ -19,7 +19,7 @@
 // terminal error is its result too. Once stored, the model has its result,
 // and an identical call it makes later is a call of its own.
 import type * as restate from '@restatedev/sessions';
-import { Schema } from '@restatedev/sessions/internal';
+import { Schema, ScopeKey } from '@restatedev/sessions/internal';
 import { randomUUID } from 'node:crypto';
 
 /** A tool's call: the tool, its input as JSON, the ids it was made with (the first is its own), and the attempt that last made it. */
@@ -72,17 +72,11 @@ async function load(ctx: CallsContext, invocation: string): Promise<Calls> {
 }
 
 /** Each attempt's id, and its calls, by its context. */
-const attempts = new WeakMap<object, { id: string; calls: Promise<Calls> }>();
+const ATTEMPT = new ScopeKey<{ id: string; calls: Promise<Calls> }>('the calls of an attempt');
 
 /** The attempt of `ctx`: its id, and the calls of its invocation. */
-function attemptOf(ctx: CallsContext) {
-  let attempt = attempts.get(ctx);
-  if (!attempt) {
-    const calls = load(ctx, ctx.request.id);
-    attempt = { id: randomUUID(), calls };
-    attempts.set(ctx, attempt);
-  }
-  return attempt;
+function attemptOf(ctx: restate.SessionContext) {
+  return ATTEMPT.of(ctx, () => ({ id: randomUUID(), calls: load(ctx, ctx.request.id) }));
 }
 
 /**
@@ -91,7 +85,7 @@ function attemptOf(ctx: CallsContext) {
  * the same tool and input (made again under a new id), or else a new one.
  * `run(id)` makes it with its own id, and stores that it answered.
  */
-export async function callOf(ctx: CallsContext, tool: string, input: unknown, callId: string) {
+export async function callOf(ctx: restate.SessionContext, tool: string, input: unknown, callId: string) {
   const attempt = attemptOf(ctx);
   const state = await attempt.calls;
   const json = JSON.stringify(input);
@@ -129,7 +123,7 @@ export async function callOf(ctx: CallsContext, tool: string, input: unknown, ca
  * otherwise take one an earlier attempt made, and the model has the result
  * of.
  */
-export async function settle(ctx: CallsContext, stored: (id: string, failed?: string) => boolean) {
+export async function settle(ctx: restate.SessionContext, stored: (id: string, failed?: string) => boolean) {
   const state = await attemptOf(ctx).calls;
   const kept = state.calls.filter((c) => !c.done || !stored(c.ids.at(-1)!, c.failed));
   if (kept.length === state.calls.length) return;

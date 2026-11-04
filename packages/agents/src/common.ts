@@ -3,7 +3,7 @@
 // cancellation, publishing for the clients that follow it), and
 // the `messages` handler with its `Transcript`.
 import * as restate from '@restatedev/sessions';
-import { cancelCalls, cancelled } from '@restatedev/sessions/internal';
+import { cancelCalls, cancelled, definitionOf, Link, ScopeKey } from '@restatedev/sessions/internal';
 import { settle } from './calls.ts';
 import * as log from './log.ts';
 import type { Said } from './log.ts';
@@ -23,7 +23,7 @@ export const configured = async <T>(value: Configure<T>, ctx: restate.SessionCon
   typeof value === 'function' ? (value as (ctx: restate.SessionContext) => T | Promise<T>)(ctx) : value;
 
 /** The prompts each invocation made so far, by its context. */
-const prompts = new WeakMap<object, number>();
+const PROMPTS = new ScopeKey<number>('nextPromptId');
 
 /**
  * The id of the next prompt of the invocation of `ctx`: the invocation's id,
@@ -31,8 +31,8 @@ const prompts = new WeakMap<object, number>();
  * order, so each gets the same id again, and its answer.
  */
 export const nextPromptId = (ctx: restate.SessionContext) => {
-  const n = (prompts.get(ctx) ?? 0) + 1;
-  prompts.set(ctx, n);
+  const n = (PROMPTS.get(ctx) ?? 0) + 1;
+  PROMPTS.set(ctx, n);
   return n === 1 ? ctx.request.id : `${ctx.request.id}:${n}`;
 };
 
@@ -133,7 +133,7 @@ export interface Turn {
 }
 
 /** What stops each turn, by its context: see {@link stopSignalOf}. */
-const turns = new WeakMap<object, AbortSignal>();
+const TURN = new ScopeKey<AbortSignal>('stopSignalOf');
 
 /**
  * Why a turn stopped when its attempt ended before it did: Restate suspended
@@ -156,42 +156,54 @@ export class AttemptEnded extends Error {
  * {@link AttemptEnded} once the attempt ends first (the work stops, and
  * answers nothing).
  */
-export const stopSignalOf = (ctx: object): AbortSignal | undefined => turns.get(ctx);
+export const stopSignalOf = (ctx: restate.SessionContext): AbortSignal | undefined => TURN.get(ctx);
 
-/** The agents that run in the background (`background: true`): no one follows them as they work. */
-const background = new Set<string>();
+/** What `clear` also empties, beside the agent's database. */
+type Clear = (ctx: restate.SessionContext) => Promise<void>;
 
-/** Agent `name` runs in the background: see `background` in object.ts. */
-export const inBackground = (name: string) => void background.add(name);
+/** An agent's own: whether it runs in the background (`background: true`: no one follows it as it works), and what its `clear` also empties. */
+interface Agent {
+  background: boolean;
+  clear?: Clear;
+}
 
-/** What each agent clears beside its database, by its object's name: see {@link onClear}. */
-const clearing = new Map<string, (ctx: restate.SessionContext) => Promise<void>>();
+/** An agent's own, on its definition. */
+const AGENT = new Link<Agent>('an agent');
 
 /** What a framework's `messages` view clears beside the agent's database: see {@link alsoClearing}. */
-const viewsClearing = new WeakMap<object, (ctx: restate.SessionContext) => Promise<void>>();
+const CLEARS = new Link<Clear>('alsoClearing');
 
 /**
  * The `messages` view `view` of a framework that keeps a conversation apart
  * (OpenCode, in a database of its own): `clear` empties it too, as an agent
  * with this view is cleared.
  */
-export const alsoClearing = <V extends object>(view: V, clear: (ctx: restate.SessionContext) => Promise<void>) => {
-  viewsClearing.set(view, clear);
-  return view;
+export const alsoClearing = <V extends object>(view: V, clear: Clear) => {
+  return CLEARS.on(view, clear);
 };
 
-/** When the agent `name`, whose `messages` view is `view`, is cleared, clear what that view keeps apart too. */
-export const onClear = (name: string, view: object | undefined) => {
-  const clear = view === undefined ? undefined : viewsClearing.get(view);
-  if (clear === undefined) clearing.delete(name);
-  else clearing.set(name, clear);
+/**
+ * `definition` is an agent's: whether it runs in the background, and its
+ * `messages` view, whose clearing (`alsoClearing`) its `clear` does too.
+ */
+export const isAgent = <D extends object>(
+  definition: D,
+  { background = false, messages = undefined as object | undefined },
+) => {
+  return AGENT.on(definition, { background, clear: messages && CLEARS.of(messages) });
 };
 
-/** Clear what the agent of `ctx` keeps beside its database ({@link onClear}). */
-export const cleared = async (ctx: restate.SessionContext) => clearing.get(ctx.request.target.service)?.(ctx);
+/** The agent of `ctx`'s own (see {@link isAgent}). */
+const agentOf = (ctx: restate.SessionContext) => {
+  const definition = definitionOf(ctx);
+  return definition && AGENT.of(definition);
+};
+
+/** Clear what the agent of `ctx` keeps beside its database. */
+export const cleared = async (ctx: restate.SessionContext) => agentOf(ctx)?.clear?.(ctx);
 
 /** Whether the agent of `ctx` runs in the background. */
-const unfollowed = (ctx: restate.SessionContext) => background.has(ctx.request.target.service);
+const unfollowed = (ctx: restate.SessionContext) => agentOf(ctx)?.background === true;
 
 /** The `signals` object of the agent of `ctx`. */
 const signalsOfAgent = (ctx: restate.SessionContext) => ctx.rpc(signals, signalsOf(ctx));
@@ -203,7 +215,7 @@ const signalsOfAgent = (ctx: restate.SessionContext) => ctx.rpc(signals, signals
  * Restate, so it also sends what the handler wrote before, for them to read.
  */
 const publish = async (ctx: restate.SessionContext) => {
-  const read = reading.get(ctx);
+  const read = READING.get(ctx);
   if (read) await logged(ctx, read);
   await signalsOfAgent(ctx).publish();
 };
@@ -221,7 +233,7 @@ const stepped = async (ctx: restate.SessionContext) => {
  */
 export async function toolCallStarted(ctx: restate.SessionContext) {
   if (!unfollowed(ctx)) return publish(ctx);
-  const read = reading.get(ctx);
+  const read = READING.get(ctx);
   if (read) {
     const transcript = await read();
     await settle(ctx, (id, failed) => transcript.answered(id, failed));
@@ -272,12 +284,12 @@ export const chatHandler = <A = string>(answer: (ctx: restate.SessionContext, me
     // turn, which publishes it: one revision. The close is a call the turn
     // waits for, so that it is done before the turn ends (see `awaitTurn`).
     const end = async () => {
-      const read = reading.get(ctx);
+      const read = READING.get(ctx);
       if (read) await logged(ctx, read);
       await signalsOfAgent(ctx).close(invocationId);
     };
     const turn = new AbortController();
-    turns.set(ctx, turn.signal);
+    TURN.set(ctx, turn.signal);
     void (async () => {
       await cancelled(ctx);
       turn.abort(new restate.CancelledError());
@@ -298,7 +310,7 @@ export const chatHandler = <A = string>(answer: (ctx: restate.SessionContext, me
         throw error;
       }
       // Any other error fails the attempt, and Restate retries the turn.
-      const terminal = refusal(error);
+      const terminal = refusalOf(ctx, error);
       if (!terminal) throw error;
       await end();
       throw terminal;
@@ -321,21 +333,26 @@ export class ToolError extends Error {
   }
 }
 
-/** The errors a framework's own tools (not `tool()`'s) failed with: see {@link fromTool}. */
-const toolErrors = new WeakSet<object>();
+/** The errors the attempt's framework tools (not `tool()`'s) failed with: see {@link fromTool}. */
+const TOOL_ERRORS = new ScopeKey<WeakSet<object>>('fromTool');
 
 /**
- * `error` is a tool's: a framework's own tool (Claude's, LangChain's...)
- * that failed, whose error is never taken for the model's provider refusing
- * (a tool that calls a model API may fail as one does). `tool()`'s are
- * {@link ToolError}s.
+ * `error` is a tool's, in the attempt of `ctx`: a framework's own tool
+ * (Claude's, LangChain's...) that failed, whose error is never taken for
+ * the model's provider refusing (a tool that calls a model API may fail as
+ * one does). `tool()`'s are {@link ToolError}s.
  */
-export function fromTool(error: unknown) {
-  if (typeof error === 'object' && error !== null) toolErrors.add(error);
+export function fromTool(ctx: restate.SessionContext, error: unknown) {
+  if (typeof error === 'object' && error !== null) TOOL_ERRORS.of(ctx, () => new WeakSet()).add(error);
 }
 
 /** The Anthropic SDK's errors of a request that fails again however often it is made. */
-const FOR_GOOD = new Set(['AuthenticationError', 'PermissionDeniedError', 'NotFoundError', 'BadRequestError']);
+const FOR_GOOD: ReadonlySet<string> = new Set([
+  'AuthenticationError',
+  'PermissionDeniedError',
+  'NotFoundError',
+  'BadRequestError',
+]);
 
 /**
  * Whether `error` is a model provider's refusal that a retry does not change:
@@ -343,12 +360,17 @@ const FOR_GOOD = new Set(['AuthenticationError', 'PermissionDeniedError', 'NotFo
  * (a tool's, an overloaded provider's) fail the attempt, and Restate retries.
  */
 function refused(error: unknown) {
-  if (error instanceof ToolError || (typeof error === 'object' && error !== null && toolErrors.has(error)))
-    return false;
+  if (error instanceof ToolError) return false;
   if (error instanceof Error && FOR_GOOD.has(error.constructor.name)) return true;
   return /API key not found|no API key|Could not resolve authentication method|Provider is not configured|"code":"(AUTH|MISSING_CREDENTIAL)"/i.test(
     String(error),
   );
+}
+
+/** {@link refusal}, but not of an error a framework's tool failed with in the attempt of `ctx` ({@link fromTool}). */
+export function refusalOf(ctx: restate.SessionContext, error: unknown): restate.TerminalError | undefined {
+  const failedTool = typeof error === 'object' && error !== null && TOOL_ERRORS.get(ctx)?.has(error);
+  return failedTool ? undefined : refusal(error);
 }
 
 /**
@@ -492,22 +514,22 @@ export class Transcript {
  */
 export type Read = () => Promise<Transcript>;
 
-/** The transcript of the turn of each context, while it answers. */
-const reading = new WeakMap<object, Read>();
+/** The transcript of the attempt's turn, while it answers. */
+const READING = new ScopeKey<Read>('transcribing');
 
-/** The log writes of each context, one after another: tool calls in parallel publish at once. */
-const writing = new WeakMap<object, Promise<void>>();
+/** The attempt's log writes, one after another: tool calls in parallel publish at once. */
+const WRITING = new ScopeKey<Promise<void>>('the log');
 
 /** The log of the conversation of `ctx` takes its transcript as `read` gives it. */
 function logged(ctx: restate.SessionContext, read: Read): Promise<void> {
   const write = async () => {
     const transcript = await read();
-    await log.sync(ctx.db, transcript.messages());
+    await log.sync(ctx, transcript.messages());
     // The calls whose results the framework stored are made: see calls.ts.
     await settle(ctx, (id, failed) => transcript.answered(id, failed));
   };
-  const done = (writing.get(ctx) ?? Promise.resolve()).then(write, write);
-  writing.set(ctx, done);
+  const done = (WRITING.get(ctx) ?? Promise.resolve()).then(write, write);
+  WRITING.set(ctx, done);
   return done;
 }
 
@@ -519,8 +541,8 @@ function logged(ctx: restate.SessionContext, read: Read): Promise<void> {
  * framework closes. `messages` and `sync` read the log.
  */
 export async function transcribing<T>(ctx: restate.SessionContext, read: Read, work: () => Promise<T>): Promise<T> {
-  const outer = reading.get(ctx);
-  reading.set(ctx, read);
+  const outer = READING.get(ctx);
+  READING.set(ctx, read);
   let failed = false;
   try {
     return await work();
@@ -532,8 +554,8 @@ export async function transcribing<T>(ctx: restate.SessionContext, read: Read, w
       // A failed attempt stores nothing more: its retry runs again.
       if (!failed) await logged(ctx, read);
     } finally {
-      if (outer) reading.set(ctx, outer);
-      else reading.delete(ctx);
+      if (outer) READING.set(ctx, outer);
+      else READING.delete(ctx);
     }
   }
 }

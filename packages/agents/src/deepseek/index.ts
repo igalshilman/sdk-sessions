@@ -383,7 +383,7 @@ const tracked = (
       await toolCallEnded(ctx);
       return result;
     } catch (error) {
-      fromTool(error);
+      fromTool(ctx, error);
       fail(error);
       throw error;
     }

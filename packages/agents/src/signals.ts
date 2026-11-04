@@ -7,7 +7,7 @@
 // replay one from), so it calls `wait`, which can: a journaled handler of
 // this object, which waits without holding a process.
 import type { SessionContext } from '@restatedev/sessions';
-import { needing, sdk as restate } from '@restatedev/sessions/internal';
+import { Link, needing, sdk as restate } from '@restatedev/sessions/internal';
 import type { Turn } from './common.ts';
 import type { Status } from './object.ts';
 
@@ -20,8 +20,8 @@ const keyOf = (service: string, key: string) => `${service}:${key}`;
 /** The key of the signals of the agent of `ctx`. */
 export const signalsOf = (ctx: AgentContext) => keyOf(ctx.request.target.service, ctx.key);
 
-/** Where an object of @restatedev/agents (`sessionObject()`, every `agent()`) points to its companion. */
-const COMPANION = Symbol('restate-agents.companion');
+/** How an object of @restatedev/agents (`sessionObject()`, every `agent()`) reaches its companion, for one of its keys. */
+const COMPANION = new Link<(key: string) => Companion>('restate-agents.companion');
 
 /**
  * An agent's companion, for one of its keys: its `signals` object, which
@@ -43,13 +43,11 @@ export interface Companion {
  */
 export const withCompanion = <D extends { name: string }>(definition: D): D =>
   needing(
-    Object.defineProperty(definition, COMPANION, {
-      value: (key: string): Companion => ({
-        object: signals,
-        key: keyOf(definition.name, key),
-        agent: { service: definition.name, key },
-      }),
-    }),
+    COMPANION.on(definition, (key) => ({
+      object: signals,
+      key: keyOf(definition.name, key),
+      agent: { service: definition.name, key },
+    })),
     () => [signals],
   );
 
@@ -58,14 +56,14 @@ export const withCompanion = <D extends { name: string }>(definition: D): D =>
  * `sessionObject()` or `agent()` of @restatedev/agents) to reach what it is doing.
  */
 export function companionOf(agent: { name: string }, key: string): Companion {
-  const companion = (agent as { [COMPANION]?: (key: string) => Companion })[COMPANION];
+  const companion = COMPANION.of(agent);
   if (!companion)
     throw new Error(`${agent.name} is not an agent of @restatedev/agents (a sessionObject() or an agent())`);
   return companion(key);
 }
 
 /** Whether `agent` is an object of @restatedev/agents, with a companion. */
-export const hasCompanion = (agent: object) => COMPANION in agent;
+export const hasCompanion = (agent: object) => COMPANION.of(agent) !== undefined;
 
 /**
  * Deliver `text` to `agent`'s key `key`, from any handler: a message of its

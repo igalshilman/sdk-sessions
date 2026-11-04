@@ -14,8 +14,8 @@
 // got to: the next conversation's ids and cursors go on from there (its
 // start, a row of `restate_agent_log_start`), so a client following it reads
 // on, and drops the messages before `first`.
-import type { Database, DatabaseReader, DatabaseWriter } from '@restatedev/sessions';
-import { Schema } from '@restatedev/sessions/internal';
+import type { DatabaseReader, DatabaseWriter, SessionContext } from '@restatedev/sessions';
+import { Schema, ScopeKey } from '@restatedev/sessions/internal';
 import type { ChatMessage, Messages, MessagesRequest } from './common.ts';
 
 const TABLE = 'restate_agent_log';
@@ -73,16 +73,16 @@ interface Head {
 }
 
 /**
- * The head of each session (`ctx.db`, one per attempt), as its last `sync`
- * stored it: the next compares the transcript with it, rather than read the
- * whole log again at each step.
+ * The log's head, as the attempt's last `sync` stored it: the next compares
+ * the transcript with it, rather than read the whole log again at each step.
  */
-const heads = new WeakMap<Database, Head>();
+const HEAD = new ScopeKey<Head>('the log');
 
-/** The log's head in `db`: as this session stored it last, or else as the log has it. */
-async function headOf(db: Database): Promise<Head> {
-  const cached = heads.get(db);
+/** The log's head in the attempt of `ctx`: as it stored it last, or else as the log has it. */
+async function headOf(ctx: SessionContext): Promise<Head> {
+  const cached = HEAD.get(ctx);
   if (cached) return cached;
+  const { db } = ctx;
   const rows = (await db.values(`SELECT id, message FROM ${TABLE} WHERE position IS NOT NULL ORDER BY position`)).map(
     ([id, json]) => ({ id: Number(id), message: JSON.parse(String(json)) as Said, json: String(json) }),
   );
@@ -98,9 +98,10 @@ async function headOf(db: Database): Promise<Head> {
  * Store the transcript's `messages`, in order, in the log: those that
  * changed since the last time, in one transaction.
  */
-export async function sync(db: Database, messages: Said[]) {
+export async function sync(ctx: SessionContext, messages: Said[]) {
+  const { db } = ctx;
   await SCHEMA.ensure(db);
-  const head = await headOf(db);
+  const head = await headOf(ctx);
   // A message the transcript did not change is the one stored (see Transcript in common.ts):
   // only the others are compared, as JSON.
   const jsons: string[] = [];
@@ -134,10 +135,10 @@ export async function sync(db: Database, messages: Said[]) {
     });
   } catch (error) {
     // Rolled back: the log is as it was, which the next sync reads again.
-    heads.delete(db);
+    HEAD.delete(ctx);
     throw error;
   }
-  heads.set(db, { rows, seq, next: id });
+  HEAD.set(ctx, { rows, seq, next: id });
 }
 
 /**

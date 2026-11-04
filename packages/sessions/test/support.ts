@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import * as restate from '@restatedev/sessions';
 import {
   asDatabase,
+  configOf,
   contextOf,
   lazyDatabase,
   open,
@@ -72,7 +73,9 @@ export interface AttemptOptions {
   onAwait?: () => Promise<void>;
   /** A shared handler's attempt: its `ctx.db` reads beside the owner's, and writes nothing. */
   shared?: boolean;
-  /** The object's name (by default, one of its own), such as one with a schema. */
+  /** The session object it is an attempt of: its name, schema and config. */
+  object?: { readonly name: string };
+  /** The object's name, if no `object`: by default, one of its own. */
   service?: string;
 }
 
@@ -94,7 +97,8 @@ export function sqlAttempt({
   onSync = async () => {},
   onAwait = async () => {},
   shared = false,
-  service = `test-${randomUUID()}`,
+  object,
+  service = object?.name ?? `test-${randomUUID()}`,
 }: AttemptOptions) {
   const check = () => {
     onRequest();
@@ -141,7 +145,7 @@ export function sqlAttempt({
       send(s);
     },
   } satisfies SqlHost;
-  const attempt = new Attempt(ctx);
+  const attempt = new Attempt(ctx, object && configOf(object));
   const cancelled = Promise.withResolvers<void>();
   return {
     db: attempt.db,
@@ -159,9 +163,9 @@ export function sqlAttempt({
     set: (name: string, value: unknown) => ctx.set(name, new TextEncoder().encode(JSON.stringify(value))),
     clear: (name: string) => ctx.clear(name),
     /** The handler's context, over this attempt's `ctx.db`. */
-    ctx: contextOf(sdkOf(ctx, cancel), attempt.db),
+    ctx: contextOf(sdkOf(ctx, cancel), attempt.db, { definition: object }),
     /** A view's context, over this attempt's `ctx.db`. */
-    view: contextOf(sdkOf(ctx, cancel), attempt.db, { view: true }),
+    view: contextOf(sdkOf(ctx, cancel), attempt.db, { view: true, definition: object }),
     /** Open the session now, as an exclusive attempt starts. */
     openNow: () => attempt.openNow(),
     /** `handler`'s result, once its session ended. */
