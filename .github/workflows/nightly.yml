@@ -13,8 +13,9 @@ permissions:
 jobs:
   soak:
     # crash.ts for 45 minutes, in rounds over many more keys: the server
-    # killed every 4 minutes, two shop processes taking turns (one with a
-    # small page cache), cancellations, and every service process's memory checked.
+    # killed every 4 minutes, two shop and two bank processes taking turns
+    # (one of each with a small page cache), each living at least 2 s between
+    # its random aborts, cancellations, and every service process's memory checked.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

@@ -2,11 +2,15 @@
 // abort at random state requests, and the server is killed twice, while
 // clients place, pay and expire orders, move money between accounts (a key
 // each, some transfers cancelled), read views of all of them, and prompt
-// agents. The ledger, the shop and the bank run in two processes behind one
-// deployment (ABORT_PER_MILLE, default 15): a proxy hands each connection
-// Restate opens to the next of them, and cuts them every few seconds, so a
-// key's invocations move between two warm page caches, one of them small
-// (1 MiB of memory, 8 MiB of disk). Each kind of agent runs in its own: the pi, LangGraph and DeepSeek Harness agents
+// agents. The ledger and the shop run in two processes behind one deployment,
+// and the bank in two more behind another (ABORT_PER_MILLE, default 15): a
+// proxy hands each connection Restate opens to the next of its processes, and
+// cuts them every few seconds, so a key's invocations move between two warm
+// page caches, one of them small (1 MiB of memory, 8 MiB of disk). The bank
+// has processes of its own because a process dies at its share of every
+// invocation's requests: the bank's many keys, retried, would kill the shop's
+// processes so often that a write of the warehouse, the key every order of a
+// SKU goes through, could not finish. Each kind of agent runs in its own: the pi, LangGraph and DeepSeek Harness agents
 // (AGENT_ABORT_PER_MILLE, default 3: a pi or DeepSeek Harness prompt makes
 // some hundreds of state requests), the Claude agents (the same), and
 // the OpenCode agents (OPENCODE_ABORT_PER_MILLE, default 1: an OpenCode prompt
@@ -32,7 +36,11 @@
 // minutes passed, killing the server every KILL_EVERY_MINUTES (default 4),
 // and checks every service process's memory (RSS) stays under SOAK_RSS_MB (default
 // 1536). CRASH_ORDERS, CRASH_MOVES (per round) and CRASH_ACCOUNTS (default
-// 60, 120 and 12) set how many keys a run touches.
+// 60, 120 and 12) set how many keys a run touches. A process of a soak aborts
+// at random only once it has run SOAK_MIN_LIFE_MS (default 2000; faults.ts's
+// ABORT_AFTER_MS): over that many keys, the requests of the retries made a
+// process die every third of a second, and a key's writes took minutes to get
+// through, while the requests queued behind them waited out the client.
 //
 //   pnpm --filter e2e crash   (RESTATE_SERVER=/path/to/restate-server to use another)
 //   ABORT_SEED=1234 pnpm --filter e2e crash   (again, as a failed run printed it)
@@ -71,18 +79,17 @@ interface Process {
   behind?: number;
   env?: Record<string, string>;
 }
-const SHOP = ['ledger', 'shop', 'bank'];
 const SHOP_PROXY = 9182;
+const BANK_PROXY = 9190;
+const SMALL_CACHE = { RESTATE_SQL_CACHE_MEMORY: '1MiB', RESTATE_SQL_CACHE_DISK: '8MiB' };
+/** Two processes of `groups` behind the proxy on `proxy`, the second with a small page cache. */
+const pair = (name: string, groups: string[], ports: [number, number], proxy: number): Process[] => [
+  { name, groups, port: ports[0], perMille: PER_MILLE, behind: proxy },
+  { name: `${name}-small`, groups, port: ports[1], perMille: PER_MILLE, behind: proxy, env: SMALL_CACHE },
+];
 const PROCESSES: Process[] = [
-  { name: 'shop', groups: SHOP, port: 9180, perMille: PER_MILLE, behind: SHOP_PROXY },
-  {
-    name: 'shop-small',
-    groups: SHOP,
-    port: 9181,
-    perMille: PER_MILLE,
-    behind: SHOP_PROXY,
-    env: { RESTATE_SQL_CACHE_MEMORY: '1MiB', RESTATE_SQL_CACHE_DISK: '8MiB' },
-  },
+  ...pair('shop', ['ledger', 'shop'], [9180, 9181], SHOP_PROXY),
+  ...pair('bank', ['bank'], [9184, 9185], BANK_PROXY),
   { name: 'agent', groups: ['agent'], port: 9183, perMille: AGENT_PER_MILLE },
   { name: 'langgraph', groups: ['langgraph'], port: 9186, perMille: AGENT_PER_MILLE },
   // Late in a conversation, a Claude attempt reads enough of it that at the
@@ -109,12 +116,13 @@ const OPENING = 1000;
 const BANK_ACCOUNTS = Number(process.env.CRASH_ACCOUNTS ?? 12);
 const MOVES = Number(process.env.CRASH_MOVES ?? 120); // per round
 const RETENTION_MS = 2000; // the Account's idempotencyRetention (bank.ts)
-// How often the proxy cuts the shop processes' connections.
+// How often the proxies cut their processes' connections.
 const ROTATE_MS = 3000;
 // A soak: rounds of the shop and the bank until SOAK_MINUTES passed.
 const SOAK_MS = Number(process.env.SOAK_MINUTES ?? 0) * 60_000;
 const KILL_EVERY_MS = Number(process.env.KILL_EVERY_MINUTES ?? 4) * 60_000;
 const SOAK_RSS_MB = Number(process.env.SOAK_RSS_MB ?? 1536);
+const SOAK_MIN_LIFE_MS = Number(process.env.SOAK_MIN_LIFE_MS ?? 2000);
 
 const SEED = seedFromEnv();
 console.error(`seed ${SEED} (ABORT_SEED=${SEED} runs it again)`);
@@ -195,6 +203,7 @@ function supervise({ name, groups, port, env }: Process, perMille: number): Supe
           ABORT_PER_MILLE: String(perMille),
           ABORT_SEED: String(seed),
           ...(first && perMille > 0 ? { ABORT_AT: String(20 + Math.floor(random() * 180)) } : {}),
+          ...(SOAK_MS > 0 ? { ABORT_AFTER_MS: String(SOAK_MIN_LIFE_MS) } : {}),
           SHOP_EXPIRY_MS: String(EXPIRY_MS),
           RESTATE_SQL_CACHE_FILE: join(dir, `${name}.cache`),
           ...env,
@@ -263,24 +272,80 @@ async function call<T = unknown>(path: string, body?: unknown, headers: Record<s
         throw new Error(`${path}: ${response.status} ${text}`);
       }
     }
-    if (Date.now() > deadline) throw new Error(`${path}: no answer; ${await stuck(path)}`);
+    if (Date.now() > deadline) throw new Error(`${path}: no answer. ${await stuck(path)}`);
     await sleep(100);
   }
 }
 
-/** What Restate holds of the invocations of `path`'s target that did not complete: for a request that got no answer. */
-async function stuck(path: string): Promise<string> {
-  const [service, key, handler] = path.split('/');
+/** The rows of `sql` over the admin API's tables, or null while the server does not answer. */
+async function query<T>(sql: string): Promise<T[] | null> {
   const r = await fetch(`${ADMIN}/query`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({
-      query: `SELECT id, status, retry_count, next_retry_at, last_failure, last_attempt_deployment_id FROM sys_invocation WHERE target_service_name = '${service}' AND target_service_key = '${key}' AND target_handler_name = '${handler}' AND status != 'completed'`,
-    }),
+    body: JSON.stringify({ query: sql }),
   }).catch(() => null);
-  if (!r?.ok) return 'the admin API did not answer';
-  const { rows } = (await r.json()) as { rows: Record<string, unknown>[] };
-  return rows.length === 0 ? 'Restate holds no invocation of it' : `Restate holds: ${JSON.stringify(rows)}`;
+  return r?.ok ? ((await r.json()) as { rows: T[] }).rows : null;
+}
+
+/**
+ * What holds `path`'s key, for a request that got no answer: the invocations
+ * of the key that did not complete, whatever their handler (one that started
+ * holds the key, and the rest wait behind it); and, for each that started, the
+ * invocations it called that did not complete, and what holds their keys in turn.
+ */
+async function stuck(path: string): Promise<string> {
+  interface Row {
+    id: string;
+    target: string;
+    service: string;
+    key: string | null;
+    status: string;
+    retry_count: number | null;
+    last_failure: string | null;
+  }
+  const columns =
+    'id, target, target_service_name AS service, target_service_key AS key, status, retry_count, last_failure';
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  const describe = (r: Row) =>
+    `${r.id} ${r.target} ${r.status}` +
+    (r.retry_count ? `, ${r.retry_count} retries` : '') +
+    (r.last_failure ? `, last: ${r.last_failure}` : '');
+  const holds = async (service: string, key: string, indent: string) => {
+    if (seen.has(`${service}/${key}`)) return;
+    seen.add(`${service}/${key}`);
+    const rows = await query<Row>(
+      `SELECT ${columns} FROM sys_invocation WHERE target_service_name = '${service}' AND target_service_key = '${key}' AND status != 'completed' ORDER BY created_at`,
+    );
+    if (rows === null) {
+      lines.push(`${indent}${service}/${key}: the admin API did not answer`);
+      return;
+    }
+    const waiting = Map.groupBy(
+      rows.filter((r) => r.status === 'pending'),
+      (r) => r.target.split('/').at(-1)!,
+    );
+    lines.push(
+      `${indent}${service}/${key}: ` +
+        (rows.length === 0
+          ? 'no invocation that did not complete'
+          : `pending: ${[...waiting].map(([handler, rs]) => `${rs.length} ${handler}`).join(', ') || 'none'}`),
+    );
+    for (const row of rows.filter((r) => r.status !== 'pending')) await started(row, `${indent}  `);
+  };
+  const started = async (r: Row, indent: string) => {
+    lines.push(`${indent}${describe(r)}`);
+    const called = await query<Row>(
+      `SELECT ${columns} FROM sys_invocation WHERE invoked_by_id = '${r.id}' AND status != 'completed'`,
+    );
+    for (const c of called ?? []) {
+      if (c.key !== null) await holds(c.service, c.key, `${indent}  `);
+      else await started(c, `${indent}  `);
+    }
+  };
+  const [service, key] = path.split('/');
+  await holds(service!, key!, '  ');
+  return `Restate holds:\n${lines.join('\n')}`;
 }
 
 /** Run `tasks` (functions) with at most `width` at a time. */
@@ -344,16 +409,24 @@ if (
 ) {
   throw new Error(`a Restate server already listens at ${ADMIN}; stop it first`);
 }
-for (const { name, port } of [...PROCESSES, { name: 'shop proxy', port: SHOP_PROXY }]) {
+for (const { name, port } of [
+  ...PROCESSES,
+  { name: 'shop proxy', port: SHOP_PROXY },
+  { name: 'bank proxy', port: BANK_PROXY },
+]) {
   if (await listening(port))
     throw new Error(`port ${port} (${name}) is taken (by a run that was killed?): stop it first`);
 }
 let server = startServer();
-const proxy = rotate(
-  SHOP_PROXY,
-  PROCESSES.filter((p) => p.behind === SHOP_PROXY).map((p) => p.port),
-  ROTATE_MS,
-);
+const proxies = [SHOP_PROXY, BANK_PROXY].map((port) => {
+  const behind = PROCESSES.filter((p) => p.behind === port);
+  const proxy = rotate(
+    port,
+    behind.map((p) => p.port),
+    ROTATE_MS,
+  );
+  return { names: behind.map((p) => p.name), served: proxy.served, close: proxy.close };
+});
 let services = PROCESSES.map((p) => supervise(p, p.perMille));
 // The most memory each process used, sampled every few seconds.
 const rss = new Map<string, number>();
@@ -394,7 +467,11 @@ await call('Ledger/bank/init', [ACCOUNTS, OPENING]);
 let progress = 0;
 const total = ORDERS * 2 + MOVES + AGENTS.length * SESSIONS * (PROMPTS + 1);
 const step = () => {
-  if (++progress % 25 === 0) console.error(`${progress}/${total} requests answered`);
+  if (++progress % 25 !== 0) return;
+  // A soak runs as many rounds as its minutes last: `total` is one round's.
+  console.error(
+    SOAK_MS > 0 ? `${progress} requests answered (round ${rounds + 1})` : `${progress}/${total} requests answered`,
+  );
 };
 
 // The shop and the bank run in rounds: one, or as many as SOAK_MINUTES lasts.
@@ -403,21 +480,32 @@ let rounds = 0;
 const working = new AbortController(); // aborted once the work is done
 
 // Orders: each round restocks, places each order (some twice), then pays the
-// even ones (which may have expired first).
+// even ones (which may have expired first). Each send has an idempotency key
+// of its own, so that its resends (after a timeout) reach the invocation it
+// started rather than queue another on the key; a second send is a new
+// invocation, which the handler makes a no-op.
 const paid = new Map<string, string>();
 const order = (n: number) => ({ id: `o${n}`, sku: SKUS[n % SKUS.length]!, qty: 1 + (n % 3) });
 async function shopRound(round: number) {
   for (const sku of SKUS) {
-    await call(`Warehouse/${sku}/restock`, { id: `round ${round}`, qty: STOCK });
-    await call(`Warehouse/${sku}/restock`, { id: `round ${round}`, qty: STOCK }); // a resend
+    for (const send of [1, 2]) {
+      // The second, a resend.
+      await call(
+        `Warehouse/${sku}/restock`,
+        { id: `round ${round}`, qty: STOCK },
+        { 'idempotency-key': `round ${round} send ${send}` },
+      );
+    }
   }
   await pool(
     6,
     Array.from({ length: ORDERS }, (_, i) => async () => {
       const { id, sku, qty } = order(round * ORDERS + i);
-      for (let n = 0; n < (i % 4 === 0 ? 2 : 1); n++) await call(`Orders/${id}/place`, { sku, qty });
+      for (let n = 0; n < (i % 4 === 0 ? 2 : 1); n++) {
+        await call(`Orders/${id}/place`, { sku, qty }, { 'idempotency-key': `place ${n}` });
+      }
       step();
-      if (i % 2 === 0) paid.set(id, await call<string>(`Orders/${id}/pay`));
+      if (i % 2 === 0) paid.set(id, await call<string>(`Orders/${id}/pay`, undefined, { 'idempotency-key': 'pay' }));
       step();
     }),
   );
@@ -456,13 +544,8 @@ const transfer = async ({ from, ...m }: ReturnType<typeof move>) => {
 };
 /** The status of the invocation `id` as Restate has it, or undefined once it is gone. */
 const invocationStatus = async (id: string) => {
-  const r = await fetch(`${ADMIN}/query`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ query: `SELECT status FROM sys_invocation WHERE id = '${id}'` }),
-  }).catch(() => null);
-  if (!r?.ok) return null; // the server is away
-  return ((await r.json()) as { rows: { status: string }[] }).rows[0]?.status;
+  const rows = await query<{ status: string }>(`SELECT status FROM sys_invocation WHERE id = '${id}'`);
+  return rows === null ? null : rows[0]?.status; // null: the server is away
 };
 // What state the cancellations found their transfers in: only one `running`
 // can interrupt a handler; the rest are of the inbox, or too late.
@@ -724,14 +807,10 @@ console.error(`bank: ${[...bankCounts].map(([a, n]) => `${n.length} ${a}`).join(
 // reserve and one ledger transfer per order and prompt, though attempts of
 // Orders/place and Agent/chat ran many times.
 const invocations = async (service: string, handler: string): Promise<number> => {
-  const response = await fetch(`${ADMIN}/query`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({
-      query: `SELECT count(*) AS n FROM sys_invocation WHERE target_service_name = '${service}' AND target_handler_name = '${handler}'`,
-    }),
-  });
-  const { rows } = (await response.json()) as { rows: { n: number }[] };
+  const rows = await query<{ n: number }>(
+    `SELECT count(*) AS n FROM sys_invocation WHERE target_service_name = '${service}' AND target_handler_name = '${handler}'`,
+  );
+  assert.ok(rows, 'the admin API answers');
   return rows[0]!.n;
 };
 assert.equal(await invocations('Warehouse', 'reserve'), rounds * ORDERS, 'reserve invocations');
@@ -740,9 +819,11 @@ assert.equal(await invocations('Ledger', 'transfer'), AGENTS.length * SESSIONS *
 console.error(`rounds: ${rounds}; orders: ${JSON.stringify(counts)}`);
 console.error(`views read: ${JSON.stringify(viewReads)}`);
 console.error(`cancellations found their transfer: ${JSON.stringify(cancelledWhile)}`);
-console.error(`shop processes served ${proxy.served.join(' and ')} connections`);
+for (const { names, served } of proxies)
+  console.error(`${names.join(' and ')} served ${served.join(' and ')} connections`);
 console.error(`memory, most (MiB): ${memory()}`);
-proxy.served.forEach((n, i) => assert.ok(n > 1, `shop process ${i} took ${n} connections`));
+for (const { names, served } of proxies)
+  served.forEach((n, i) => assert.ok(n > 1, `${names[i]} took ${n} connections`));
 if (SOAK_MS > 0) {
   for (const [name, mb] of rss) assert.ok(mb < SOAK_RSS_MB, `${name} used ${Math.round(mb)} MiB`);
 }
@@ -751,7 +832,7 @@ PROCESSES.forEach((p, i) => console.error(`${p.name} process started ${starts[i]
 PROCESSES.forEach((p, i) => assert.ok(p.perMille === 0 || (starts[i] ?? 0) > 1, `no abort happened in ${p.name}`));
 
 await Promise.all(services.map((s) => s.stop()));
-proxy.close();
+proxies.forEach((p) => p.close());
 server.kill('SIGKILL');
 rmSync(dir, { recursive: true, force: true });
 console.error('ok');
