@@ -11,9 +11,13 @@ server, are in its `test/` directory (`pnpm test` at the root runs them all).
   of one account per key), through crashes: the services abort at random, the
   server is killed twice, transfers are cancelled, and views are read all
   along (`pnpm --filter e2e crash`). The shop's services run in two processes
-  behind one deployment, one with a small page cache, and take turns. Every
-  random choice comes from a seed it prints (`ABORT_SEED`), and
-  `SOAK_MINUTES=n` makes it a soak that also checks memory. The agents'
+  behind one deployment, one with a small page cache, and take turns; the
+  bank's, in two more behind another. Every random choice comes from a seed it
+  prints (`ABORT_SEED`), and `SOAK_MINUTES=n` makes it a soak that also checks
+  memory, where a process aborts at random only once it has run
+  `SOAK_MIN_LIFE_MS` (default 2000). A request that gets no answer fails with
+  what holds its key: the invocation that started, those queued behind it,
+  and what the one that started waits for. The agents'
   models are the scripted ones of
   [`@restatedev/agents/test/fakes`](../agents/test/fakes/fakes.ts).
   [`serve.ts`](serve.ts) serves them all, or some (`node serve.ts ledger shop`).

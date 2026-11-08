@@ -52,6 +52,14 @@ What the new tests found out:
 - **A damaged or deleted cache file never made a read wrong.**
 - `crash.ts` takes about 4 minutes (3 before): the proxy cuts connections every
   3 seconds, and the bank, the views and a second shop process add work.
+- **The soak livelocked its own shop**, every night: a process aborts at
+  its share of every invocation's requests, so over 100 accounts the bank's
+  retries killed the shop processes about 3 times a second (median life
+  332 ms), and a write of `Warehouse/plum`, which every plum order goes
+  through, took up to 250 attempts. An order queued behind it waited out the
+  client's 300 s. The bank now runs in processes of its own, a soak's
+  processes live at least 2 s before a random abort (`ABORT_AFTER_MS`), and
+  a request that gets no answer names what holds its key.
 
 ## What is covered
 
