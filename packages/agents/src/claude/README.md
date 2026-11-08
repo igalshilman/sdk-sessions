@@ -4,7 +4,8 @@ The Anthropic SDK's tool runner (`client.beta.messages.toolRunner` in
 [`@anthropic-ai/sdk`](https://github.com/anthropics/anthropic-sdk-typescript))
 is a light agent harness: the tool-calling loop, in the process, with nothing
 stored. It keeps the conversation in its params, so an agent built on it is
-durable when the conversation is: here it is in the agent's SQL database
+durable when the conversation is: here it is the agent's conversation of
+turns, in its SQL database
 ([SQL in Restate virtual objects](../../../sessions/README.md)).
 
 It is lighter than the Claude Agent SDK, which runs Claude Code as a
@@ -42,23 +43,28 @@ often the handler runs; each prompt of an invocation is a prompt of its own.
 
 ## Through crashes
 
-The conversation ([`conversation.ts`](conversation.ts)) is the messages in
-the object's database, in order, each with the invocation it belongs to, and
-the answer to each. The handler is not replayed: a retried attempt runs it
-again from the start, with the stored messages.
+The conversation is the object's conversation of turns
+([docs/conversation.md](../../docs/conversation.md)), whose items are the
+SDK's messages. The runner starts from what the model sees of it: the
+earlier turns as their prompt and answer (as many as `budget` holds, the
+earliest summarized), the latest `window` turns whole. The handler is not
+replayed: a retried attempt runs it again from the start, from what is
+stored.
 
 - **Each reply is stored before its tools run, and their results before the
   next request.** So a crash during the tools resumes them with the same tool
-  call ids, without asking the model again.
+  call ids, without asking the model again; and a stored final reply is the
+  answer, without asking the model for it again.
 - **A tool is idempotent by its tool call id** (`callId` of `tool()`'s
   `run`, or `callId(context)` for the SDK's tools), which it passes on, such
   as in an idempotency key.
 - **A tool's error fails the attempt**, and Restate retries it; a
-  `restate.TerminalError` of a `@restatedev/agents` tool is its answer to the
-  model.
-- **A message is answered once per invocation**: its answer is stored with
-  the model's last reply, and a retried attempt returns it. A message that a
-  crash interrupted is finished before the next one starts.
+  `restate.TerminalError` of a `@restatedev/agents` tool, and the SDK's
+  `ToolError`, are its answer to the model.
+- **A message is answered once per invocation** (`answerOnce`). A turn that
+  a killed invocation left is closed (`ended`), never finished: by the next
+  message, or by the agent's `settle` once its companion finds the
+  invocation gone.
 
 ## Run
 

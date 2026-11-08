@@ -1,5 +1,8 @@
 // DeepSeek Harness agents in Restate virtual objects: the session (the
-// harness's event log) is in the object's database (persistence.ts).
+// harness's event log) is in the object's database (persistence.ts), and
+// each of its flushes copies the turn's new messages into the conversation of
+// turns (../conversation.ts) in the same transaction: the harness keeps its
+// own history, and the conversation is what clients read, and how turns end.
 //
 //   const assistant = deepseek.agent({ name: 'assistant', tools: [weather] });
 //
@@ -28,13 +31,12 @@
 //   invocation id, and a retried attempt returns the answer of the turn that
 //   finished it.
 import * as restate from '@restatedev/sessions';
-import type { Database } from '@restatedev/sessions';
 import { Context } from '@deepseek-ai/cordis';
 import { AgentRegistry } from '@deepseek-ai/dsh-agent';
 import { AgentLoop } from '@deepseek-ai/dsh-agent-loop';
 import * as deepseek from '@deepseek-ai/dsh-llm-deepseek-api-key';
 import * as piAi from '@deepseek-ai/dsh-llm-pi-ai';
-import { LlmRuntime, MessageId, freezeMessage, type Message, type UserMessage } from '@deepseek-ai/dsh-llm';
+import { LlmRuntime, MessageId, ToolCallId, freezeMessage, type Message, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session';
 import * as checkpoints from '@deepseek-ai/dsh-session-checkpoint-policy';
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection';
@@ -51,31 +53,26 @@ import {
 } from '@deepseek-ai/dsh-tools';
 import {
   aborted,
-  CANCELLED,
   chatHandler,
   checkModelName,
   type Configure,
   configured,
   fromTool,
-  messagesHandler,
   ModelError,
   modelOf,
-  nextPromptId,
   providerOf,
-  refusal,
+  RETURNED_UNRECORDED,
   stopSignalOf,
-  storedAnswer,
   toolCallEnded,
   toolCallStarted,
-  transcribing,
-  Transcript,
-  UNANSWERED,
 } from '../common.ts';
-import { type Answer, withOutput } from '../output.ts';
+import { answerOnce, type Items, type Parsed, type Run, type Turn } from '../conversation.ts';
+import { conversationView } from '../messages.ts';
+import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
 import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
 import type { z } from 'zod';
-import { SqlSessionPersistence, storedEvents } from './persistence.ts';
+import { SqlSessionPersistence } from './persistence.ts';
 
 export { SqlSessionPersistence };
 
@@ -150,37 +147,34 @@ const promptId = (id: string) => MessageId(`prompt:${id}`);
 const textOf = (message: Message) => message.content.flatMap((c) => (c.type === 'text' ? [c.text] : [])).join('');
 
 /**
- * The answer to prompt `id` in the session log: the last reply of the first
- * turn completed after it, {@link CANCELLED} if a cancellation aborted its
- * turn, or {@link UNANSWERED} if the model's provider refused it for good;
- * undefined while it is absent or unfinished (a crash's interrupted turn, or
- * one that failed otherwise, is continued).
+ * How the harness's turn of prompt `id` ended in the session log: the last
+ * reply of its first harness turn that completed (`answer`), or a failure
+ * (`error`); none while it is absent (`asked: false`) or was interrupted (a
+ * crash), when it is continued.
  */
-function answerOf(events: readonly SessionEvent[], id: MessageId): string | undefined {
+function endOf(events: readonly SessionEvent[], id: MessageId) {
   const at = events.findIndex((e) => e.type === 'user/message' && e.data.id === id);
-  if (at < 0) return undefined;
+  if (at < 0) return { asked: false as const };
   let answer: string | undefined;
+  let error: unknown;
   for (const e of events.slice(at)) {
     if (e.type === 'assistant/message') answer = textOf(e.data.message);
     if (e.type !== 'turn/end') continue;
     const { reason } = e.data;
-    if (reason.kind === 'completed') return answer ?? '';
-    if (reason.kind === 'aborted' && reason.reason.kind === 'user') return CANCELLED;
-    if (reason.kind === 'error' && refusal(turnError(reason.error))) return UNANSWERED;
+    if (reason.kind === 'completed') return { asked: true as const, answer: answer ?? '' };
+    // A failed harness turn, continued after (by a retry), or the last.
+    error = reason.kind === 'error' ? reason.error : undefined;
   }
-  return undefined;
+  return { asked: true as const, error };
 }
 
-/** The error a turn failed with, as the attempt fails with it (see {@link throwIfTurnFailed}). */
-const turnError = (error: unknown) => new Error(`the agent's turn failed: ${JSON.stringify(error)}`);
-
-/** The last prompt in the session log, by id. */
-function lastPrompt(events: readonly SessionEvent[]): MessageId | undefined {
-  const prompt = events.findLast(
-    (e): e is SessionEvent<'user/message'> => e.type === 'user/message' && e.data.id.startsWith('prompt:'),
-  );
-  return prompt?.data.id;
-}
+/** The error a harness turn failed with: terminal for an overflow of the model's context, which a retry meets again. */
+const turnError = (error: unknown) => {
+  const message = `the agent's turn failed: ${JSON.stringify(error)}`;
+  return /context.?length|context_length_exceeded|context window|maximum context/i.test(message)
+    ? new restate.TerminalError(message)
+    : new Error(message);
+};
 
 const message = (id: string, text: string): UserMessage =>
   freezeMessage({ id: MessageId(id), role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } });
@@ -273,91 +267,166 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   output?: O;
 }
 
-/** {@link prompt}, answering with the agent's text. */
-const promptText = (ctx: restate.SessionContext, text: string, options: Options): Promise<string> =>
-  transcribing(
-    ctx,
-    () => transcribe(ctx.db, ctx.key),
-    () => answerOnce(ctx, text, options),
-  );
+/**
+ * DeepSeek's items, as the conversation of turns keeps them: the harness's
+ * messages. A user's text is said by the user; an assistant's by the
+ * assistant, with its tool calls; a tool message is a result.
+ */
+export const items: Items<Message> = {
+  dump: (m) => JSON.stringify(m),
+  load: (stored) => freezeMessage(JSON.parse(stored) as Message),
+  prompt: (text) => message('prompt', text),
+  reply: (text) =>
+    freezeMessage({
+      id: MessageId('reply'),
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      source: { kind: 'model', provider: 'restate', model: 'note' },
+    }),
+  results: (results) =>
+    results.map(([call, output]) =>
+      freezeMessage({
+        id: MessageId(`result:${call.id}`),
+        role: 'tool',
+        toolCallId: ToolCallId(call.id),
+        content: [{ type: 'text', text: output }],
+        source: { kind: 'tool', callId: ToolCallId(call.id) },
+        isError: output !== RETURNED_UNRECORDED,
+      }),
+    ),
+  read: (m): Parsed => {
+    if (m.role === 'user') return { said: ['user', textOf(m)] };
+    if (m.role === 'assistant') {
+      const calls = m.content.flatMap((c) =>
+        c.type === 'tool-call' ? [{ id: c.id, name: c.name, input: parsedJson(c.arguments) }] : [],
+      );
+      // Each reply is a message of its own, its tool calls' too.
+      return { said: ['assistant', textOf(m)], calls };
+    }
+    if (m.role === 'tool') return { results: [{ id: m.toolCallId, output: textOf(m), error: m.isError === true }] };
+    return {};
+  },
+};
 
 /** An agent of the harness, on a session. */
 type Agent = Awaited<ReturnType<Context['agents']['create']>>['agent'];
 
-const answerOnce = async (
-  ctx: restate.SessionContext,
-  text: string,
-  { model: named, system, tools = [] }: Options,
-): Promise<string> => {
-  const id = nextPromptId(ctx);
-  const route = routeOf(modelOf(named, DEEPSEEK_MODEL));
-  const harness = await boot(ctx.db, route, system);
-  // A tool's error fails the attempt, which Restate retries: the harness
-  // stores nothing more, so the retry finds the tool's call without a result.
-  // The turn's stop fails it too: a cancellation (below), or an attempt that
-  // ended first.
-  const { promise: failed, reject: fail } = Promise.withResolvers<never>();
-  failed.catch(() => {});
-  const turn = stopSignalOf(ctx);
-  const onStop = () => fail(turn!.reason);
-  turn?.addEventListener('abort', onStop, { once: true });
-  let agent: Agent | undefined;
-  try {
-    const sessionId = SessionId(ctx.key);
-    const options = {
-      agentOptions: route,
-      setup: (agentCtx: Context) => {
-        for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail));
-      },
+/**
+ * The harness's message of `turn`'s prompt: its text, after how the turn
+ * before it ended if its run did not answer it (stopped, refused, failed,
+ * or ended once its invocation was gone), which the harness's log does not
+ * say.
+ */
+function promptOf(turn: Turn<Message>, before: { status?: string; answer?: string } | undefined) {
+  const text = textOf(turn.prompt.item);
+  const note = before && before.status !== 'answered' && before.answer ? `(${before.answer})\n\n` : '';
+  return message(promptId(turn.id), note + text);
+}
+
+/**
+ * Copy the events of `batch` that are `turn`'s (after its latest ask, at seq
+ * `from()` of the log) into it, in `tx`: the model's replies, and the
+ * tools' results. Not the requests to continue (a step of the run's own),
+ * nor anything once the run stopped or `failed()` (the harness's result of a
+ * tool that failed the attempt, or was cancelled, is not the call's): the
+ * turn's close, or the retry, says how it ended.
+ */
+const copying =
+  (ctx: restate.SessionContext, turn: Turn<Message>, from: () => number | undefined, failed: () => boolean) =>
+  async (tx: Parameters<NonNullable<SqlSessionPersistence['copy']>>[0], batch: readonly SessionEvent[]) => {
+    const start = from();
+    if (start === undefined || failed() || stopSignalOf(ctx)?.aborted || !turn.writable) return;
+    const copied = batch.flatMap((e): { item: Message; reply?: boolean }[] => {
+      if (e.seq <= start) return [];
+      if (e.type === 'assistant/message') return [{ item: e.data.message, reply: true }];
+      if (e.type === 'tool/result') return [{ item: e.data.message }];
+      return [];
+    });
+    if (copied.length > 0) await turn.copyIn(tx, copied);
+  };
+
+/**
+ * The run of the harness of `options`, on the conversation: its turn's
+ * latest ask (its prompt, or the message that asked again) asked once, and
+ * continued after a crash.
+ */
+const runOf =
+  (ctx: restate.SessionContext, { model: named, system, tools = [] }: Options): Run<Message> =>
+  async (conversation) => {
+    const turn = conversation.turn;
+    const route = routeOf(modelOf(named, DEEPSEEK_MODEL));
+    const harness = await boot(ctx.db, route, system);
+    const persistence = harness.sessionPersistence as SqlSessionPersistence;
+    // A tool's error fails the attempt, which Restate retries: the harness
+    // stores nothing more, so the retry finds the tool's call without a result.
+    // The turn's stop fails it too: a cancellation, or an attempt that ended first.
+    const { promise: failed, reject } = Promise.withResolvers<never>();
+    failed.catch(() => {});
+    let broken = false;
+    const fail = (error: unknown) => {
+      broken = true;
+      reject(error);
     };
-    // Resuming closes a turn a crash left open.
-    const started = (await harness.sessionPersistence.stat(sessionId))
-      ? await harness.agents.resume({ resumeSessionId: sessionId, ...options })
-      : await harness.agents.create({ sessionId, ...options });
-    agent = started.agent;
-    const answer = await answered(harness, agent, id, text, failed);
-    return answer;
-  } catch (e) {
-    // A cancelled invocation cancels the agent's turn, which the log keeps.
-    if (e instanceof restate.CancelledError && agent) await cancelTurn(harness, agent);
-    else (harness.sessionPersistence as SqlSessionPersistence).abandon();
-    throw e;
-  } finally {
-    turn?.removeEventListener('abort', onStop);
-    await harness.fiber.dispose();
-  }
-};
-
-/**
- * The answer of prompt `id`, `text`, asked once: a prompt left unfinished
- * (this one's, after a crash) is finished first, then this one starts.
- */
-async function answered(harness: Context, agent: Agent, id: string, text: string, failed: Promise<never>) {
-  // The log as this attempt found it: a turn that failed before is continued like an interrupted one.
-  const found = agent.session.snapshotEvents().length;
-  for (;;) {
-    const events = agent.session.snapshotEvents();
-    // First: a prompt refused in this attempt fails it, rather than answer.
-    throwIfTurnFailed(events.slice(found));
-    const answer = answerOf(events, promptId(id));
-    if (answer !== undefined) return storedAnswer(answer);
-    const last = lastPrompt(events);
-    const unfinished = last !== undefined && answerOf(events, last) === undefined;
-    agent.followup(unfinished ? message(`continue:${events.length}`, CONTINUE) : message(promptId(id), text));
-    await Promise.race([agent.whenIdle(), failed]);
-    await harness.sessions.flush(agent.session);
-  }
-}
-
-/**
- * Fail the attempt if a turn of `events` (this attempt's) failed: its model
- * request, or a checkpoint. Its end may be stored already, so only this
- * attempt's turns count: the retry asks the model again.
- */
-function throwIfTurnFailed(events: readonly SessionEvent[]) {
-  const end = events.findLast((e): e is SessionEvent<'turn/end'> => e.type === 'turn/end')?.data.reason;
-  if (end?.kind === 'error') throw turnError(end.error);
-}
+    const stop = stopSignalOf(ctx);
+    const onStop = () => fail(stop!.reason);
+    stop?.addEventListener('abort', onStop, { once: true });
+    let agent: Agent | undefined;
+    // The turn asked again (its output's check, say): the harness is asked that, and answers it.
+    const asked = turn.latestAsk();
+    const again = asked !== turn.prompt;
+    const id = again ? MessageId(`prompt:${turn.id}:again`) : promptId(turn.id);
+    // Where the turn's latest ask is in the log, once it is.
+    let from: number | undefined;
+    try {
+      const sessionId = SessionId(ctx.key);
+      const options = {
+        agentOptions: route,
+        setup: (agentCtx: Context) => {
+          for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail));
+        },
+      };
+      // Resuming closes a harness turn a crash, or a killed invocation, left open.
+      const started = (await persistence.stat(sessionId))
+        ? await harness.agents.resume({ resumeSessionId: sessionId, ...options })
+        : await harness.agents.create({ sessionId, ...options });
+      agent = started.agent;
+      const found = agent.session.snapshotEvents().length;
+      from = agent.session.snapshotEvents().find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
+      persistence.copy = async (tx, batch) => {
+        from ??= batch.find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
+        await copying(
+          ctx,
+          turn,
+          () => from,
+          () => broken,
+        )(tx, batch);
+      };
+      // The turn before this one, as the conversation has it.
+      const before = conversation.transcript.at(-2);
+      for (;;) {
+        const events = agent.session.snapshotEvents();
+        const end = endOf(events, id);
+        // A turn of this attempt's that failed fails it (a refusal ends the turn); the retry asks the model again.
+        if ('error' in end && end.error !== undefined) {
+          const failedHere = events.slice(found).some((e) => e.type === 'turn/end' && e.data.reason.kind === 'error');
+          if (failedHere) throw turnError(end.error);
+        }
+        if ('answer' in end && end.answer !== undefined) return end.answer;
+        const ask = again ? message(id, textOf(asked.item)) : promptOf(turn, before);
+        agent.followup(end.asked ? message(`continue:${events.length}`, CONTINUE) : ask);
+        await Promise.race([agent.whenIdle(), failed]);
+        await harness.sessions.flush(agent.session);
+      }
+    } catch (e) {
+      // A cancelled invocation cancels the agent's turn, which the log keeps.
+      if (e instanceof restate.CancelledError && agent) await cancelTurn(harness, agent);
+      else persistence.abandon();
+      throw e;
+    } finally {
+      stop?.removeEventListener('abort', onStop);
+      await harness.fiber.dispose();
+    }
+  };
 
 /** Cancel `agent`'s turn, and store it cancelled. */
 async function cancelTurn(harness: Context, agent: Agent) {
@@ -400,7 +469,10 @@ export const prompt = <O extends z.ZodObject | undefined = undefined>(
   ctx: restate.SessionContext,
   text: string,
   options: Options<O> = {},
-): Promise<Answer<O>> => withOutput(text, options, (t, o) => promptText(ctx, t, o)) as Promise<Answer<O>>;
+): Promise<Answer<O>> =>
+  withChecked(text, options, (t, o, check) => answerOnce(ctx, t, items, runOf(ctx, o), { check })) as Promise<
+    Answer<O>
+  >;
 
 /**
  * A chat handler: each message an invocation, the session in the object's
@@ -417,7 +489,7 @@ export const chat = <O extends z.ZodObject | undefined = undefined>(options: Con
 };
 
 /** `json` parsed, or as it is if it is not JSON. */
-const parsed = (json: string): unknown => {
+const parsedJson = (json: string): unknown => {
   try {
     return JSON.parse(json);
   } catch {
@@ -426,25 +498,11 @@ const parsed = (json: string): unknown => {
 };
 
 /**
- * A handler of the conversation as clients read it: a page at a time, or
- * what is new or changed since a cursor, from the log each change writes
- * (log.ts). It answers while a message is answered.
+ * A view of the conversation as clients read it: a page at a time, or what
+ * is new or changed since a cursor; `view: 'summary'` for each turn's
+ * message and answer. It answers while a message is answered.
  */
-export const messages = () => messagesHandler();
-
-/** The session `key` in `db`, from its log, as `messages` gives it. */
-const transcribe = async (db: Database, key: string) => {
-  const transcript = new Transcript();
-  for (const e of await storedEvents(db, SessionId(key))) {
-    // The prompts, not the requests to continue an interrupted turn.
-    if (e.type === 'user/message' && e.data.id.startsWith('prompt:')) transcript.say('user', textOf(e.data));
-    if (e.type === 'assistant/message') transcript.say('assistant', textOf(e.data.message));
-    if (e.type === 'tool/call') transcript.call(e.data.callId, e.data.name, parsed(e.data.arguments));
-    if (e.type === 'tool/result')
-      transcript.result(e.data.message.toolCallId, textOf(e.data.message), e.data.message.isError);
-  }
-  return transcript;
-};
+export const messages = () => conversationView(items);
 
 /** An agent: a virtual object `name`, one per key, whose `chat` handler is {@link chat}, and `messages` {@link messages}. */
 export const agent = <P extends string, O extends z.ZodObject | undefined = undefined>({
@@ -452,6 +510,8 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
   description,
   schema,
   background,
+  window,
+  budget,
   ...options
 }: Options<O> & Definition<P>) =>
   sessionObject({
@@ -459,6 +519,8 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
     description,
     schema,
     background,
+    window,
+    budget,
     handlers: { chat: chat(options) },
     views: { messages: messages() },
   });

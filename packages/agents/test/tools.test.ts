@@ -6,8 +6,22 @@ import { type AttemptContext, contextOf, invoke } from '@restatedev/sessions/int
 import { fakeContext, type Made, memoryDatabase } from '@restatedev/sessions/test/support';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { settle } from '../src/calls.ts';
-import { alsoClearing, messagesHandler, Transcript } from '../src/common.ts';
+import { settleCalls as settle } from '../src/calls.ts';
+import { alsoClearing } from '../src/common.ts';
+import { Conversation, type Entry } from '../src/conversation.ts';
+import { conversationView } from '../src/messages.ts';
+import { calling, type Item, ITEMS } from './fakes/items.ts';
+
+/** Whether a turn that called `call_1` and stored `output` (an error if `error`) as its result has the call's result. */
+function storedAs(output: string, error = false) {
+  const entries: Entry<Item>[] = [
+    { n: 0, item: { role: 'user', text: 'go' }, prompt: 'p0' },
+    { n: 1, item: calling('call_1') },
+    { n: 2, item: error ? { result: 'call_1', output: `Error: ${output}` } : { result: 'call_1', output } },
+  ];
+  const turn = new Conversation(undefined as unknown as restate.Database, ITEMS, entries).turn;
+  return (id: string, failed?: string) => turn.stored(id, failed);
+}
 
 const orders = restate.service({ name: 'orders', handlers: { status: async (_ctx, _order: string) => 'shipped' } });
 const carts = restate.object({
@@ -200,12 +214,9 @@ describe("Restate's tools", () => {
     const state = new Map<string, Uint8Array>();
     const first = context(state);
     await t.run({ order: '103' }, { ctx: first.ctx, callId: 'call_1' });
-    // Resumed, OpenCode gives the call an error, which is not its result: the model makes it again.
+    // Resumed, the DeepSeek Harness gives the call an error, which is not its result: the model makes it again.
     const next = context(state);
-    const transcript = new Transcript();
-    transcript.call('call_1', 'status', { order: '103' });
-    transcript.result('call_1', 'Tool execution was interrupted', true);
-    await settle(next.ctx, (id, failed) => transcript.answered(id, failed));
+    await settle(next.ctx, storedAs('Tool execution was interrupted', true));
     await t.run({ order: '103' }, { ctx: next.ctx, callId: 'call_2' });
     expect(next.made.map((m) => m.idempotencyKey)).toEqual(['inv1:call_1']);
   });
@@ -223,10 +234,7 @@ describe("Restate's tools", () => {
     // The framework stored that error as the call's result; the attempt then
     // ended (a suspension), and the model, resumed, tries again.
     const next = context(state);
-    const transcript = new Transcript();
-    transcript.call('call_1', 'status', { order: '103' });
-    transcript.result('call_1', failed);
-    await settle(next.ctx, (id, error) => transcript.answered(id, error));
+    await settle(next.ctx, storedAs(failed));
     await t.run({ order: '103' }, { ctx: next.ctx, callId: 'call_2' });
     expect(next.made.map((m) => m.idempotencyKey)).toEqual(['inv1:call_2']);
   });
@@ -348,7 +356,7 @@ describe('object', () => {
     const agent = sessionObject({
       name: 'keeper',
       handlers: { chat: async () => '' },
-      views: { messages: alsoClearing(messagesHandler(), async (ctx) => void cleared.push(ctx.key)) },
+      views: { messages: alsoClearing(conversationView(ITEMS), async (ctx) => void cleared.push(ctx.key)) },
     });
     await invoke(agent, 'erase', fakeContext({ map: new Map(), service: 'keeper', key: 'alice', answer: () => null }));
     expect(cleared).toEqual(['alice']);

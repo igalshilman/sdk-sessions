@@ -78,10 +78,18 @@ it, and leaves the model to decide what to do about it. So:
   without a result, as above.
 - **A failed turn fails the attempt**: a model request that failed, or a
   checkpoint that could not store the log, and Restate retries.
-- **A message is answered once per invocation**: the message carries the
-  invocation id, and a retried attempt returns the answer of the turn that
-  finished it. A message that a crash interrupted is finished before the next
-  one starts.
+- **A message is answered once per invocation** (`answerOnce`): a retried
+  attempt continues its own prompt (`CONTINUE`, a step of its turn), and
+  returns the answer once it has one. A turn a killed invocation left is
+  closed (`ended`) in the agent's conversation of turns, never continued,
+  and the harness's next turn is told how it ended.
+
+The harness keeps its own event log, and its model's input is the harness's;
+each flush of the log copies the turn's new messages (the model's replies,
+the tools' results) into the agent's conversation of turns, in the same
+transaction: what `messages` shows
+([docs/conversation.md](../../docs/conversation.md)). No compaction is
+mounted yet: the harness's input grows with the conversation.
 
 ## Run
 

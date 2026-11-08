@@ -7,6 +7,7 @@
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { AIMessage, type BaseMessage } from '@langchain/core/messages';
 import type { ChatResult } from '@langchain/core/outputs';
+import { createHash } from 'node:crypto';
 
 export class Teller extends BaseChatModel {
   override _llmType() {
@@ -27,9 +28,10 @@ export class Teller extends BaseChatModel {
     if (text === 'Who are you?') {
       return new AIMessage(messages.flatMap((m) => (m.getType() === 'system' ? [m.text] : [])).join('\n'));
     }
-    // A tool call id, unique in the conversation, and the same when a step is
-    // run again.
-    const id = `call_${messages.length}`;
+    // A tool call id, unique in the conversation (as a model's), and the same
+    // when a step is run again: of the request.
+    const asked = JSON.stringify(messages.map((m) => [m.getType(), m.text]));
+    const id = `call_${createHash('sha256').update(asked).digest('hex').slice(0, 12)}`;
     const move = /move (\d+) from (\d+) to (\d+)/i.exec(text);
     if (move) {
       const [amount, from, to] = move.slice(1).map(Number);

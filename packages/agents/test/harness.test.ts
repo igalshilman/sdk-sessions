@@ -104,16 +104,8 @@ describe('a Harness configured as it runs', () => {
     // After a reset, the model has the handoff and what comes next.
     await alice(reset, 'a4', 'Alice likes short answers');
     expect(await alice(chat, 'a5', 'Hi')).toBe('gpt (You are a helpful assistant.): Alice likes short answers / Hi');
-    // The UI still has all of it.
+    // The UI has each turn, as it was asked and answered: not pi's summary, nor its handoff.
     const { messages } = await alice(pi.messages(), 'read', {});
-    expect(messages.map((m) => m.role)).toEqual([
-      'user',
-      'assistant',
-      'user',
-      'assistant',
-      'user',
-      'user',
-      'assistant',
-    ]);
+    expect(messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant', 'user', 'assistant']);
   });
 });

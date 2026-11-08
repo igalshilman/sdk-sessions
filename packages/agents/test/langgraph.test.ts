@@ -3,9 +3,9 @@
 // way out of a crashed attempt. `pnpm --filter @restatedev/agents test langgraph`. Its model is the teller (../fakes/langgraph.ts).
 import { describe, expect, it, vi } from 'vitest';
 import * as restate from '@restatedev/restate-sdk';
-import type { ViewContext } from '@restatedev/sessions';
 import { CANCELLED, REFUSED, UNANSWERED } from '@restatedev/agents';
-import { AttemptEnded } from '../src/common.ts';
+import { AIMessage } from '@langchain/core/messages';
+import { AttemptEnded, ENDED } from '../src/common.ts';
 import {
   afterCancel,
   cancelledTransfer,
@@ -16,16 +16,12 @@ import {
   withoutIds,
   conversation,
   crashedAnywhere,
-  SAID,
+  SAID_IN_TURNS as SAID,
 } from './support.ts';
 import { Teller } from './fakes/langgraph.ts';
 import * as langgraph from '@restatedev/agents/langgraph';
 import { prompt } from './langgraph.ts';
 import { bank } from './bank.ts';
-
-/** The rows of `table` in an object's database. */
-const count = (table: string) => async (ctx: ViewContext) =>
-  Number((await ctx.db.values(`SELECT COUNT(*) FROM ${table}`))[0]![0]);
 
 describe('the LangGraph agent', () => {
   it('answers arguments that do not fit a tool with what is wrong, for the model to fix', async () => {
@@ -74,7 +70,7 @@ describe('the LangGraph agent', () => {
         { type: 'text', text: 'On it.' },
         {
           type: 'tool',
-          id: 'call_1',
+          id: expect.stringMatching(/^call_/),
           name: 'transfer',
           input: { from: 1, to: 2, amount: 5 },
           output: CANCELLED,
@@ -104,16 +100,15 @@ describe('the LangGraph agent', () => {
     expect(await c.read(langgraph.messages())).toEqual({ messages: SAID, more: false, cursor: expect.any(Number) });
   });
 
-  it('keeps the latest checkpoint only, and the values it has', async () => {
+  it('keeps no checkpoint: the conversation of turns is its state', async () => {
     const c = conversation(prompt, 'latest');
     await c.attempt('inv1', 'Please move 5 from 1 to 2');
     await c.attempt('inv2', 'audit the books');
-    expect(await c.read(count('restate_langgraph_checkpoints'))).toBe(1);
+    const tables = await c.read(async (ctx) =>
+      (await ctx.db.values("SELECT name FROM sqlite_schema WHERE type = 'table'")).map(([name]) => String(name)),
+    );
+    expect(tables.filter((t) => t.startsWith('restate_langgraph'))).toEqual([]);
     expect(await c.read(langgraph.messages())).toMatchObject({ messages: SAID });
-    // One value per channel (the messages, the prompt, the answers...), however long the conversation.
-    const values = await c.read(count('restate_langgraph_channel_values'));
-    await c.attempt('inv3', 'Please move 5 from 1 to 2');
-    expect(await c.read(count('restate_langgraph_channel_values'))).toBe(values);
   });
 
   it('ends a prompt the provider refused, and answers the next message afresh', async () => {
@@ -136,6 +131,23 @@ describe('the LangGraph agent', () => {
     expect(messages[1]!.parts).toEqual([{ type: 'text', text: UNANSWERED }]);
   });
 
+  it('sends a reply of the model with nothing in it back as one that says so: a provider may refuse it empty', async () => {
+    // The teller, but for `Hello`, which it answers with nothing; and, as Anthropic's API, it refuses an empty message.
+    class BadRequestError extends Error {}
+    const model = new (class extends Teller {
+      override reply(...args: Parameters<Teller['reply']>) {
+        const [messages] = args;
+        if (messages.slice(0, -1).some((m) => !m.text.trim() && !(m as AIMessage).tool_calls?.length)) {
+          throw new BadRequestError('all messages must have non-empty content');
+        }
+        return messages.at(-1)!.text === 'Hello' ? new AIMessage('') : super.reply(...args);
+      }
+    })({});
+    const c = conversation(langgraph.chat({ model }), 'empty');
+    expect(await c.attempt('inv1', 'Hello')).toBe('');
+    expect(await c.attempt('inv2', 'Hello again')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
+  });
+
   it('gives the model its system prompt', async () => {
     const c = conversation(langgraph.chat({ system: 'You are Ada.' }), 'ada');
     expect(await c.attempt('inv1', 'Who are you?')).toBe('You are Ada.');
@@ -148,7 +160,7 @@ describe('the LangGraph agent', () => {
     // Its attempt retried: the same answer, no new transfer.
     expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toEqual(first);
     expect(c.ledger.calls).toHaveLength(1);
-    expect([...c.ledger.transfers.keys()]).toEqual(['GraphAgent/a/call_1']);
+    expect([...c.ledger.transfers.keys()]).toEqual([expect.stringMatching(/^GraphAgent\/a\/call_/)]);
     // The next prompt goes on in the same thread.
     const audit = await c.attempt('inv3', 'audit the books');
     expect(audit).toMatch(/^Done: .*"transfers":1/);
@@ -168,9 +180,11 @@ describe('the LangGraph agent', () => {
       reply.mockRestore();
     }
     // The same transfer id and idempotency key both times: the money moved once.
+    const id = c.ledger.calls[0]!.id.split('/').at(-1)!;
+    expect(id).toMatch(/^call_/);
     expect(c.ledger.calls).toEqual([
-      { name: 'transfer', id: 'GraphAgent/b/call_1', key: 'inv1:call_1' },
-      { name: 'transfer', id: 'GraphAgent/b/call_1', key: 'inv1:call_1' },
+      { name: 'transfer', id: `GraphAgent/b/${id}`, key: `inv1:${id}` },
+      { name: 'transfer', id: `GraphAgent/b/${id}`, key: `inv1:${id}` },
     ]);
     expect(c.ledger.transfers.size).toBe(1);
   });
@@ -184,13 +198,74 @@ describe('the LangGraph agent', () => {
     expect(c.ledger.transfers.size).toBe(1);
   });
 
-  it('finishes an interrupted prompt before starting the next one', async () => {
+  it('closes a turn its gone invocation left, by the next message: never finishes it', async () => {
     const c = conversation(prompt, 'c');
+    // Killed in its transfer: its invocation is gone, and the next message comes.
     await c.crash('inv1', 'Please move 1 from 0 to 1');
-    // Its caller gave up; the next prompt comes.
-    const second = await c.attempt('inv2', 'Please move 2 from 0 to 1');
-    expect(second).toBe('Done: moved 2 from account 0 to account 1');
-    expect(await c.attempt('inv1', 'Please move 1 from 0 to 1')).toBe('Done: moved 1 from account 0 to account 1');
+    const reply = vi.spyOn(Teller.prototype, 'reply');
+    try {
+      expect(await c.attempt('inv2', 'Please move 2 from 0 to 1')).toBe('Done: moved 2 from account 0 to account 1');
+      // The model was asked for the second message only, and saw how the first ended.
+      expect(reply).toHaveBeenCalledTimes(2);
+      expect(reply.mock.calls[0]![0].map((m) => m.text)).toContain(ENDED);
+    } finally {
+      reply.mockRestore();
+    }
     expect(c.ledger.transfers.size).toBe(2);
+    const { messages } = await c.read(langgraph.messages());
+    expect(messages[1]!.parts[1]).toMatchObject({ type: 'tool', output: ENDED, error: true });
+    expect(messages[2]!.parts).toEqual([{ type: 'text', text: ENDED }]);
+    await expect(c.attempt('inv1', 'Please move 1 from 0 to 1')).rejects.toThrow(ENDED);
+  });
+
+  it('answers a stored final reply without asking the model again', async () => {
+    let stored = 0;
+    for (let at = 1; ; at++) {
+      const c = conversation(prompt, `final-${at}`);
+      const reply = vi.spyOn(Teller.prototype, 'reply');
+      try {
+        if ((await c.attempt('inv1', 'Hello', at)) !== 'crashed') break;
+        const replied = (await c.read(langgraph.messages())).messages.length > 1;
+        const asked = reply.mock.calls.length;
+        expect(await c.attempt('inv1', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
+        if (replied) stored++;
+        expect(reply.mock.calls.length - asked).toBe(replied ? 0 : 1);
+      } finally {
+        reply.mockRestore();
+      }
+    }
+    expect(stored).toBeGreaterThan(0);
+  });
+
+  it('closes a turn that failed for good, and answers the next message', async () => {
+    let failing = true;
+    const model = new (class extends Teller {
+      override reply(...args: Parameters<Teller['reply']>) {
+        if (failing) throw new restate.TerminalError('the model is gone for good');
+        return super.reply(...args);
+      }
+    })({});
+    const c = conversation(langgraph.chat({ model, tools: bank('GraphAgent') }), 'terminal');
+    await expect(c.attempt('inv1', 'Please move 5 from 1 to 2')).rejects.toThrow('gone for good');
+    failing = false;
+    expect(await c.attempt('inv2', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
+    const { messages } = await c.read(langgraph.messages());
+    expect(messages[1]!.parts).toEqual([{ type: 'text', text: 'Error: the model is gone for good' }]);
+  });
+
+  it('ends a turn that runs past its recursion limit, for good', async () => {
+    // A model that calls a tool forever.
+    const model = new (class extends Teller {
+      override reply(messages: Parameters<Teller['reply']>[0]) {
+        return new AIMessage({ content: '', tool_calls: [{ id: `loop_${messages.length}`, name: 'audit', args: {} }] });
+      }
+    })({});
+    const c = conversation(langgraph.chat({ model, tools: bank('GraphAgent'), recursionLimit: 20 }), 'loop');
+    const failed = await c.attempt('inv1', 'audit forever').catch((error: unknown) => error);
+    expect(failed).toBeInstanceOf(restate.TerminalError);
+    expect(String(failed)).toMatch(/Recursion limit/i);
+    // The turn is closed with the error, for the next message to start afresh.
+    const { messages } = await c.read(langgraph.messages());
+    expect(messages.at(-1)!.parts).toEqual([{ type: 'text', text: expect.stringMatching(/^Error: Recursion limit/) }]);
   });
 });

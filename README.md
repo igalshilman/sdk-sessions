@@ -9,7 +9,7 @@ TypeScript SDK:
   separate database to run.
 - **[`@restatedev/agents`](packages/agents/README.md)** runs AI agents inside
   sessions, with each conversation stored in its session's database. It
-  supports pi, OpenCode, LangGraph, Claude and the DeepSeek Harness.
+  supports pi, LangGraph, Claude and the DeepSeek Harness.
 
 If you are new to this, start with [the tutorial](packages/template/README.md).
 It builds a wallet one idea per file, from a plain virtual object up to an
@@ -208,8 +208,7 @@ docker run --rm -p 8080:8080 -p 9070:9070 --add-host=host.docker.internal:host-g
 
 ## Build and test
 
-You need Node 24 or later (the code is TypeScript that Node runs directly,
-and OpenCode requires 24), pnpm, and Rust for the addon.
+You need Node 24 or later (the code is TypeScript that Node runs directly), pnpm, and Rust for the addon.
 
 ```sh
 pnpm install

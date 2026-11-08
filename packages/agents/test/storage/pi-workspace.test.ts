@@ -26,7 +26,7 @@ describe('withPi', () => {
       const attempt = sqlAttempt({ map: new Map(), id: 'inv' });
       const { answer, agent } = await attempt.end(() =>
         withPi(attempt.ctx, { models, model: 'scribe/scribe', workspace }, async (pi) => ({
-          answer: await pi.prompt('take a note', 'p1'),
+          answer: await pi.prompt('take a note'),
           agent: await (await pi.harness.root(pi.context)).agent(pi.context),
         })),
       );

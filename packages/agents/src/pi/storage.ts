@@ -41,9 +41,14 @@ class Executor implements SqliteExecutor {
   }
 }
 
+/** What runs at the end of each pi commit, in its transaction: the copy of its entries (index.ts). */
+export type OnCommit = (tx: DatabaseWriter) => Promise<void>;
+
 /** The `SqliteDatabase` facade over the session `db`. */
-class SqlKvDatabase extends Executor implements SqliteDatabase {
+export class SqlKvDatabase extends Executor implements SqliteDatabase {
   readonly #session: Database;
+  /** Runs at the end of each commit, in its transaction, so that what it writes commits with it. */
+  onCommit: OnCommit | undefined;
 
   constructor(db: Database) {
     super(db);
@@ -52,14 +57,18 @@ class SqlKvDatabase extends Executor implements SqliteDatabase {
 
   /** Commits when the callback resolves; rolls back, and rejects with its error, when it rejects. */
   transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
-    return this.#session.transaction((tx) => callback(new Executor(tx)));
+    return this.#session.transaction(async (tx) => {
+      const result = await callback(new Executor(tx));
+      if (this.onCommit) await this.onCommit(tx);
+      return result;
+    });
   }
 
   /** The session is the caller's to end, after the calls made before. */
   async close() {}
 }
 
-/** Open pi-durable storage on the session `db`. */
-export function openSqlKvStorage(db: Database): Promise<SqliteStorage> {
-  return SqliteStorage.open(new SqlKvDatabase(db), { prefix: PREFIX });
+/** Open pi-durable storage on the session `db`, through `database`, its facade, if given (to set its `onCommit`). */
+export function openSqlKvStorage(db: Database, database = new SqlKvDatabase(db)): Promise<SqliteStorage> {
+  return SqliteStorage.open(database, { prefix: PREFIX });
 }

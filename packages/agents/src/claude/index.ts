@@ -1,6 +1,7 @@
 // Claude agents in Restate virtual objects, on the tool runner of the
-// Anthropic SDK (`client.beta.messages.toolRunner`): the conversation is in
-// the object's database (conversation.ts).
+// Anthropic SDK (`client.beta.messages.toolRunner`): the conversation is the
+// object's conversation of turns (../conversation.ts), whose items are the
+// SDK's messages (`BetaMessageParam`).
 //
 //   const assistant = claude.agent({ name: 'assistant', system: 'Answer briefly.', tools: [weather] });
 //
@@ -12,48 +13,47 @@
 // with ANTHROPIC_API_KEY.
 //
 // The handler is not replayed: a retried attempt (a crash, a lost connection)
-// runs again from the start, and starts the runner with the stored messages:
+// runs again from the start, and starts the runner with what the model sees
+// of the conversation (`history()`: the earlier turns as their prompts and
+// answers, the latest whole):
 // - Each reply of the model is stored before its tools run, and their results
 //   before the next request. So a crash during the tools resumes them with the
 //   same tool call ids (`callId(context)`), without asking the model again,
-//   and a tool passes the id on to stay idempotent.
-// - A tool's error fails the attempt, which Restate retries (by default the
-//   runner hands it to the model as the tool's result).
-// - A message is answered once per invocation: its answer is stored with the
-//   model's last reply, and a retried attempt returns it.
-// - A reply cut off at `maxTokens`, or declined, ends the prompt: its tool
-//   calls do not run, and the handler fails with a terminal error.
+//   and a tool passes the id on to stay idempotent. A stored final reply is
+//   the answer: the model is not asked for it again.
+// - A tool's error fails the attempt, which Restate retries; but the SDK's
+//   `ToolError`, which is meant for the model, is the tool's result.
+// - A message is answered once per invocation (`answerOnce`).
+// - A reply cut off at `maxTokens`, declined, or past the model's context
+//   window ends the turn: its tool calls do not run, and the handler fails
+//   with a terminal error.
 import * as restate from '@restatedev/sessions';
 import { ScopeKey } from '@restatedev/sessions/internal';
 import Anthropic from '@anthropic-ai/sdk';
 import type { BetaRunnableTool, BetaToolRunContext } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
+import { ToolError } from '@anthropic-ai/sdk/lib/tools/ToolError';
 import {
-  aborted,
-  AttemptEnded,
-  CANCELLED,
   chatHandler,
   CLAUDE_MODEL,
   type Configure,
   configured,
   fromTool,
-  messagesHandler,
   modelIdOf,
   modelOf,
-  nextPromptId,
-  refusalOf,
+  RETURNED_UNRECORDED,
   stopSignalOf,
-  storedAnswer,
+  type Summarize,
   toolCallEnded,
   toolCallStarted,
-  transcribing,
-  Transcript,
-  UNANSWERED,
 } from '../common.ts';
-import { type Answer, withOutput } from '../output.ts';
+import { answerOnce, type Items, type Parsed, type Run } from '../conversation.ts';
+import { conversationView } from '../messages.ts';
+import { type Answer, withChecked } from '../output.ts';
 import type { z } from 'zod';
 import { type Definition, sessionObject } from '../object.ts';
 import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
-import { Conversation } from './conversation.ts';
+
+type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 
 /** The id of the tool call a tool runs for: the runner always passes it. */
 export const callId = (context?: BetaToolRunContext) => {
@@ -61,10 +61,82 @@ export const callId = (context?: BetaToolRunContext) => {
   return context.toolUse.id;
 };
 
+/** What an empty answer says, as the model sees it later: the API refuses an empty text. */
+const NO_ANSWER = '(no answer)';
+
+/**
+ * `messages` as the API takes them: it refuses an empty text, and an
+ * assistant's message with no content but the last. The model may reply
+ * with nothing (stored as it came): sent back, such a reply says so.
+ */
+const sendable = (messages: MessageParam[]): MessageParam[] =>
+  messages.map((m) => {
+    if (m.role !== 'assistant') return m;
+    if (typeof m.content === 'string') return m.content.trim() ? m : { ...m, content: NO_ANSWER };
+    const content = m.content.filter((b) => b.type !== 'text' || b.text.trim() !== '');
+    if (content.length === 0) return { ...m, content: NO_ANSWER };
+    return content.length === m.content.length ? m : { ...m, content };
+  });
+
+/** The text of stored content, without its tool calls and results. */
+const storedText = (content: string | readonly { type: string; text?: string }[] | undefined) =>
+  typeof content === 'string' ? content : (content ?? []).flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('');
+
+/**
+ * Claude's items: the SDK's messages, as JSON. A user's text is said by the
+ * user, an assistant's by the assistant, and its `tool_use` blocks are its
+ * calls; a `tool_result` is a result. A server tool's blocks (and a
+ * `system` message) say nothing: they leave no open call the API would
+ * refuse a result for.
+ */
+export const items: Items<MessageParam> = {
+  dump: (message) => JSON.stringify(message),
+  load: (stored) => JSON.parse(stored) as MessageParam,
+  prompt: (text) => ({ role: 'user', content: text }),
+  // The API refuses an empty text: an empty answer, as the model sees it later, says so.
+  reply: (text) => ({ role: 'assistant', content: text.trim() ? text : NO_ANSWER }),
+  // Every result of a reply in one message, as the API wants them.
+  results: (results) =>
+    results.length === 0
+      ? []
+      : [
+          {
+            role: 'user',
+            content: results.map(([call, output]) => ({
+              type: 'tool_result' as const,
+              tool_use_id: call.id,
+              content: output,
+              ...(output === RETURNED_UNRECORDED ? {} : { is_error: true }),
+            })),
+          },
+        ],
+  read: (message): Parsed => {
+    if (message.role !== 'user' && message.role !== 'assistant') return {};
+    const { role, content } = message;
+    if (typeof content === 'string') return { said: [role, content] };
+    const texts = content.filter((b) => b.type === 'text');
+    const calls = content.flatMap((b) => (b.type === 'tool_use' ? [{ id: b.id, name: b.name, input: b.input }] : []));
+    const results = content.flatMap((b) =>
+      b.type === 'tool_result'
+        ? [{ id: b.tool_use_id, output: storedText(b.content as never), error: b.is_error === true }]
+        : [],
+    );
+    // Each reply of the model is a message of its own, its tool calls' too (as
+    // the views gave them before); a message of results only says nothing.
+    const said = role === 'assistant' || texts.length > 0;
+    return {
+      ...(said ? { said: [role, texts.map((b) => b.text).join('')] as ['user' | 'assistant', string] } : {}),
+      calls,
+      results,
+    };
+  },
+};
+
 /**
  * `tools`, whose errors fail the attempt: the runner would hand a thrown error
  * to the model as the tool's result, so each one is kept, for `check()` to
- * throw once the tools ran.
+ * throw once the tools ran. The SDK's `ToolError` is for the model: the
+ * runner hands it over as the tool's result.
  */
 function failing(ctx: restate.SessionContext, tools: BetaRunnableTool[]) {
   let failure: unknown;
@@ -75,6 +147,7 @@ function failing(ctx: restate.SessionContext, tools: BetaRunnableTool[]) {
         try {
           return await tool.run(args, context);
         } catch (e) {
+          if (e instanceof ToolError) throw e;
           fromTool(ctx, e);
           failure ??= e;
           throw e;
@@ -103,81 +176,86 @@ interface Agent {
 }
 
 /**
- * Run prompt `id` of `conversation` until it is answered, from its stored
- * messages; each round of tool calls published as it starts and ends (for
- * the clients that follow the conversation).
+ * The run of `agent` on the conversation: from the stored turn on, each
+ * reply stored before its tools run, and their results after; each round of
+ * tool calls published as it starts and ends (for the clients that follow
+ * the conversation).
  */
-async function run(
-  ctx: restate.SessionContext,
-  { client, model, maxTokens, effort, system, tools: all }: Agent,
-  conversation: Conversation,
-  id: string,
-  signal?: AbortSignal,
-) {
-  const { tools, check } = failing(ctx, all);
-  const runner = client.beta.messages.toolRunner(
-    {
-      model,
-      max_tokens: maxTokens,
-      ...(effort === undefined ? {} : { output_config: { effort } }),
-      ...(system === undefined ? {} : { system }),
-      tools,
-      messages: await conversation.messages(),
-    },
-    { signal },
-  );
-  // A reply whose tools did not finish (a crash): run them, with the same ids,
-  // once the calls whose results are stored are settled, as for any reply:
-  // else one of its calls could take the id of an identical call answered before.
-  if (runner.params.messages.at(-1)?.role === 'assistant') {
-    await toolCallStarted(ctx);
-    const results = await runner.generateToolResponse();
-    check();
-    if (results) {
-      await conversation.append(id, [results]);
-      runner.pushMessages(results);
+const runOf =
+  (ctx: restate.SessionContext, agent: Agent): Run<MessageParam> =>
+  async (conversation) => {
+    const { client, model, maxTokens, effort, system } = agent;
+    const turn = conversation.turn;
+    for (;;) {
+      // A stored final reply is the answer: the model is not asked for it again.
+      const final = turn.finalReply();
+      if (final !== undefined) return final;
+      const { tools, check } = failing(ctx, agent.tools);
+      const runner = client.beta.messages.toolRunner(
+        {
+          model,
+          max_tokens: maxTokens,
+          ...(effort === undefined ? {} : { output_config: { effort } }),
+          ...(system === undefined ? {} : { system }),
+          tools,
+          messages: sendable(conversation.history()),
+        },
+        { signal: stopSignalOf(ctx) },
+      );
+      // A reply whose tools did not finish (a crash): run them, with the same
+      // ids, once the calls whose results are stored are settled, as for any
+      // reply: else one of its calls could take the id of an identical call
+      // answered before.
+      if (turn.openCalls().length > 0) {
+        await toolCallStarted(ctx);
+        const results = await runner.generateToolResponse();
+        check();
+        if (results) {
+          await turn.append(results);
+          runner.pushMessages(results);
+        }
+        await toolCallEnded(ctx);
+      }
+      let paused = false;
+      for await (const message of runner) {
+        // A reply that cannot go on ends the turn, whose tool calls do not run.
+        const stopped = stoppedShort(message, maxTokens);
+        if (stopped) throw new restate.TerminalError(stopped);
+        const said: MessageParam = { role: 'assistant', content: message.content };
+        // Paused (a server tool's long turn): a step of the turn, not a reply to
+        // end it with, and the model goes on from it.
+        if (message.stop_reason === 'pause_turn') {
+          await turn.append(said);
+          paused = true;
+          break;
+        }
+        await turn.appendReply([said]);
+        if (!message.content.some((c) => c.type === 'tool_use')) return textOf(message.content);
+        await toolCallStarted(ctx);
+        const results = await runner.generateToolResponse();
+        check();
+        if (results) await turn.append(results);
+        await toolCallEnded(ctx);
+      }
+      if (!paused) throw new Error('the tool runner ended without a reply');
     }
-    await toolCallEnded(ctx);
-  }
-  for await (const message of runner) {
-    const reply: Anthropic.Beta.Messages.BetaMessageParam = { role: 'assistant', content: message.content };
-    // A reply that cannot go on ends the prompt, whose tool calls do not run.
-    const stopped = stoppedShort(message, maxTokens);
-    if (stopped) {
-      await conversation.close(id, stopped.text, reply);
-      throw new restate.TerminalError(stopped.error);
-    }
-    if (!message.content.some((c) => c.type === 'tool_use')) {
-      await conversation.append(id, [reply], textOf(message.content));
-      return;
-    }
-    // The reply first, then its tools.
-    await conversation.append(id, [reply]);
-    await toolCallStarted(ctx);
-    const results = await runner.generateToolResponse();
-    check();
-    if (results) await conversation.append(id, [results]);
-    await toolCallEnded(ctx);
-  }
-}
+  };
 
 /**
  * Why the model's `message` stopped short of a reply to go on from: cut off
- * at `maxTokens` (its text, or a tool call's input, unfinished), or declined.
+ * at `maxTokens` (its text, or a tool call's input, unfinished), declined, or
+ * past the model's context window: a terminal error's message.
  */
 function stoppedShort(message: Anthropic.Beta.Messages.BetaMessage, maxTokens: number) {
   if (message.stop_reason === 'max_tokens') {
-    return {
-      text: `Cut off: the reply reached ${maxTokens} tokens before it ended.`,
-      error: `the model's reply reached maxTokens (${maxTokens}) before it ended: raise the agent's maxTokens`,
-    };
+    return `the model's reply reached maxTokens (${maxTokens}) before it ended: raise the agent's maxTokens`;
   }
   if (message.stop_reason === 'refusal') {
     const category = message.stop_details?.category;
-    return {
-      text: 'Declined: the model did not answer.',
-      error: `the model declined to answer${category ? ` (${category})` : ''}`,
-    };
+    return `the model declined to answer${category ? ` (${category})` : ''}`;
+  }
+  if (message.stop_reason === 'model_context_window_exceeded') {
+    return "the conversation outgrew the model's context window: lower the agent's window or budget";
   }
   return undefined;
 }
@@ -222,81 +300,34 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
 /** The client of an agent without one of its own, on the context of the turn it answers. */
 const CLIENT = new ScopeKey<Anthropic>('the Anthropic client');
 
-/** {@link prompt}, answering with the agent's text. */
-const promptText = (ctx: restate.SessionContext, text: string, options: Options): Promise<string> =>
-  transcribing(
-    ctx,
-    () => transcribe(ctx),
-    () => answerOnce(ctx, text, options),
-  );
-
-const answerOnce = async (
+/** The agent of `options`, for the turn of `ctx`. */
+const agentOf = (
   ctx: restate.SessionContext,
-  text: string,
-  { model: named, system, tools = [], client, maxTokens = 16_000, effort }: Options,
-): Promise<string> => {
-  const agent = {
-    client: client ?? CLIENT.of(ctx, () => new Anthropic()),
-    model: modelIdOf(modelOf(named, CLAUDE_MODEL), 'anthropic'),
-    maxTokens,
-    effort,
-    system,
-    tools: tools.map((t) => (isTool(t) ? native(t, ctx) : t)),
-  };
-  const id = nextPromptId(ctx);
-  const conversation = await Conversation.open(ctx.db);
-  for (;;) {
-    const answer = await conversation.answer(id);
-    if (answer !== undefined) return storedAnswer(answer);
-    // Finish an interrupted prompt first (this one's, after a crash), then
-    // start this one.
-    let pending = await conversation.pending();
-    if (pending === undefined) {
-      await conversation.append(id, [{ role: 'user', content: text }]);
-      pending = id;
-    }
-    const turn = stopSignalOf(ctx);
-    try {
-      const running = run(ctx, agent, conversation, pending, turn);
-      running.catch(() => {});
-      await (turn ? Promise.race([running, aborted(turn)]) : running);
-    } catch (error) {
-      // The attempt ended: it stops, and the next attempt goes on with the prompt.
-      if (turn?.reason instanceof AttemptEnded) throw turn.reason;
-      // Cancelled: the prompt ends, and the next one starts afresh.
-      if (turn?.aborted || error instanceof restate.CancelledError) {
-        await conversation.cancel(pending, CANCELLED);
-        throw turn?.aborted ? turn.reason : error;
-      }
-      // An earlier prompt that ended (cut off, or declined): this one goes on.
-      if (
-        pending !== id &&
-        error instanceof restate.TerminalError &&
-        (await conversation.answer(pending)) !== undefined
-      ) {
-        continue;
-      }
-      // Refused for good (a wrong API key): the prompt ends unanswered, and
-      // fails as terminal. An earlier one's, this one goes on.
-      const refused = refusalOf(ctx, error);
-      if (!refused) throw error;
-      await conversation.close(pending, UNANSWERED);
-      if (pending === id) throw refused;
-    }
-  }
-};
+  { model, system, tools = [], client, maxTokens = 16_000, effort }: Options,
+): Agent => ({
+  client: client ?? CLIENT.of(ctx, () => new Anthropic()),
+  model: modelIdOf(modelOf(model, CLAUDE_MODEL), 'anthropic'),
+  maxTokens,
+  effort,
+  system,
+  tools: tools.map((t) => (isTool(t) ? native(t, ctx) : t)),
+});
 
 /**
  * Answer `text`, once: a retried attempt resumes the same prompt. Each prompt
  * of an invocation is a prompt of its own.
  * With `output`, it answers with the value the agent replies with (see
- * output.ts), not its text.
+ * output.ts), not its text: a reply that is not one is asked again within
+ * its turn, once.
  */
 export const prompt = <O extends z.ZodObject | undefined = undefined>(
   ctx: restate.SessionContext,
   text: string,
   options: Options<O> = {},
-): Promise<Answer<O>> => withOutput(text, options, (t, o) => promptText(ctx, t, o)) as Promise<Answer<O>>;
+): Promise<Answer<O>> =>
+  withChecked(text, options, (t, o, check) =>
+    answerOnce(ctx, t, items, runOf(ctx, agentOf(ctx, o)), { check }),
+  ) as Promise<Answer<O>>;
 
 /**
  * A chat handler: each message an invocation, the conversation in the
@@ -309,42 +340,29 @@ export const chat = <O extends z.ZodObject | undefined = undefined>(options: Con
   return chatHandler(async (ctx, message) => prompt(ctx, message, await configured(options, ctx)));
 };
 
-/** The text of stored content, without its tool calls and results. */
-const storedText = (content: string | readonly { type: string; text?: string }[] | undefined) =>
-  typeof content === 'string' ? content : (content ?? []).flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('');
+/**
+ * A view of the conversation as clients read it: a page at a time, or what
+ * is new or changed since a cursor; `view: 'summary'` for each turn's
+ * message and answer. It answers while a message is answered.
+ */
+export const messages = () => conversationView(items);
 
 /**
- * A handler of the conversation as clients read it: a page at a time, or
- * what is new or changed since a cursor, from the log each change writes
- * (log.ts). It answers while a message is answered.
+ * How an agent of `options` summarizes the earliest turns, past its budget:
+ * with its own client and model (`agent()` gives it; for an object of your
+ * own, `sessionObject`'s `summarize`).
  */
-export const messages = () => messagesHandler();
-
-/**
- * The transcript of each session's conversation (`ctx.db`, one per
- * attempt), as far as it was read: the conversation only grows, so each
- * read adds the messages stored since.
- */
-const TRANSCRIPT = new ScopeKey<{ seq: number; transcript: Transcript }>('the transcript');
-
-/** The conversation in the database of `ctx`, as `messages` gives it. */
-const transcribe = async (ctx: restate.SessionContext): Promise<Transcript> => {
-  const { db } = ctx;
-  const read = TRANSCRIPT.of(ctx, () => ({ seq: 0, transcript: new Transcript() }));
-  const { transcript } = read;
-  for (const [seq, m] of await (await Conversation.open(db)).since(read.seq)) {
-    read.seq = seq;
-    if (m.role === 'system') continue;
-    transcript.say(m.role, storedText(m.content));
-    if (typeof m.content === 'string') continue;
-    for (const block of m.content) {
-      if (block.type === 'tool_use') transcript.call(block.id, block.name, block.input);
-      if (block.type === 'tool_result')
-        transcript.result(block.tool_use_id, storedText(block.content), block.is_error === true);
-    }
-  }
-  return transcript;
-};
+export const summarizer =
+  (options: Options = {}): Summarize =>
+  async (ctx, request) => {
+    const { client, model, maxTokens } = agentOf(ctx, { ...options, tools: [] });
+    const message = await client.beta.messages.create({
+      model,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: request }],
+    });
+    return textOf(message.content);
+  };
 
 /** An agent: a virtual object `name`, one per key, whose `chat` handler is {@link chat}, and `messages` {@link messages}. */
 export const agent = <P extends string, O extends z.ZodObject | undefined = undefined>({
@@ -352,6 +370,9 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
   description,
   schema,
   background,
+  window,
+  budget,
+  summarize,
   ...options
 }: Options<O> & Definition<P>) =>
   sessionObject({
@@ -359,6 +380,9 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
     description,
     schema,
     background,
+    window,
+    budget,
+    summarize: summarize ?? summarizer(options),
     handlers: { chat: chat(options) },
     views: { messages: messages() },
   });

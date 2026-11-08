@@ -130,7 +130,7 @@ console.log('@restatedev/agents/pi type-checks');
 
 // The other harnesses are not installed: their subpaths say what is missing.
 // (pi-ai's own @anthropic-ai/sdk, hoisted by npm, is the Claude agent's.)
-for (const subpath of ['langgraph', 'opencode', 'deepseek']) {
+for (const subpath of ['langgraph', 'deepseek']) {
   try {
     output(process.execPath, ['--input-type=module', '-e', `await import('@restatedev/agents/${subpath}')`], app);
   } catch (error) {

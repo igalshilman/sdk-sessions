@@ -5,8 +5,8 @@
 // to the ledger has an idempotency key made from the request id and the tool
 // call id, so a retried attempt reaches the call the first one made.
 //
-// A framework that gives a tool call cut off by a crash a new id (OpenCode,
-// the DeepSeek Harness) has the model retry it with `retryOf`, the id of the
+// A framework that gives a tool call cut off by a crash a new id (the
+// DeepSeek Harness) has the model retry it with `retryOf`, the id of the
 // call it retries.
 import type * as restate from '@restatedev/sessions';
 import { tool } from '@restatedev/agents';

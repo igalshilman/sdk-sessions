@@ -19,8 +19,10 @@ export class Following {
   revision = 0;
   /** Each turn closed, by its invocation id. */
   readonly closed: string[] = [];
-  /** The message being answered, from its turn's start to its close. */
-  answering: { invocationId: string; since: string } | null = null;
+  /** The message being answered, from its turn's start to its close, and whether its agent settles it. */
+  answering: { invocationId: string; since: string; settles?: boolean } | null = null;
+  /** Each turn the companion would have its agent `settle`: closed as gone, by its invocation id. */
+  readonly settled: string[] = [];
 }
 
 /** The following of each object's state. */
@@ -56,22 +58,38 @@ const made = (c: Made): Made => ({
  * of following over `map`: `ctx`, a handler's context, and `view`, a view's.
  * `route` answers the calls to anything but `signals`.
  */
-export function sqlAttempt(options: AttemptOptions & { route?: (call: Made) => Promise<unknown> }) {
+export function sqlAttempt(
+  options: AttemptOptions & {
+    route?: (call: Made) => Promise<unknown>;
+    /** What the companion's `wait` answers a wait with: by default, it waits forever. */
+    signal?: (wait: { id: string; name: string; input?: unknown }) => unknown;
+  },
+) {
   const following = followingOf(options.map);
   const base = baseAttempt(options);
   // The `signals` object, as the agents call it.
   const signals: Record<string, (input: never) => unknown> = {
     publish: () => ({ revision: ++following.revision }),
-    start: (turn: { invocationId: string; since: string }) => {
-      if (following.answering?.invocationId !== turn.invocationId) following.answering = turn;
+    start: (turn: { invocationId: string; since: string; settles?: boolean }) => {
+      if (following.answering?.invocationId === turn.invocationId) return;
+      if (following.answering) closed(following.answering.invocationId, true);
+      following.answering = turn;
     },
     // As the companion's: a turn's close publishes it.
-    close: (turn: string) => {
-      if (following.answering?.invocationId === turn) following.answering = null;
-      following.closed.push(turn);
-      following.revision++;
-    },
+    close: (turn: string) => closed(turn),
+    ended: (turn: string) => closed(turn, true),
+    wait: (wait: { id: string; name: string; input?: unknown }) =>
+      options.signal ? options.signal(wait) : new Promise(() => {}),
   };
+  /** As the companion's close: a gone turn that settles is sent to its agent's `settle`. */
+  function closed(turn: string, gone = false) {
+    if (following.answering?.invocationId === turn) {
+      if (gone && following.answering.settles) following.settled.push(turn);
+      following.answering = null;
+    }
+    following.closed.push(turn);
+    following.revision++;
+  }
   const route = (c: Made) => {
     if (c.service !== 'signals') {
       if (options.route) return options.route(made(c));
@@ -144,6 +162,8 @@ export function conversation(
   // Ends the attempt before: Restate fences it once the next one starts.
   let abort: (() => void) | undefined;
   const ledger: FakeLedger = { transfers: new Map(), calls: [], crashNext: 0, failNext: 0, crashed: () => {} };
+  /** Each call the attempts made, but a fenced one's. */
+  const calls: Made[] = [];
   // The books as an attempt calls them: a fenced (crashed) attempt's calls
   // never reach them, as a dead process's do not.
   const booksOf = (attempt: { closed: boolean }) => ({
@@ -170,6 +190,8 @@ export function conversation(
   if (from) for (const [id, transfer] of from.ledger.transfers) ledger.transfers.set(id, transfer);
   return {
     ledger,
+    /** Each call the attempts made to the books (`transfer` or else `audit`), but a fenced attempt's. */
+    calls: calls as readonly Made[],
     /** The object's state. */
     state: map as ReadonlyMap<string, Uint8Array>,
     /**
@@ -191,8 +213,12 @@ export function conversation(
         throw new Error('crash at a state request');
       };
       const books = booksOf(current);
-      const route = async ({ method, parameter, idempotencyKey }: Made) =>
-        method === 'transfer' ? books.transfer(parameter as Transfer, idempotencyKey) : books.audit();
+      const route = async (call: Made) => {
+        if (!current.closed) calls.push(call);
+        return call.method === 'transfer'
+          ? books.transfer(call.parameter as Transfer, call.idempotencyKey)
+          : books.audit();
+      };
       const sql = sqlAttempt({ map, fence, key, id: requestId, onRequest, route });
       abort = sql.abort;
       const answer = sql.end(() => handlerOf(handler)(sql.ctx, prompt));
@@ -248,6 +274,13 @@ export const SAID = [
     parts: [{ type: 'text', text: 'Done: {"accounts":8,"total":8000,"transfers":1,"inconsistent":0}' }],
   },
 ].map((m, id) => ({ id, role: m.role, parts: m.parts }));
+
+/**
+ * {@link SAID} as a framework on the conversation of turns gives it: each
+ * message's id is its position, and the rows that only add to a message
+ * (tool results) take positions of their own.
+ */
+export const SAID_IN_TURNS = SAID.map(({ role, parts }, i) => ({ id: [0, 1, 3, 4, 5, 7][i]!, role, parts }));
 
 /**
  * What goes wrong when `prompt` crashes at a state request of a message and

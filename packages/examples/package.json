@@ -15,7 +15,6 @@
     "@langchain/openai": "1.7.0",
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
-    "@opencode/plugin": "2.0.32",
     "@restatedev/agents": "workspace:*",
     "@restatedev/restate-sdk": "1.18.2",
     "@restatedev/restate-sdk-clients": "1.18.2",

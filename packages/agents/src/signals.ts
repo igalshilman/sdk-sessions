@@ -8,7 +8,7 @@
 // this object, which waits without holding a process.
 import type { SessionContext } from '@restatedev/sessions';
 import { Link, needing, sdk as restate } from '@restatedev/sessions/internal';
-import type { Turn } from './common.ts';
+import type { Answering } from './common.ts';
 import type { Status } from './object.ts';
 
 /** An agent's context, as far as its signals need it: any handler's or view's of its object. */
@@ -136,6 +136,21 @@ export interface Watch {
   timeoutSeconds?: number;
 }
 
+/**
+ * A turn as its agent starts it, and whether the agent closes it itself once
+ * its invocation is gone: whether it has the private `settle` handler, which
+ * the companion sends such a turn. An agent of another SDK (the companion's
+ * handlers are shared) that does not say so is sent nothing: its next
+ * message closes such a turn.
+ */
+export interface Started extends Answering {
+  settles?: boolean;
+}
+
+/** `turn` as `status` shows it: without what only the companion reads. */
+const shown = (turn: Started | null | undefined): Answering | null =>
+  turn ? { invocationId: turn.invocationId, since: turn.since } : null;
+
 /** An agent: its object's name, and key. */
 interface Agent {
   service: string;
@@ -149,7 +164,7 @@ interface Agent {
  */
 interface State {
   /** The message the agent answers, from its turn's start to its close. */
-  turn: Turn;
+  turn: Started;
   waiting: (Waiting & { awakeable: string })[];
   kept: Record<string, unknown[]>;
   revision: number;
@@ -175,10 +190,27 @@ const WATCH = { hours: 1 };
  * It publishes the change, for the clients that follow the conversation: a
  * turn's own close (its last change), or the close of one that never closed
  * itself. A close again changes nothing, and publishes nothing.
+ *
+ * If the turn's invocation is `gone` and the turn did not close itself, its
+ * agent is sent `settle`, which closes the turn in its conversation too, if
+ * it said, as it started the turn, that it `settles`.
  */
-async function closed(ctx: restate.ObjectContext<State>, turn: string) {
-  const answering = (await ctx.get('turn'))?.invocationId === turn;
-  if (answering) ctx.clear('turn');
+async function closed(ctx: restate.ObjectContext<State>, turn: string, gone = false) {
+  const started = await ctx.get('turn');
+  const answering = started?.invocationId === turn;
+  if (answering) {
+    ctx.clear('turn');
+    if (gone && started?.settles) {
+      const at = ctx.key.indexOf(':');
+      ctx.genericSend({
+        service: ctx.key.slice(0, at),
+        method: 'settle',
+        key: ctx.key.slice(at + 1),
+        parameter: turn,
+        inputSerde: restate.serde.json,
+      });
+    }
+  }
   const waiting = (await ctx.get('waiting')) ?? [];
   // A wait's id starts with the invocation id of the turn whose tool waits.
   const ofTurn = (id: string) => id.startsWith(`${turn}:`);
@@ -261,10 +293,10 @@ export const signals = restate.object({
      * `awaitTurn` did not close it yet. `awaitTurn` watches the new turn, so
      * that it closes even if no turn comes after it.
      */
-    start: internal(async (ctx: restate.ObjectContext<State>, turn: Turn) => {
+    start: internal(async (ctx: restate.ObjectContext<State>, turn: Started) => {
       const before = (await ctx.get('turn'))?.invocationId;
       if (before === turn.invocationId) return;
-      if (before !== undefined) await closed(ctx, before);
+      if (before !== undefined) await closed(ctx, before, true);
       ctx.set('turn', turn);
       ctx.objectSendClient(signals, ctx.key).awaitTurn(turn.invocationId);
     }),
@@ -295,7 +327,7 @@ export const signals = restate.object({
             .map((_answer, failure) => ({ failed: failure !== undefined })),
           ctx.sleep(WATCH).map(() => null),
         ]);
-        if (ended?.failed) ctx.objectSendClient(signals, ctx.key).close(turn);
+        if (ended?.failed) ctx.objectSendClient(signals, ctx.key).ended(turn);
         else if (ended === null && (await ctx.get('turn'))?.invocationId === turn) {
           ctx.objectSendClient(signals, ctx.key).awaitTurn(turn);
         }
@@ -304,7 +336,7 @@ export const signals = restate.object({
 
     /** What the agent does: the message it answers, if any, and the waits of its tools. */
     status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext<State>): Promise<Status> => ({
-      answering: (await ctx.get('turn')) ?? null,
+      answering: shown(await ctx.get('turn')),
       waiting: ((await ctx.get('waiting')) ?? []).map(({ id, name, input, since }) => ({ id, name, input, since })),
     })),
 
@@ -330,7 +362,13 @@ export const signals = restate.object({
     ),
 
     /** @internal The message `turn` (an invocation id) is answered, or its turn ended otherwise: see {@link closed}. */
-    close: internal(closed),
+    close: internal(async (ctx: restate.ObjectContext<State>, turn: string) => closed(ctx, turn)),
+
+    /**
+     * @internal The invocation of `turn` failed (killed, out of retries): if
+     * the turn did not close itself, its agent closes it too (see {@link closed}).
+     */
+    ended: internal(async (ctx: restate.ObjectContext<State>, turn: string) => closed(ctx, turn, true)),
 
     /**
      * @internal The agent forgot its conversation (`clear`): forget its

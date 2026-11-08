@@ -16,7 +16,13 @@
 //
 // It runs `work` over `ctx.db`: pi-durable's storage is the object's
 // database (storage.ts), and each pi-durable commit is an SQL transaction
-// in it, stored in order with everything else the handler does. The Harness
+// in it, stored in order with everything else the handler does. pi keeps its
+// own history (and compacts it); each commit of a prompt's run copies its
+// new entries (the model's replies, the tools' results) into the
+// conversation of turns (../conversation.ts) in the same transaction: what
+// clients read, and how turns end. A run another invocation left (killed)
+// is aborted, never finished, and the next prompt tells the model how the
+// turn before it ended. The Harness
 // is opened with `tools` (made with pi-durable's `defineTool`) and closed at
 // the end. A retried attempt (a crash, a lost connection) opens it again and
 // carries on: a prompt is submitted once, by its id (pi-durable's requestId),
@@ -32,7 +38,6 @@
 // and a coding tool cut off by a crash is not run again (the model is told
 // it was interrupted).
 import * as restate from '@restatedev/sessions';
-import { ScopeKey } from '@restatedev/sessions/internal';
 import type { Context } from '@earendil-works/chord';
 import { awaitWithContext, BACKGROUND_CONTEXT, withCancel, withoutAbortSignal } from '@earendil-works/chord/context';
 import { mkdir } from 'node:fs/promises';
@@ -48,43 +53,49 @@ import {
   section,
   type Conversation,
   type ConversationStreamOptions,
-  type EntryId,
   type ToolRegistration,
 } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { CodingTools } from '@earendil-works/pi-durable/tools';
+import type { DatabaseWriter } from '@restatedev/sessions';
 import {
   AttemptEnded,
   chatHandler,
   CHECK_MODEL,
+  type Check,
   checkModelName,
   type Configure,
   configured,
-  messagesHandler,
+  fromTool,
   ModelError,
   modelOf,
-  nextPromptId,
   providerOf,
   refusal,
   REFUSED,
+  RETURNED_UNRECORDED,
   stopSignalOf,
   toolCallEnded,
   toolCallStarted,
-  transcribing,
-  Transcript,
 } from '../common.ts';
-import { type Answer, withOutput } from '../output.ts';
+import { answerOnce, invocationOf, type Items, type Parsed, type Turn } from '../conversation.ts';
+import { conversationView } from '../messages.ts';
+import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
 import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
 import type { z } from 'zod';
-import { openSqlKvStorage } from './storage.ts';
+import { openSqlKvStorage, SqlKvDatabase } from './storage.ts';
 
 /** What `work` gets: `prompt(text)`, the `conversation()`, and the `harness` and chord `context` for anything else. */
 export interface Pi {
   harness: Harness;
   context: Context;
-  /** Answer `text`, once per prompt `id`, with the answer's text. By default, each prompt of an invocation has an id of its own, the same on every attempt. */
-  prompt: (text: string, id?: string) => Promise<string>;
+  /**
+   * Answer `text`, once, with the answer's text: a turn of the object's
+   * conversation (each prompt of an invocation has an id of its own, the
+   * same on every attempt). With `check`, a reply it returns a message for
+   * is asked again within the turn, once.
+   */
+  prompt: (text: string, check?: Check) => Promise<string>;
   /** The object's conversation, on the model: for `reset`, `compact`, `entries` and the like. */
   conversation: () => Promise<Conversation>;
 }
@@ -92,6 +103,107 @@ export interface Pi {
 /** The text of a message's content. */
 const textOf = (content: Message['content']): string =>
   typeof content === 'string' ? content : content.flatMap((c) => (c.type === 'text' ? [c.text] : [])).join('');
+
+/** A pi message as the conversation of turns keeps it: with the id of the pi entry it was copied from. */
+export interface Item {
+  entry?: number;
+  message: Message;
+}
+
+/** No usage: a message the conversation makes, which no model gave. */
+const NO_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/**
+ * pi's items: pi-ai's messages. A user's message is said by the user; an
+ * assistant's (but one aborted, failed or deferred) says its text, with its
+ * tool calls; a tool's result is a result; a system message says nothing.
+ */
+export const items: Items<Item> = {
+  dump: (item) => JSON.stringify(item),
+  load: (stored) => JSON.parse(stored) as Item,
+  prompt: (text) => ({ message: { role: 'user', content: text, timestamp: 0 } }),
+  reply: (text) => ({
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      api: 'restate',
+      provider: 'restate',
+      model: 'note',
+      usage: NO_USAGE,
+      stopReason: 'stop',
+      timestamp: 0,
+    },
+  }),
+  results: (results) =>
+    results.map(([call, output]) => ({
+      message: {
+        role: 'toolResult',
+        toolCallId: call.id,
+        toolName: call.name,
+        content: [{ type: 'text', text: output }],
+        isError: output !== RETURNED_UNRECORDED,
+        timestamp: 0,
+      },
+    })),
+  read: ({ message: m }): Parsed => {
+    if (m.role === 'user') return { said: ['user', textOf(m.content)] };
+    if (m.role === 'assistant') {
+      if (m.stopReason === 'aborted' || m.stopReason === 'error' || m.stopReason === 'deferred') return {};
+      const calls = m.content.flatMap((c) =>
+        c.type === 'toolCall' ? [{ id: c.id, name: c.name, input: c.arguments }] : [],
+      );
+      // Each reply is a message of its own, its tool calls' too.
+      return { said: ['assistant', textOf(m.content)], calls };
+    }
+    if (m.role === 'toolResult')
+      return { results: [{ id: m.toolCallId, output: textOf(m.content), error: m.isError }] };
+    return {};
+  },
+};
+
+/**
+ * What each pi commit copies into `turn`, in its transaction: the entries of
+ * the run of the turn's request `requestId` after its user entry (pi's
+ * submission names it),
+ * its replies and its tools' results; nothing once `stopped()`, or once the
+ * turn is closed. Each entry once: after the last one copied.
+ */
+function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean) {
+  let from: { conversation: number; last: number } | undefined;
+  return async (tx: DatabaseWriter) => {
+    if (stopped() || !turn.writable) return;
+    if (!from) {
+      const submitted = await tx.get<{ entry: number | null; conversation: number }>(
+        "SELECT json_extract(record, '$.entry') AS entry, conversation_id AS conversation FROM restate_pi_submissions WHERE request_id = ?",
+        [JSON.stringify(requestId)],
+      );
+      if (submitted?.entry === null || submitted?.entry === undefined) return;
+      const copied = turn.items.flatMap((e) => (e.item.entry === undefined ? [] : [e.item.entry]));
+      from = { conversation: submitted.conversation, last: Math.max(submitted.entry, ...copied) };
+    }
+    const rows = await tx.values(
+      'SELECT id, record FROM restate_pi_entries WHERE conversation_id = ? AND id > ? ORDER BY id',
+      [from.conversation, from.last],
+    );
+    const copied: { item: Item; reply?: boolean }[] = [];
+    for (const [id, record] of rows) {
+      const entry = JSON.parse(String(record)) as { kind: string; model?: Message[] };
+      from.last = Number(id);
+      if (entry.kind !== 'pi.assistant' && entry.kind !== 'pi.tool-result') continue;
+      for (const message of entry.model ?? []) {
+        copied.push({ item: { entry: Number(id), message }, reply: message.role === 'assistant' });
+      }
+    }
+    if (copied.length > 0) await turn.copyIn(tx, copied);
+  };
+}
 
 /** An agent's options: `chat`, `prompt` and `withPi` take them. */
 export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undefined> {
@@ -222,6 +334,19 @@ export const withPi = async <T>(
   turn?.addEventListener('abort', onStop, { once: true });
   // The root conversation, once the Harness is open (below).
   const conversation = () => rootOn(harness, context, model);
+  /**
+   * Abort the run of a live input of the root conversation that `kept` does
+   * not keep: a run a prompt left, whose turn is closed (or the next prompt
+   * closes it), is aborted, never finished. pi's own writes (a compaction's)
+   * are not runs, and an input without a request id is not a prompt's.
+   */
+  const abortLeft = async (kept: (requestId: string) => boolean) => {
+    const { submissions } = await harness.inspect(context);
+    const left = submissions.filter((s) => s.type === 'input' && s.requestId !== undefined && !kept(s.requestId));
+    if (left.length === 0) return;
+    const root = await conversation();
+    if (left.some((s) => s.conversationId === root.id)) await root.abort(context);
+  };
   // A tool call's error: the attempt fails, and the call never returns.
   const stopped = (error: unknown, task: Context): Promise<never> => {
     // The turn was cancelled, and the abort ended the call: pi-durable records it.
@@ -243,6 +368,8 @@ export const withPi = async <T>(
         await toolCallEnded(ctx);
         return result;
       } catch (error) {
+        // The tool's error: never taken for the model's provider refusing (a tool may call a model API).
+        fromTool(ctx, error);
         return stopped(error, task);
       }
     },
@@ -259,46 +386,79 @@ export const withPi = async <T>(
     // pi-durable hands its stream settings to pi-ai's requests as they are: serviceTier is pi-ai's.
     ...(serviceTier ? { stream: { serviceTier } as ConversationStreamOptions } : {}),
   };
-  const harness = await Harness.open(await openSqlKvStorage(ctx.db), { models, registry, env, settings }, context);
+  const database = new SqlKvDatabase(ctx.db);
+  const harness = await Harness.open(
+    await openSqlKvStorage(ctx.db, database),
+    { models, registry, env, settings },
+    context,
+  );
 
-  const prompt = async (text: string, id = nextPromptId(ctx)) => {
-    const root = await conversation();
-    const submission = await root.submit({ type: 'input', content: text, requestId: id }, context);
-    const settled = await submission.wait(context);
-    // A prompt the cancellation's abort ended fails with the cancellation.
-    if (settled.status !== 'done' || settled.answer === undefined)
-      throw cancelled ?? unanswered(id, settled.reason, settled.detail, model);
-    const { answer } = settled;
-    const entry = await root.commit((tx) => tx.entry(AssistantEntry, answer), context);
-    const reply = entry?.model?.at(-1);
-    if (!reply) throw new restate.TerminalError(`prompt ${id}: no answer entry`);
-    return textOf(reply.content);
-  };
-  // `failure`, once it comes; a cancellation first aborts the conversation's work.
+  const prompt = (text: string, check?: Check) =>
+    answerOnce(
+      ctx,
+      text,
+      items,
+      async (store) => {
+        const current = store.turn;
+        const id = current.id;
+        const root = await conversation();
+        // The turn's own request: its prompt, or the message that asked again within it.
+        const again = current.latestAsk() !== current.prompt;
+        const requestId = again ? `${id}:again` : id;
+        // A run an earlier prompt of this invocation left (its turn failed, say).
+        await abortLeft((r) => r === id || r === `${id}:again`);
+        // Once stopped, the turn's close says how it ended: not pi's abort of its tools.
+        database.onCommit = copying(
+          current,
+          requestId,
+          () => cancelled !== undefined || stopSignalOf(ctx)?.aborted === true,
+        );
+        // The model is told how the turn before this one ended, if its run did not answer it.
+        const before = store.transcript.at(-2);
+        const note = !again && before && before.status !== 'answered' && before.answer ? `(${before.answer})\n\n` : '';
+        const asked = textOf(current.latestAsk().item.message.content);
+        const submission = await root.submit({ type: 'input', content: note + asked, requestId }, context);
+        const settled = await submission.wait(context);
+        // A prompt the cancellation's abort ended fails with the cancellation.
+        if (settled.status !== 'done' || settled.answer === undefined)
+          throw cancelled ?? unanswered(id, settled.reason, settled.detail, model);
+        const { answer } = settled;
+        const entry = await root.commit((tx) => tx.entry(AssistantEntry, answer), context);
+        const reply = entry?.model?.at(-1);
+        if (!reply) throw new restate.TerminalError(`prompt ${id}: no answer entry`);
+        return textOf(reply.content);
+      },
+      { check },
+    );
+  // `failure`, once it comes. A cancellation aborts the conversation's work
+  // instead: the work ends with it (a prompt closes its turn, cancelled).
   const abortOn = async (): Promise<never> => {
     try {
       return await failure;
     } catch (error) {
-      if (error instanceof restate.CancelledError) await (await conversation()).abort(context);
-      throw error;
+      if (!(error instanceof restate.CancelledError)) throw error;
+      await (await conversation()).abort(context);
+      return new Promise<never>(() => {});
     }
   };
 
+  // Whatever `work` does (a prompt, a compaction, a wait) has pi schedule
+  // what it has: a run another invocation left is aborted first. This
+  // invocation's own (a retried attempt's) goes on.
+  const working = async () => {
+    await abortLeft((r) => invocationOf(r) === ctx.request.id);
+    return work({ harness, context, conversation, prompt });
+  };
   try {
-    // The log reads the root conversation through this Harness, while it is open.
-    const read = async () => transcribe(ctx, await harness.root(context), context);
-    return await transcribing(ctx, read, () =>
-      Promise.race([abortOn(), work({ harness, context, conversation, prompt })]),
-    );
+    const done = await Promise.race([abortOn(), working()]);
+    // Work the cancellation's abort ended (a wait for pi, say) fails with it, as a prompt does.
+    if (cancelled) throw cancelled;
+    return done;
   } finally {
     turn?.removeEventListener('abort', onStop);
     await harness.close(withoutAbortSignal(context));
   }
 };
-
-/** {@link prompt}, answering with the agent's text. */
-const promptText = (ctx: restate.SessionContext, text: string, options: Options): Promise<string> =>
-  withPi(ctx, options, (session) => session.prompt(text));
 
 /**
  * Answer `text`, once: a retried attempt resumes the same prompt. Each prompt
@@ -310,7 +470,10 @@ export const prompt = <O extends z.ZodObject | undefined = undefined>(
   ctx: restate.SessionContext,
   text: string,
   options: Options<O> = {},
-): Promise<Answer<O>> => withOutput(text, options, (t, o) => promptText(ctx, t, o)) as Promise<Answer<O>>;
+): Promise<Answer<O>> =>
+  withChecked(text, options, (t, o, check) => withPi(ctx, o, (session) => session.prompt(t, check))) as Promise<
+    Answer<O>
+  >;
 
 /**
  * A chat handler: each message an invocation, the conversation in the
@@ -324,44 +487,11 @@ export const chat = <O extends z.ZodObject | undefined = undefined>(options: Con
 };
 
 /**
- * A handler of the conversation as clients read it: a page at a time, or
- * what is new or changed since a cursor, from the log each change writes
- * (log.ts). It answers while a message is answered.
+ * A view of the conversation as clients read it: a page at a time, or what
+ * is new or changed since a cursor; `view: 'summary'` for each turn's
+ * message and answer. It answers while a message is answered.
  */
-export const messages = () => messagesHandler();
-
-/**
- * The transcript of each session's root conversation (`ctx.db`, one per
- * attempt), as far as it was read, to its last entry. pi-durable's entries
- * never change, and a new one takes a greater id than any before it (they
- * are committed one at a time), so each read adds the entries after it.
- */
-const TRANSCRIPT = new ScopeKey<{ last?: EntryId; transcript: Transcript }>('the transcript');
-
-/** The root conversation in the database of `ctx`, `root` of a Harness on it, from pi-durable's entries, as `messages` gives it. */
-const transcribe = async (ctx: restate.SessionContext, root: Conversation, context: Context) => {
-  const read = TRANSCRIPT.of(ctx, () => ({ transcript: new Transcript() }));
-  const { transcript } = read;
-  // From the last entry read (the bound is inclusive), or the first.
-  const query = { order: 'ascending' as const, ...(read.last === undefined ? {} : { minEntryId: read.last }) };
-  for (let cursor: Parameters<typeof root.entries>[2]; ;) {
-    const page = await root.entries(query, 100, cursor, context);
-    for (const entry of page.items) {
-      if (entry.id === read.last) continue;
-      read.last = entry.id;
-      for (const m of entry.model ?? []) {
-        if (m.role === 'user') transcript.say('user', textOf(m.content));
-        if (m.role === 'assistant') {
-          transcript.say('assistant', textOf(m.content));
-          for (const c of m.content) if (c.type === 'toolCall') transcript.call(c.id, c.name, c.arguments);
-        }
-        if (m.role === 'toolResult') transcript.result(m.toolCallId, textOf(m.content), m.isError);
-      }
-    }
-    cursor = page.next;
-    if (cursor === undefined) return transcript;
-  }
-};
+export const messages = () => conversationView(items);
 
 /** An agent: a virtual object `name`, one per key, whose `chat` handler is {@link chat}, and `messages` {@link messages}. */
 export const agent = <P extends string, O extends z.ZodObject | undefined = undefined>({
@@ -369,6 +499,8 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
   description,
   schema,
   background,
+  window,
+  budget,
   ...options
 }: Options<O> & Definition<P>) =>
   sessionObject({
@@ -376,6 +508,8 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
     description,
     schema,
     background,
+    window,
+    budget,
     handlers: { chat: chat(options) },
     views: { messages: messages() },
   });

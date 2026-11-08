@@ -1,6 +1,6 @@
 /**
  * A software factory: a new Linear issue, through a webhook, starts a triage
- * agent (pi), which has a planner (pi) plan it, a coder (OpenCode) per part
+ * agent (pi), which has a planner (pi) plan it, a coder (pi) per part
  * build it and open its pull request, and a reviewer (pi) review each one.
  * GitHub's webhook brings people's comments and reviews, and failed CI
  * runs, to the coder of the pull request. See README.md.
@@ -15,8 +15,7 @@
  * The environment (the real Linear and GitHub, WORKSPACE): env.ts. Coders
  * run real commands, on this machine: use a sandbox.
  */
-import { serve, subagent, webhook } from '@restatedev/agents';
-import * as opencode from '@restatedev/agents/opencode';
+import { serve, sessionObject, subagent, webhook } from '@restatedev/agents';
 import * as pi from '@restatedev/agents/pi';
 import * as env from './env.ts';
 import * as github from './github.ts';
@@ -34,14 +33,21 @@ const reviewer = pi.agent({
   output: Review,
 });
 
-const coder = opencode.agent({
-  name: 'coder',
-  description: 'Builds a part of the plan, on a branch of its own, and opens its pull request; answers its reviews',
+/** A coder's options: its workspace is a clone of the project, on a branch of its own, for its key. */
+const coding = {
   model: 'anthropic/claude-sonnet-5-5',
-  workspace: env.coderWorkspace, // a clone of the project, on its own branch
   tools: [...env.linearTools('🛠️ Coder'), env.pullRequestTool('🛠️ Coder'), env.pullRequestCommentTool('🛠️ Coder')],
   system: prompts.CODER,
   output: Built,
+};
+
+const coder = sessionObject({
+  name: 'coder',
+  description: 'Builds a part of the plan, on a branch of its own, and opens its pull request; answers its reviews',
+  handlers: {
+    chat: pi.chat(async (ctx) => ({ ...coding, workspace: await env.coderWorkspace(ctx) })),
+  },
+  views: { messages: pi.messages() },
 });
 
 const planner = pi.agent({

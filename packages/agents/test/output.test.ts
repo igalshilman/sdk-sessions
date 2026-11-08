@@ -1,15 +1,17 @@
 // An agent's answer as data (`output`): its reply, as JSON of the schema,
 // is what `chat` answers with; a reply that is not is answered with what is
 // wrong, once, then the invocation fails; a crash at any point still answers
-// with it. On pi's chat, with a fake model (../fakes/pi.ts), and Claude's
-// (the teller's client, ../fakes/claude.ts); the others share the same code
-// (output.ts).
+// with it. On pi's chat, with a fake model (../fakes/pi.ts), Claude's (the
+// teller's client, ../fakes/claude.ts) and DeepSeek's (../fakes/deepseek.ts);
+// the others share the same code (output.ts).
 import * as restate from '@restatedev/sessions';
 import * as claude from '@restatedev/agents/claude';
+import * as deepseek from '@restatedev/agents/deepseek';
 import * as pi from '@restatedev/agents/pi';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { teller } from './fakes/claude.ts';
+import { teller as deepseekTeller } from './fakes/deepseek.ts';
 import { fakeProvider, say, textOf } from './fakes/pi.ts';
 import { conversation, type PromptHandler } from './support.ts';
 
@@ -44,6 +46,7 @@ vi.mock('@earendil-works/pi-ai/providers/all', () => ({
 }));
 
 vi.mock('@anthropic-ai/sdk', () => import('./fakes/claude.ts'));
+vi.mock('@deepseek-ai/dsh-llm-deepseek-api-key', () => import('./fakes/deepseek.ts'));
 
 const Plan = z.object({ summary: z.string(), parts: z.array(z.string()) });
 const chat = pi.chat({ output: Plan }) as unknown as PromptHandler;
@@ -97,6 +100,30 @@ describe("an agent's output", () => {
     const planner = claude.chat({ output: Plan }) as unknown as PromptHandler;
     expect(await conversation(planner, 'claude').attempt('inv1', 'Plan it')).toEqual(PLAN);
   });
+
+  it("is DeepSeek's too, asked once more with what is wrong, however a crash cuts it", async () => {
+    // In prose, then in a code fence once told; asked to continue (after a crash), it answers the request it continues.
+    const asked: string[] = [];
+    deepseekTeller.reply = (messages) => {
+      const requests = messages
+        .filter((m) => m.role === 'user')
+        .map((m) => m.content.flatMap((c) => (c.type === 'text' ? [c.text] : [])).join(''))
+        .filter((text) => !text.startsWith('Continue: '));
+      const request = requests.at(-1)!;
+      asked.push(request);
+      return {
+        text: request.startsWith('Your reply is not') ? '```json\n' + JSON.stringify(PLAN) + '\n```' : 'A plan',
+      };
+    };
+    const planner = deepseek.chat({ output: Plan }) as unknown as PromptHandler;
+    expect(await conversation(planner, 'deepseek').attempt('inv1', 'Plan lazily')).toEqual(PLAN);
+    expect(asked).toHaveLength(2);
+    for (let crashAt = 1; ; crashAt++) {
+      const c = conversation(planner, `deepseek-${crashAt}`);
+      if ((await c.attempt('inv1', 'Plan lazily', crashAt)) !== 'crashed') break;
+      expect([crashAt, await c.attempt('inv1', 'Plan lazily')]).toEqual([crashAt, PLAN]);
+    }
+  }, 60_000);
 
   it('types what prompt answers: the output, or else text', () => {
     expectTypeOf<Awaited<ReturnType<typeof pi.prompt<typeof Plan>>>>().toEqualTypeOf<z.infer<typeof Plan>>();

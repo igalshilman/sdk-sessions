@@ -15,7 +15,6 @@ that put them together. New to it all? Begin with
 | File                                 | What                                                                                                                                       |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | [`chat.ts`](basic/chat.ts)           | **Start here.** A durable chat agent on pi, with a tool: `pi.agent({ name: 'assistant', tools: [weather] })`                               |
-| [`opencode.ts`](basic/opencode.ts)   | The same agent on OpenCode 2.0                                                                                                             |
 | [`langgraph.ts`](basic/langgraph.ts) | The same agent on LangGraph                                                                                                                |
 | [`claude.ts`](basic/claude.ts)       | The same agent on Claude (the Anthropic SDK's tool runner; `ANTHROPIC_API_KEY`)                                                            |
 | [`deepseek.ts`](basic/deepseek.ts)   | The same agent on the DeepSeek Harness (`DEEPSEEK_API_KEY`)                                                                                |
@@ -25,25 +24,23 @@ that put them together. New to it all? Begin with
 
 ### Intermediate
 
-| File                                      | What                                                                                                                                        |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`support.ts`](intermediate/support.ts)   | A support agent whose tools are Restate itself: a service call, a signal (a manager's approval) and a workflow                              |
-| [`triage.ts`](intermediate/triage.ts)     | Agents as steps of a workflow: classify a ticket, draft a reply, and wait for a person's review                                             |
-| [`router.ts`](intermediate/router.ts)     | A front desk of your own: a handler asks a model which team handles a message (`pi.prompt`), then calls that team's agent                   |
-| [`team.ts`](intermediate/team.ts)         | A team on three frameworks: an editor (pi) hands research to a researcher (LangGraph) and drafting to a writer (OpenCode)                   |
-| [`followup.ts`](intermediate/followup.ts) | An agent that schedules a check-in for a day later: `send` with a delay                                                                     |
-| [`harness.ts`](intermediate/harness.ts)   | An agent each user configures: its model and persona from the object's database (`pi.chat(options)`), and `compact` and `reset` handlers    |
-| [`coding.ts`](intermediate/coding.ts)     | A coordinator (pi) that hands coding tasks to coders of its own (OpenCode)                                                                  |
-| [`review.ts`](intermediate/review.ts)     | A coder (OpenCode) made your own: a plugin that keeps its edits in `src/`, and a handler that writes code, then reviews it (`withOpenCode`) |
-| [`ui/`](ui/app.ts)                        | A chat page for `support.ts` on Restate's own client: the conversation as the agent works, Approve and Reject, Stop (`npx vite ui`)         |
+| File                                      | What                                                                                                                                       |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`support.ts`](intermediate/support.ts)   | A support agent whose tools are Restate itself: a service call, a signal (a manager's approval) and a workflow                             |
+| [`triage.ts`](intermediate/triage.ts)     | Agents as steps of a workflow: classify a ticket, draft a reply, and wait for a person's review                                            |
+| [`router.ts`](intermediate/router.ts)     | A front desk of your own: a handler asks a model which team handles a message (`pi.prompt`), then calls that team's agent                  |
+| [`team.ts`](intermediate/team.ts)         | A team on three frameworks: an editor (pi) hands research to a researcher (LangGraph) and drafting to a writer (Claude)                    |
+| [`followup.ts`](intermediate/followup.ts) | An agent that schedules a check-in for a day later: `send` with a delay                                                                    |
+| [`harness.ts`](intermediate/harness.ts)   | An agent each user configures: its model and persona from the object's database (`pi.chat(options)`), and `summarize` and `reset` handlers |
+| [`ui/`](ui/app.ts)                        | A chat page for `support.ts` on Restate's own client: the conversation as the agent works, Approve and Reject, Stop (`npx vite ui`)        |
 
 ### Advanced
 
-| Folder                                   | What                                                                                                                                                                                                                                                                        |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`gateway/`](advanced/gateway/README.md) | A tool gateway for agents: one per tenant, holding dangerous calls for approval, with limits per tenant and user, and an agent per case                                                                                                                                     |
-| [`factory/`](advanced/factory/README.md) | A software factory on Linear: a webhook starts it; a triage agent (pi) asks a planner (pi) for a structured plan, then hands each part to a coder (OpenCode), at once, and a reviewer (pi) reads each pull request; each moves its issue along, through Linear's MCP server |
-| [`pairing/`](advanced/pairing/README.md) | A pair programmer you talk with from a terminal, about a project: its loop in Restate, pi's coding tools in the project's directory; you talk with it as it works; a reviewer on another model reads its diff; it ships through a workflow once you approve                 |
+| Folder                                   | What                                                                                                                                                                                                                                                                  |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`gateway/`](advanced/gateway/README.md) | A tool gateway for agents: one per tenant, holding dangerous calls for approval, with limits per tenant and user, and an agent per case                                                                                                                               |
+| [`factory/`](advanced/factory/README.md) | A software factory on Linear: a webhook starts it; a triage agent (pi) asks a planner (pi) for a structured plan, then hands each part to a coder (pi), at once, and a reviewer (pi) reads each pull request; each moves its issue along, through Linear's MCP server |
+| [`pairing/`](advanced/pairing/README.md) | A pair programmer you talk with from a terminal, about a project: its loop in Restate, pi's coding tools in the project's directory; you talk with it as it works; a reviewer on another model reads its diff; it ships through a workflow once you approve           |
 
 Each agent is a virtual object, one per key, whose conversation is in the
 object's SQL database: a message is answered once per invocation, and a
@@ -80,7 +77,7 @@ The examples take OpenAI's models, with `OPENAI_API_KEY` (all but
 `claude.ts` and `deepseek.ts`, on their providers' own, and `factory/`, on
 OpenAI's and Anthropic's). `MODEL` picks another model, such as
 `MODEL=anthropic/claude-sonnet-5-5` with `ANTHROPIC_API_KEY`, for the agents
-on pi, OpenCode, LangGraph (OpenAI's and Anthropic's) and the DeepSeek
+on pi, LangGraph (OpenAI's and Anthropic's) and the DeepSeek
 Harness; Claude takes Anthropic's models alone, and refuses another
 provider's `MODEL` when it starts (see
 [the models](../agents/README.md#models)). To call an agent from code,

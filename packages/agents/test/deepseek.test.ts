@@ -5,8 +5,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 import * as restate from '@restatedev/restate-sdk';
-import { REFUSED } from '@restatedev/agents';
-import { AttemptEnded } from '../src/common.ts';
+import { CANCELLED, REFUSED, UNANSWERED } from '@restatedev/agents';
+import { AttemptEnded, ENDED } from '../src/common.ts';
 import {
   afterCancel,
   cancelledTransfer,
@@ -17,7 +17,7 @@ import {
   withoutIds,
   conversation,
   crashedAnywhere,
-  SAID,
+  SAID_IN_TURNS as SAID,
 } from './support.ts';
 import { teller } from './fakes/deepseek.ts';
 import * as deepseek from '@restatedev/agents/deepseek';
@@ -83,7 +83,7 @@ describe('the DeepSeek Harness agent', () => {
     );
     expect(failed).toBeInstanceOf(restate.CancelledError);
     expect(answer).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
-    // The harness ends the tool call with the cancellation, as its error.
+    // The turn's close ends the tool call, and the turn, as cancelled.
     expect(parts).toEqual([
       [{ type: 'text', text: 'Please move 5 from 1 to 2' }],
       [
@@ -92,10 +92,11 @@ describe('the DeepSeek Harness agent', () => {
           id: expect.any(String),
           name: 'transfer',
           input: { from: 1, to: 2, amount: 5 },
-          output: 'Error: Cancelled',
+          output: CANCELLED,
           error: true,
         },
       ],
+      [{ type: 'text', text: CANCELLED }],
       [{ type: 'text', text: 'Hello' }],
       [{ type: 'text', text: 'Ask me to "move 5 from 1 to 2", or to "audit" the books.' }],
     ]);
@@ -225,13 +226,77 @@ describe('the DeepSeek Harness agent', () => {
     expect(audit).toMatch(/^Done: .*"transfers":1/);
   });
 
-  it('finishes an interrupted prompt before starting the next one', async () => {
+  it('closes a turn its gone invocation left, by the next message: never finishes it', async () => {
     const c = conversation(prompt, 'c');
+    // Killed in its transfer: its invocation is gone, and the next message comes.
     await c.crash('inv1', 'Please move 1 from 0 to 1');
-    // Its caller gave up; the next prompt comes.
-    const second = await c.attempt('inv2', 'Please move 2 from 0 to 1');
-    expect(second).toBe('Done: moved 2 from account 0 to account 1');
-    expect(await c.attempt('inv1', 'Please move 1 from 0 to 1')).toBe('Done: moved 1 from account 0 to account 1');
+    const seen: RequestMessage[][] = [];
+    const reply = teller.reply;
+    teller.reply = (messages: RequestMessage[]) => {
+      seen.push(messages);
+      return reply(messages);
+    };
+    try {
+      const second = await c.attempt('inv2', 'Please move 2 from 0 to 1');
+      expect(second).toBe('Done: moved 2 from account 0 to account 1');
+    } finally {
+      teller.reply = reply;
+    }
+    // The model was asked for the second message only, and told how the first ended.
+    expect(seen).toHaveLength(2);
+    expect(JSON.stringify(seen[0]!.at(-1))).toContain(ENDED);
     expect(c.ledger.transfers.size).toBe(2);
+    const { messages } = await c.read(deepseek.messages());
+    expect(messages[1]!.parts[0]).toMatchObject({ type: 'tool', output: ENDED, error: true });
+    expect(messages[2]!.parts).toEqual([{ type: 'text', text: ENDED }]);
+    // The views show the prompt as asked, without the note.
+    expect(messages[3]!.parts).toEqual([{ type: 'text', text: 'Please move 2 from 0 to 1' }]);
+    await expect(c.attempt('inv1', 'Please move 1 from 0 to 1')).rejects.toThrow(ENDED);
+  });
+
+  it('tells the next model that a turn was refused', async () => {
+    const c = conversation(prompt, 'refused-note');
+    const reply = teller.reply;
+    const seen: RequestMessage[][] = [];
+    teller.reply = () => {
+      teller.reply = (messages: RequestMessage[]) => {
+        seen.push(messages);
+        return reply(messages);
+      };
+      throw new Error('API key not found');
+    };
+    try {
+      await expect(c.attempt('inv1', 'Please move 5 from 1 to 2')).rejects.toMatchObject({ code: REFUSED });
+      await c.attempt('inv2', 'Hello');
+    } finally {
+      teller.reply = reply;
+    }
+    expect(JSON.stringify(seen[0]!.at(-1))).toContain(UNANSWERED);
+  });
+
+  it('keeps the requests to continue out of the conversation', async () => {
+    const c = conversation(prompt, 'continued');
+    await c.crash('inv1', 'Please move 3 from 1 to 2');
+    expect(await c.attempt('inv1', 'Please move 3 from 1 to 2')).toBe('Done: moved 3 from account 1 to account 2');
+    const { messages } = await c.read(deepseek.messages());
+    expect(JSON.stringify(messages)).not.toContain('Continue: your last turn was interrupted');
+    expect(messages.filter((m) => m.role === 'user')).toHaveLength(1);
+  });
+
+  it("ends a turn past the model's context window for good, rather than retry it", async () => {
+    const c = conversation(prompt, 'overflow');
+    const reply = teller.reply;
+    teller.reply = () => {
+      teller.reply = reply;
+      throw new Error("This model's maximum context length is 131072 tokens");
+    };
+    try {
+      const failed = await c.attempt('inv1', 'Please move 5 from 1 to 2').catch((error: unknown) => error);
+      expect(failed).toBeInstanceOf(restate.TerminalError);
+      expect((failed as restate.TerminalError).code).not.toBe(REFUSED);
+    } finally {
+      teller.reply = reply;
+    }
+    expect(await c.attempt('inv2', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
   });
 });

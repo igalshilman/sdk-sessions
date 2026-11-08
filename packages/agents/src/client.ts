@@ -14,11 +14,12 @@
 //   for await (const { status, messages } of follow(restate, agent('assistant'), 'alice')) { ... }
 import * as clients from '@restatedev/restate-sdk-clients';
 import type { VirtualObjectDefinition } from '@restatedev/restate-sdk-core';
-import type { ChatMessage, Messages, MessagesRequest, Part, Turn } from './common.ts';
+import type { Answering, ChatMessage, Messages, MessagesRequest, Part } from './common.ts';
 import type { Status, Stopped, Synced, SyncRequest } from './object.ts';
 import type { Notifications, Resolved, Signal, Waiting, Watch } from './signals.ts';
 
 export type {
+  Answering,
   ChatMessage,
   Messages,
   MessagesRequest,
@@ -30,7 +31,6 @@ export type {
   Stopped,
   Synced,
   SyncRequest,
-  Turn,
   Waiting,
   Watch,
 };

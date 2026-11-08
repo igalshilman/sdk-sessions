@@ -1,6 +1,6 @@
 # @restatedev/agents
 
-Durable agents on Restate: an agent of one of five frameworks (pi, OpenCode,
+Durable agents on Restate: an agent of one of four frameworks (pi,
 LangGraph, Claude, the DeepSeek Harness) in a Restate virtual object, its
 conversation in the object's own SQL database. A crash, a restart or a
 person who takes a day to approve changes nothing: each message is answered
@@ -15,8 +15,9 @@ once, and each tool call is made once.
 - [Your own session object](#your-own-session-object)
 - [Build your own](#build-your-own)
 - [Words](#words)
-- [Turn semantics](TURN-SEMANTICS.md): how a message is answered, retried,
-  stopped or killed, and what a client sees meanwhile
+- [The conversation of turns](docs/README.md): how a message is answered,
+  retried, stopped or killed, how the conversation is stored, what the model
+  sees, and what a client sees meanwhile
 
 ## Start here
 
@@ -76,7 +77,6 @@ the handler `chat` (a message in, the answer out), and the views
 | Import                                                    | Framework                       | Choose it when                                                                                |
 | --------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------- |
 | [`@restatedev/agents/pi`](src/pi/README.md)               | pi-durable                      | You want the default: any provider, coding tools on request, and its Harness (compact, reset) |
-| [`@restatedev/agents/opencode`](src/opencode/README.md)   | OpenCode 2.0, embedded          | You want a coding agent: OpenCode's own tools (read, edit, bash, grep...) in a directory      |
 | [`@restatedev/agents/langgraph`](src/langgraph/README.md) | LangGraph                       | You use LangChain: its tools, or a chat model of your own                                     |
 | [`@restatedev/agents/claude`](src/claude/README.md)       | the Anthropic SDK's tool runner | You want Claude with nothing in between: the lightest, the API's own messages                 |
 | [`@restatedev/agents/deepseek`](src/deepseek/README.md)   | DeepSeek Harness                | You want DeepSeek's harness: DeepSeek's models, or any pi-ai knows                            |
@@ -92,16 +92,17 @@ npm install @restatedev/agents @earendil-works/pi-durable @earendil-works/pi-ai 
 npm install @restatedev/agents @anthropic-ai/sdk                                                        # Claude
 npm install @restatedev/agents @langchain/core @langchain/langgraph @langchain/langgraph-checkpoint \
   @langchain/openai                       # LangGraph, and the provider of its models: or @langchain/anthropic
-npm install @restatedev/agents @opencode/core@2.0.32 @opencode/plugin@2.0.32 @opencode/sdk@2.0.32 \
-  @opencode/server@2.0.32 effect@4.0.1    # OpenCode, which pins its packages, and effect
 npm install @restatedev/agents @earendil-works/pi-ai @deepseek-ai/cordis \
   @deepseek-ai/{dsh-agent,dsh-agent-loop,dsh-llm,dsh-llm-deepseek-api-key,dsh-llm-pi-ai,dsh-session}@0.2.1-rc.2 \
   @deepseek-ai/{dsh-session-checkpoint-policy,dsh-session-persistence,dsh-session-projection}@0.2.1-rc.2 \
   @deepseek-ai/{dsh-system-prompt,dsh-tools}@0.2.1-rc.2   # DeepSeek
 ```
 
-OpenCode is pinned: @restatedev/agents stores its tables in the object's
-database, as its version lays them out. A subpath whose packages are
+OpenCode was a framework of this package until its agents moved onto the
+conversation of turns: a turn whose invocation is gone (killed) must be
+closed, never finished, and OpenCode resumes a turn it claimed whenever it
+boots, with no public way to end it first (see
+[docs/frameworks.md](docs/frameworks.md#opencode)). A subpath whose packages are
 missing fails as it is imported, naming the first it lacks. The packages
 are not published yet:
 [`pnpm --filter e2e packaging`](../e2e/packaging.ts) installs them from
@@ -109,10 +110,10 @@ their tarballs, with pi alone. In this repository the frameworks' packages
 are @restatedev/agents' development dependencies, so every example runs as it is.
 
 Every framework takes `model`, `system`, `tools` and `output` (a
-[structured answer](#structured-answers)); pi and OpenCode take a
-`workspace` too, a directory for their coding tools. `system` is the whole
+[structured answer](#structured-answers)); pi takes a
+`workspace` too, a directory for its coding tools. `system` is the whole
 system prompt for Claude and LangGraph, and is added to the framework's own
-(which tells the model about its tools) for pi, OpenCode and DeepSeek.
+(which tells the model about its tools) for pi and DeepSeek.
 
 Every agent takes these too, beside its framework's options:
 
@@ -121,6 +122,13 @@ Every agent takes these too, beside its framework's options:
 | `description` | What it is, for the UI, and for a parent's model: `subagent(agent)` tells it                                                                     |
 | `background`  | It works unwatched (a subagent, say): its turn tells its `signals` at its end only, not at each step, so a follower sees each turn once it ended |
 | `schema`      | Tables of your own in its database ([Build your own](#build-your-own))                                                                           |
+| `window`      | How many of the latest answered turns its model sees whole, with their tool calls and results (default 1), or `'all'`                            |
+| `budget`      | How many tokens of the turns before the window its model sees, as their messages and answers (default 32 000); `summarize` summarizes the rest   |
+
+`window` and `budget` bound what Claude's and LangGraph's model is sent
+([what the model gets](docs/conversation.md)); pi and the DeepSeek Harness
+keep their own history, and compact it themselves. An object holds one
+framework's conversation: its turns are that framework's messages.
 
 ## Calling an agent
 
@@ -133,7 +141,7 @@ curl localhost:8080/assistant/alice/chat -d 'Hi, I am Alice'       # "Hello Alic
 ```
 
 A key answers one message at a time: a message sent while another is
-answered waits for it ([turn semantics](TURN-SEMANTICS.md) spells out how a
+answered waits for it ([turn semantics](docs/turns.md) spells out how a
 turn starts, ends, and is retried). A message that fails for good answers with an error:
 HTTP 424 if the model's provider refused it (a missing or wrong API key, an
 unknown model), 500 otherwise. A refused message is over: the next message
@@ -235,15 +243,17 @@ curl localhost:8080/assistant/alice/messages
 }
 ```
 
-The conversation as clients read it is a log in the object's database,
-which each change the agent publishes goes into. A message's `id` never
-changes; `cursor` is where the log is now. `limit` caps a page; `before` an
-id gives older messages (scrolling back, while `more` says there are older
-ones still); and `cursor` gives the messages new or changed since it, by
-when they changed, with the next cursor: a message that grew (a tool call
-with its output) comes again, with its `id`. A compacted or reset
-conversation keeps what was said, and the summary or handoff after it (the
-model's context is what changed):
+The conversation as clients read it is the agent's conversation of turns,
+in the object's database ([docs/conversation.md](docs/conversation.md)). A
+message's `id` is its position, and never changes; `cursor` is where the
+conversation is now. `limit` caps a page; `before` an id gives older
+messages (scrolling back, while `more` says there are older ones still);
+and `cursor` gives the messages new or changed since it, by when they
+changed, with the next cursor: a message that grew (a tool call with its
+output) comes again, with its `id`. `view: "summary"` gives each turn's
+message and answer alone, under the same ids. A conversation whose earliest
+turns are summarized, or that the framework compacted, keeps every turn as
+it was said (only the model's context changed):
 
 ```sh
 curl localhost:8080/assistant/alice/messages --json '{"limit": 20, "before": 40}'
@@ -382,7 +392,7 @@ and Restate retries it: the tool call runs again.
 **Once.** A crash runs an unfinished tool call again with the same call id.
 A tool that must not run twice passes its `idempotencyKey` on (made of the
 invocation's id and the call id), as Restate's tools do with each call they
-make: run again, it is the same call. OpenCode and the DeepSeek Harness tell
+make: run again, it is the same call. The DeepSeek Harness tells
 the model that a cut-off tool call was interrupted instead, and the model
 makes it again as a new tool call: Restate's tools then make the same call,
 if the input is the same (so a wait for an approval outlasts a restart), and
@@ -530,7 +540,7 @@ environment variable, or else OpenAI's `openai/gpt-6-sol`, with
 pi.agent({ name: 'assistant', model: 'anthropic/claude-sonnet-5-5' }); // with ANTHROPIC_API_KEY
 ```
 
-pi, OpenCode and the DeepSeek Harness take any provider they know (the
+pi and the DeepSeek Harness take any provider they know (the
 DeepSeek Harness, pi-ai's); LangGraph OpenAI's and Anthropic's models (and
 any LangChain chat model, as `model`); Claude Anthropic's.
 
@@ -579,10 +589,8 @@ await serve(assistant);
 ```
 
 Your tables share the database with the agent's, whose names all start with
-`restate_` (`restate_pi_tasks`, `restate_claude_messages`,
-`restate_agent_log`...): any other name is yours. OpenCode's tables are in a
-database of their own, beside it, as OpenCode boots only on a database that
-is empty or its own.
+`restate_` (`restate_agent_turns`, `restate_agent_items`,
+`restate_pi_tasks`...): any other name is yours.
 
 **Options for each invocation.** `chat` takes options, or a function of the
 invocation's context that gives them: each user's model and persona from
@@ -606,9 +614,8 @@ that takes its message as `chat` does (text, or a JSON string):
 summarize: chatHandler(async (ctx, topic) => pi.prompt(ctx, `Summarize what we said about ${topic}`)),
 ```
 
-pi and OpenCode also have `withPi(ctx, options, work)` and
-`withOpenCode(ctx, options, work)`, for more than a prompt: the Harness's own
-API, such as compacting the conversation (see their READMEs).
+pi also has `withPi(ctx, options, work)`, for more than a prompt: the Harness's own
+API, such as compacting the conversation (see its README).
 
 **What `sessionObject()` sets up.** `ctx.db` in every handler; retries for weeks
 (50 ms after a crash, then twice as long each time, up to 10 s apart), since

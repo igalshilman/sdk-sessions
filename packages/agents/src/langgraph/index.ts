@@ -1,5 +1,7 @@
-// LangGraph agents in Restate virtual objects: a tool-calling graph whose
-// checkpoints are in the object's database (checkpointer.ts).
+// LangGraph agents in Restate virtual objects: a tool-calling graph on the
+// object's conversation of turns (../conversation.ts), whose items are
+// LangChain's messages. `SqlCheckpointSaver` (checkpointer.ts) is for graphs
+// of your own, which keep their checkpoints in the object's database.
 //
 //   const assistant = langgraph.agent({ name: 'assistant', tools: [search] });
 //
@@ -13,48 +15,58 @@
 // openai/gpt-6-sol, with OPENAI_API_KEY.
 //
 // The handler is not replayed: a retried attempt (a crash, a lost connection)
-// runs again from the start, and LangGraph carries on from the last step it
-// stored:
-// - Each step is stored before the next starts (`durability: 'sync'`), in
-//   order with everything else the handler does. So the tool calls a model
-//   made are stored before any tool runs, and a crash during the tools
-//   resumes them with the same tool call ids, which a tool passes on to stay
-//   idempotent.
+// runs again from the start, and the graph starts from what the model sees
+// of the conversation (`history()`: the earlier turns as their prompts and
+// answers, the latest whole):
+// - The model node stores its reply before it returns, and the tools node
+//   each tool's result as it lands. So a crash during the tools resumes
+//   those without a result, with the same tool call ids, which a tool passes
+//   on to stay idempotent; and a stored final reply is the answer, without
+//   asking the model again.
 // - A tool's error fails the attempt, which Restate retries (the ToolNode
 //   would hand it to the model as the tool's result); a call of a tool the
 //   agent lacks, or with arguments that do not fit, is the model's to fix.
-// - A message is answered once per invocation: the graph records each answer
-//   in its state, and a retried attempt returns it.
+// - A message is answered once per invocation (`answerOnce`).
 import * as restate from '@restatedev/sessions';
-import type { Database } from '@restatedev/sessions';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import { AIMessage, type BaseMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  type BaseMessage,
+  HumanMessage,
+  mapStoredMessagesToChatMessages,
+  type StoredMessage,
+  SystemMessage,
+  type ToolCall,
+  ToolMessage,
+} from '@langchain/core/messages';
 import { type StructuredToolInterface, tool, ToolInputParsingException } from '@langchain/core/tools';
-import { Annotation, END, isGraphInterrupt, MessagesAnnotation, START, StateGraph } from '@langchain/langgraph';
+import {
+  END,
+  GraphRecursionError,
+  isGraphInterrupt,
+  MessagesAnnotation,
+  START,
+  StateGraph,
+} from '@langchain/langgraph';
 import { ToolNode, toolsCondition } from '@langchain/langgraph/prebuilt';
 import {
-  AttemptEnded,
-  CANCELLED,
   chatHandler,
   type Configure,
   configured,
   fromTool,
-  messagesHandler,
   ModelError,
   modelOf,
-  nextPromptId,
   providerOf,
-  refusalOf,
+  RETURNED_UNRECORDED,
   stopSignalOf,
-  storedAnswer,
+  type Summarize,
   toolCallEnded,
   toolCallStarted,
-  transcribing,
-  Transcript,
-  UNANSWERED,
 } from '../common.ts';
-import { type Answer, withOutput } from '../output.ts';
+import { answerOnce, type Items, type Run, type Turn } from '../conversation.ts';
+import { conversationView } from '../messages.ts';
+import { type Answer, withChecked } from '../output.ts';
 import type { z } from 'zod';
 import { type Definition, sessionObject } from '../object.ts';
 import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
@@ -63,38 +75,59 @@ import { SqlCheckpointSaver } from './checkpointer.ts';
 
 export { SqlCheckpointSaver };
 
-const State = Annotation.Root({
-  ...MessagesAnnotation.spec,
-  /** The id of the prompt being answered. */
-  prompt: Annotation<string>(),
-  /** The answer to each prompt, by id. */
-  answers: Annotation<Record<string, string>>({ reducer: (a, b) => ({ ...a, ...b }), default: () => ({}) }),
-});
+/**
+ * LangGraph's items: LangChain's messages, stored as their `toDict()`. A
+ * human message is said by the user; an AI message by the assistant, with
+ * its `tool_calls` as calls; a tool message is a result (an error if its
+ * status says so).
+ */
+export const items: Items<BaseMessage> = {
+  dump: (message) => JSON.stringify(message.toDict()),
+  load: (stored) => mapStoredMessagesToChatMessages([JSON.parse(stored) as StoredMessage])[0]!,
+  prompt: (text) => new HumanMessage(text),
+  // A provider may refuse an empty message: an empty answer, as the model sees it later, says so.
+  reply: (text) => new AIMessage(text.trim() ? text : NO_ANSWER),
+  results: (results) =>
+    results.map(
+      ([call, output]) =>
+        new ToolMessage({
+          tool_call_id: call.id,
+          name: call.name,
+          content: output,
+          ...(output === RETURNED_UNRECORDED ? {} : { status: 'error' as const }),
+        }),
+    ),
+  read: (message) => {
+    if (HumanMessage.isInstance(message)) return { said: ['user', message.text] };
+    if (AIMessage.isInstance(message)) {
+      const calls = (message.tool_calls ?? []).map((c) => ({ id: c.id ?? '', name: c.name, input: c.args }));
+      // Each reply is a message of its own, its tool calls' too.
+      return { said: ['assistant', message.text], calls };
+    }
+    if (ToolMessage.isInstance(message)) {
+      return { results: [{ id: message.tool_call_id, output: message.text, error: message.status === 'error' }] };
+    }
+    return {};
+  },
+};
+
+/** What an empty answer says, as the model sees it later. */
+const NO_ANSWER = '(no answer)';
+
+/** Whether `message` is a reply of the model with nothing in it: no text, no tool call, no other content. */
+const blank = (message: AIMessage) =>
+  (message.tool_calls ?? []).length === 0 &&
+  (typeof message.content === 'string'
+    ? !message.content.trim()
+    : message.content.every((b) => b.type === 'text' && !(typeof b.text === 'string' && b.text.trim())));
 
 /**
- * The tools node: each tool call of the model's last message run by a
- * ToolNode, which answers the model with what is wrong when a call names a
- * tool the agent does not have, or arguments that do not fit (the model's to
- * fix: failing the attempt, every retry would meet the same call again). Any
- * other error of a tool fails the attempt, at once (the ToolNode would hand
- * it to the model too). The round is published as it starts and ends, for
- * the clients that follow the conversation.
+ * `messages` as a provider takes them: a reply of the model with nothing in
+ * it (stored as it came) says so, as an empty answer does. Anthropic's API
+ * refuses an empty message but the last.
  */
-function toolsNode(ctx: restate.SessionContext, tools: StructuredToolInterface[]) {
-  return async (state: typeof MessagesAnnotation.State, config: RunnableConfig) => {
-    await toolCallStarted(ctx);
-    // The first error fails the attempt at once, not once the other calls end.
-    const { promise: failure, reject: failed } = Promise.withResolvers<never>();
-    failure.catch(() => {});
-    const node = new ToolNode(
-      tools.map((t) => failing(ctx, t, failed)),
-      { handleToolErrors: true },
-    );
-    const ran: { messages: BaseMessage[] } = await Promise.race([node.invoke(state, config), failure]);
-    await toolCallEnded(ctx);
-    return ran;
-  };
-}
+const sendable = (messages: BaseMessage[]) =>
+  messages.map((m) => (AIMessage.isInstance(m) && blank(m) ? new AIMessage(NO_ANSWER) : m));
 
 /** `t`, its errors given to `failed`, but for its input's (arguments that do not fit) and LangGraph's interrupts. */
 const failing = (
@@ -117,6 +150,47 @@ const failing = (
       },
     },
   }) as StructuredToolInterface;
+
+/**
+ * The tools node: each tool call of the turn without a result run by a
+ * ToolNode, which answers the model with what is wrong when a call names a
+ * tool the agent does not have, or arguments that do not fit (the model's to
+ * fix: failing the attempt, every retry would meet the same call again). Each
+ * result is stored as it lands. Any other error of a tool fails the attempt,
+ * at once (the ToolNode would hand it to the model too). The round is
+ * published as it starts and ends, for the clients that follow the
+ * conversation.
+ */
+function toolsNode(ctx: restate.SessionContext, turn: Turn<BaseMessage>, tools: StructuredToolInterface[]) {
+  return async (_state: typeof MessagesAnnotation.State, config: RunnableConfig) => {
+    await toolCallStarted(ctx);
+    // The first error fails the attempt at once, not once the other calls end.
+    const { promise: failure, reject } = Promise.withResolvers<never>();
+    failure.catch(() => {});
+    let broken = false;
+    const failed = (error: unknown) => {
+      broken = true;
+      reject(error);
+    };
+    const node = new ToolNode(
+      tools.map((t) => failing(ctx, t, failed)),
+      { handleToolErrors: true },
+    );
+    const one = async (call: ToolCall) => {
+      const ran = (await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [call] })] }, config)) as {
+        messages: BaseMessage[];
+      };
+      // A tool's error fails the attempt: the ToolNode's answer to the model of it is not the call's result.
+      if (broken) return [];
+      await turn.append(...ran.messages);
+      return ran.messages;
+    };
+    const calls = turn.openCalls().map((c) => ({ id: c.id, name: c.name, args: c.input as Record<string, unknown> }));
+    const ran = await Promise.race([Promise.all(calls.map(one)), failure]);
+    await toolCallEnded(ctx);
+    return { messages: ran.flat() };
+  };
+}
 
 /** `provider/model-id` as its provider and model id, for a provider the usual graph takes. */
 const providerOfModel = (named: string) => {
@@ -155,21 +229,65 @@ async function integration<T>(name: string, load: () => Promise<T>): Promise<T> 
   }
 }
 
-/** The agent's graph: `model`, calling `tools`. */
-function graph(ctx: restate.SessionContext, model: BaseChatModel, tools: StructuredToolInterface[], system?: string) {
+/**
+ * The agent's graph, for `turn`: `model`, calling `tools`, from the tools if
+ * the turn has calls without results (a crash cut them off). The model node
+ * stores each reply before it returns.
+ */
+function graph(
+  ctx: restate.SessionContext,
+  turn: Turn<BaseMessage>,
+  model: BaseChatModel,
+  tools: StructuredToolInterface[],
+  system?: string,
+) {
   if (!model.bindTools) throw new Error(`${model.getName()} does not call tools`);
   const withTools = model.bindTools(tools);
-  return new StateGraph(State)
-    .addNode('model', async ({ messages }) => ({
-      messages: [await withTools.invoke(system ? [new SystemMessage(system), ...messages] : messages)],
-    }))
-    .addNode('tools', toolsNode(ctx, tools))
-    .addNode('answer', ({ prompt, messages }) => ({ answers: { [prompt]: messages.at(-1)!.text } }))
-    .addEdge(START, 'model')
-    .addConditionalEdges('model', toolsCondition, { tools: 'tools', [END]: 'answer' })
-    .addEdge('tools', 'model')
-    .addEdge('answer', END);
+  return new StateGraph(MessagesAnnotation)
+    .addNode('model', async ({ messages }) => {
+      const reply = await withTools.invoke(system ? [new SystemMessage(system), ...messages] : messages);
+      await turn.appendReply([reply]);
+      return { messages: [reply] };
+    })
+    .addNode('tools', toolsNode(ctx, turn, tools))
+    .addConditionalEdges(START, () => (turn.openCalls().length > 0 ? 'tools' : 'model'), {
+      tools: 'tools',
+      model: 'model',
+    })
+    .addConditionalEdges('model', toolsCondition, { tools: 'tools', [END]: END })
+    .addEdge('tools', 'model');
 }
+
+/** How many steps a turn takes at most, by default: tool rounds enough for any turn, and the end of a run that loops. */
+const RECURSION_LIMIT = 10_000;
+
+/** The run of the agent: the graph from what the model sees, to the final reply's text. */
+const runOf =
+  (
+    ctx: restate.SessionContext,
+    model: BaseChatModel,
+    tools: StructuredToolInterface[],
+    system?: string,
+    recursionLimit = RECURSION_LIMIT,
+  ): Run<BaseMessage> =>
+  async (conversation) => {
+    const turn = conversation.turn;
+    // A stored final reply is the answer: the model is not asked for it again.
+    const final = turn.finalReply();
+    if (final !== undefined) return final;
+    const app = graph(ctx, turn, model, tools, system).compile();
+    try {
+      const { messages } = await app.invoke(
+        { messages: sendable(conversation.history()) },
+        { signal: stopSignalOf(ctx), recursionLimit },
+      );
+      return messages.at(-1)!.text;
+    } catch (error) {
+      // A run that loops would loop again: it ends the turn.
+      if (error instanceof GraphRecursionError) throw new restate.TerminalError(error.message);
+      throw error;
+    }
+  };
 
 /** `t` as a LangChain tool: `t.run` checks the model's arguments itself. */
 const native = (t: AnyTool, ctx: restate.SessionContext): StructuredToolInterface =>
@@ -190,6 +308,8 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   system?: string;
   /** The agent's tools: `tool()`s, Restate's (`call`, `signal`...), or LangChain's. */
   tools?: (AnyTool | StructuredToolInterface)[];
+  /** How many steps of the graph a turn takes at most (default 10 000): past it, the turn fails for good. */
+  recursionLimit?: number;
   /**
    * The answer as data: a zod object, whose JSON the agent replies with
    * (checked), and `chat` and `prompt` answer with (see output.ts).
@@ -197,109 +317,41 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   output?: O;
 }
 
-/** {@link prompt}, answering with the agent's text. */
-const promptText = (ctx: restate.SessionContext, text: string, options: Options): Promise<string> =>
-  transcribing(
-    ctx,
-    () => transcribe(ctx.db, ctx.key),
-    () => answerOnce(ctx, text, options),
-  );
-
-const answerOnce = async (
-  ctx: restate.SessionContext,
-  text: string,
-  { model, system, tools = [] }: Options,
-): Promise<string> => {
-  const llm = typeof model === 'object' ? model : await chatModel(modelOf(model));
-  // The latest checkpoint is all an agent resumes from: earlier ones would
-  // store the conversation again at each step.
-  const checkpointer = new SqlCheckpointSaver(ctx.db, { history: 'latest' });
-  const app = graph(
-    ctx,
-    llm,
-    tools.map((t) => (isTool(t) ? native(t, ctx) : t)),
-    system,
-  ).compile({ checkpointer });
-  const config = { configurable: { thread_id: ctx.key }, durability: 'sync' as const };
-  const id = nextPromptId(ctx);
-  for (;;) {
-    const state = await app.getState(config);
-    const answer = state.values.answers?.[id];
-    if (answer !== undefined) return storedAnswer(answer);
-    // Finish an interrupted run first (this prompt's, after a crash), then
-    // start this prompt's. A run is unfinished while its prompt has no
-    // answer: `next` does not say, as it leaves out the steps whose writes
-    // are stored.
-    const { prompt: last, answers = {} } = state.values;
-    const interrupted = last !== undefined && answers[last] === undefined;
-    const turn = stopSignalOf(ctx);
-    try {
-      await app.invoke(interrupted ? null : { messages: [new HumanMessage(text)], prompt: id }, {
-        ...config,
-        signal: turn,
-      });
-    } catch (error) {
-      // The attempt ended: it stops, and the next attempt goes on with the run.
-      if (turn?.reason instanceof AttemptEnded) throw turn.reason;
-      // Cancelled: the run ends, and the next prompt starts afresh.
-      if (turn?.aborted || error instanceof restate.CancelledError) {
-        await close(app, config, CANCELLED);
-        throw turn?.aborted ? turn.reason : error;
-      }
-      // Refused for good (a wrong API key): the run ends unanswered, and
-      // fails as terminal. An earlier prompt's, this one goes on.
-      const refused = refusalOf(ctx, error);
-      if (!refused) throw error;
-      await close(app, config, UNANSWERED);
-      if (!interrupted || last === id) throw refused;
-    }
-  }
-};
-
-/**
- * End the run of `app` that was cancelled or refused, as its `answer` node: a
- * result of `text` for each tool call of the last reply that has none, then
- * `text` as the reply and the prompt's answer. A run that stored no input
- * yet (cancelled at once) has nothing to end: the prompt the state has is
- * an earlier one, which has its answer.
- */
-async function close(app: ReturnType<ReturnType<typeof graph>['compile']>, config: RunnableConfig, text: string) {
-  const { values } = await app.getState(config);
-  if (values.prompt === undefined || values.answers?.[values.prompt] !== undefined) return;
-  const messages = (values.messages ?? []) as BaseMessage[];
-  const answered = new Set(messages.filter((m) => ToolMessage.isInstance(m)).map((m) => m.tool_call_id));
-  const last = messages.findLast((m) => AIMessage.isInstance(m));
-  const calls = (last && AIMessage.isInstance(last) ? (last.tool_calls ?? []) : []).filter(
-    (call) => call.id !== undefined && !answered.has(call.id),
-  );
-  await app.updateState(
-    config,
-    {
-      messages: [
-        ...calls.map((call) => new ToolMessage({ tool_call_id: call.id!, content: text, status: 'error' })),
-        new AIMessage(text),
-      ],
-      answers: { [values.prompt]: text },
-    },
-    'answer',
-  );
-}
+/** The chat model of `model`. */
+const modelOfOptions = async (model: Options['model']) =>
+  typeof model === 'object' ? model : chatModel(modelOf(model));
 
 /**
  * Answer `text`, once: a retried attempt resumes the same prompt. Each prompt
- * of an invocation is a prompt of its own. The thread is the object's key.
+ * of an invocation is a prompt of its own.
  * With `output`, it answers with the value the agent replies with (see
- * output.ts), not its text.
+ * output.ts), not its text: a reply that is not one is asked again within
+ * its turn, once.
  */
 export const prompt = <O extends z.ZodObject | undefined = undefined>(
   ctx: restate.SessionContext,
   text: string,
   options: Options<O> = {},
-): Promise<Answer<O>> => withOutput(text, options, (t, o) => promptText(ctx, t, o)) as Promise<Answer<O>>;
+): Promise<Answer<O>> =>
+  withChecked(text, options, async (t, { model, system, tools = [], recursionLimit }, check) =>
+    answerOnce(
+      ctx,
+      t,
+      items,
+      runOf(
+        ctx,
+        await modelOfOptions(model),
+        tools.map((x) => (isTool(x) ? native(x, ctx) : x)),
+        system,
+        recursionLimit,
+      ),
+      { check },
+    ),
+  ) as Promise<Answer<O>>;
 
 /**
- * A chat handler: each message an invocation, the thread (the object's key)
- * in the object's database, with `options`, or the options a function of the
+ * A chat handler: each message an invocation, the conversation in the
+ * object's database, with `options`, or the options a function of the
  * invocation's context gives. It takes the message as plain text
  * (`curl -d 'Hi'`) or as a JSON string (`curl --json '"Hi"'`).
  */
@@ -309,26 +361,21 @@ export const chat = <O extends z.ZodObject | undefined = undefined>(options: Con
 };
 
 /**
- * A handler of the conversation as clients read it: a page at a time, or
- * what is new or changed since a cursor, from the log each change writes
- * (log.ts). It answers while a message is answered.
+ * A view of the conversation as clients read it: a page at a time, or what
+ * is new or changed since a cursor; `view: 'summary'` for each turn's
+ * message and answer. It answers while a message is answered.
  */
-export const messages = () => messagesHandler();
+export const messages = () => conversationView(items);
 
-/** The thread `key` in `db`, from its last checkpoint, as `messages` gives it. */
-const transcribe = async (db: Database, key: string) => {
-  const transcript = new Transcript();
-  const saved = await new SqlCheckpointSaver(db).getTuple({ configurable: { thread_id: key } });
-  for (const m of (saved?.checkpoint.channel_values.messages ?? []) as BaseMessage[]) {
-    if (HumanMessage.isInstance(m)) transcript.say('user', m.text);
-    if (AIMessage.isInstance(m)) {
-      transcript.say('assistant', m.text);
-      for (const call of m.tool_calls ?? []) transcript.call(call.id ?? '', call.name, call.args);
-    }
-    if (ToolMessage.isInstance(m)) transcript.result(m.tool_call_id, m.text, m.status === 'error');
-  }
-  return transcript;
-};
+/**
+ * How an agent of `model` summarizes the earliest turns, past its budget:
+ * with its own model (`agent()` gives it; for an object of your own,
+ * `sessionObject`'s `summarize`).
+ */
+export const summarizer =
+  (model?: Options['model']): Summarize =>
+  async (_ctx, request) =>
+    (await (await modelOfOptions(model)).invoke([new HumanMessage(request)])).text;
 
 /** An agent: a virtual object `name`, one per key, whose `chat` handler is {@link chat}, and `messages` {@link messages}. */
 export const agent = <P extends string, O extends z.ZodObject | undefined = undefined>({
@@ -336,6 +383,9 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
   description,
   schema,
   background,
+  window,
+  budget,
+  summarize,
   ...options
 }: Options<O> & Definition<P>) =>
   sessionObject({
@@ -343,6 +393,9 @@ export const agent = <P extends string, O extends z.ZodObject | undefined = unde
     description,
     schema,
     background,
+    window,
+    budget,
+    summarize: summarize ?? summarizer(options.model),
     handlers: { chat: chat(options) },
     views: { messages: messages() },
   });

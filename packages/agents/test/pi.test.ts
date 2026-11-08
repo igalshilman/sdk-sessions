@@ -1,9 +1,11 @@
 // pi's chat without a Restate server or an API key: Anthropic's provider is a
 // fake model (../fakes/pi.ts).
 import * as restate from '@restatedev/sessions';
-import { subagent, tool } from '@restatedev/agents';
+import { CANCELLED, chatHandler, subagent, tool } from '@restatedev/agents';
 import { z } from 'zod';
 import * as pi from '@restatedev/agents/pi';
+import { Type } from '@earendil-works/pi-ai';
+import { defineTool } from '@earendil-works/pi-durable';
 import { describe, expect, it, vi } from 'vitest';
 import { callTools, fakeProvider, say, textOf } from './fakes/pi.ts';
 import { AttemptEnded } from '../src/common.ts';
@@ -189,11 +191,39 @@ describe('pi.chat', () => {
     expect(answer).toBe('moved 5 from account 1 to account 2');
   });
 
+  it('fails with the cancellation of work that is not a prompt, as a prompt does', async () => {
+    const started = Promise.withResolvers<void>();
+    const lookup = tool({
+      name: 'lookup',
+      description: 'Look it up.',
+      input: z.object({}),
+      run: async () => {
+        started.resolve();
+        return new Promise<string>(() => {});
+      },
+    });
+    // Its work hands pi a message of its own, and waits for pi to be idle: the cancellation's abort ends that.
+    const waiting = chatHandler((ctx) =>
+      pi.withPi(ctx, { tools: [lookup] }, async (session) => {
+        const root = await session.conversation();
+        await root.submit({ type: 'input', content: 'Look it up' }, session.context);
+        await root.waitForIdle(session.context);
+        return 'idle';
+      }),
+    );
+    const sql = sqlAttempt({ map: new Map(), key: 'k', id: 'inv1' });
+    const answer = sql.end(() => handlerOf(waiting)(sql.ctx, 'Look it up'));
+    await started.promise;
+    sql.cancel();
+    await expect(answer).rejects.toBeInstanceOf(restate.CancelledError);
+  });
+
   it('ends a cancelled turn, and answers the next message afresh', async () => {
     const { failed, answer, parts } = await afterCancel(pi.chat({ tools: [cancelledTransfer] }), pi.messages());
     expect(failed).toBeInstanceOf(restate.CancelledError);
-    expect(answer).toBe('Please move 5 from 1 to 2 / Hello');
-    // pi-durable's abort ends the tool call, as its own error.
+    // The next model is told how the turn before ended, with the message.
+    expect(answer).toBe(`Please move 5 from 1 to 2 / (${CANCELLED})\n\nHello`);
+    // The turn's close ends the tool call, and the turn, as cancelled.
     expect(parts).toEqual([
       [{ type: 'text', text: 'Please move 5 from 1 to 2' }],
       [
@@ -203,12 +233,13 @@ describe('pi.chat', () => {
           id: expect.any(String),
           name: 'transfer',
           input: { from: 1, to: 2, amount: 5 },
-          output: expect.stringContaining('Tool transfer was aborted'),
+          output: CANCELLED,
           error: true,
         },
       ],
+      [{ type: 'text', text: CANCELLED }],
       [{ type: 'text', text: 'Hello' }],
-      [{ type: 'text', text: 'Please move 5 from 1 to 2 / Hello' }],
+      [{ type: 'text', text: `Please move 5 from 1 to 2 / (${CANCELLED})\n\nHello` }],
     ]);
   });
 
@@ -269,6 +300,22 @@ describe('pi.chat', () => {
     expect(await alice.invoke(chat, 'inv1', 'Break it')).toBe('fixed');
     expect(calls).toHaveLength(2);
     expect(calls[1]).toBe(calls[0]);
+  });
+
+  it("never takes a pi tool's error for the provider refusing the model", async () => {
+    // A tool of pi's own, whose request fails as a provider's would (an HTTP library's 404, say).
+    class NotFoundError extends Error {}
+    const boom = defineTool({
+      name: 'boom',
+      description: 'Looks a page up.',
+      parameters: Type.Object({}),
+      execute: async () => {
+        throw new NotFoundError('no such page');
+      },
+    });
+    const failed = object('alice').invoke(pi.chat({ tools: [boom] }), 'inv1', 'Break it');
+    await expect(failed).rejects.toThrow('no such page');
+    await expect(failed).rejects.not.toBeInstanceOf(restate.TerminalError);
   });
 
   it('answers each prompt of an invocation, and each once', async () => {

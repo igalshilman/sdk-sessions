@@ -47,6 +47,8 @@ function companion(ends: Record<string, Promise<unknown>> = {}, { watched = fals
   const state = new Map<string, unknown>();
   const own: { method: string; input: unknown }[] = [];
   const rejected: string[] = [];
+  /** What it sent to others (an agent's `settle`). */
+  const sent: { service: string; method: string; key?: string; parameter: unknown }[] = [];
   const ctx = {
     key: 'assistant:alice',
     get: async (name: string) => structuredClone(state.get(name)),
@@ -58,11 +60,22 @@ function companion(ends: Record<string, Promise<unknown>> = {}, { watched = fals
       new Proxy({}, { get: (_, method: string) => (input: unknown) => void own.push({ method, input }) }),
     invocation: (id: string) => ({ attach: () => restatePromise(ends[id] ?? never()) }),
     sleep: () => restatePromise(watched ? Promise.resolve() : never()),
+    genericSend: ({
+      service,
+      method,
+      key,
+      parameter,
+    }: {
+      service: string;
+      method: string;
+      key?: string;
+      parameter: unknown;
+    }) => void sent.push({ service, method, key, parameter }),
   };
   const handlers = (signals as unknown as { object: Record<string, (ctx: unknown, input?: unknown) => unknown> })
     .object;
   const run = <T>(name: string, input?: unknown) => handlers[name]!(ctx, input) as Promise<T>;
-  return { run, own, rejected };
+  return { run, own, rejected, sent };
 }
 
 const wait = (id: string, awakeable: string) => ({ id, name: 'approval', since: '', awakeable });
@@ -99,13 +112,46 @@ describe("an agent's companion", () => {
     expect(c.own).toEqual([{ method: 'awaitTurn', input: A }]);
   });
 
-  it('closes a turn that fails (a killed one), and nothing for one that ends as it should', async () => {
+  it('ends a turn that fails (a killed one), and nothing for one that ends as it should', async () => {
     const killed = Promise.reject(new restate.TerminalError('killed', { errorCode: 409 }));
     killed.catch(() => {});
     const c = companion({ [A]: killed, [B]: Promise.resolve('answered') });
     await c.run('awaitTurn', A);
     await c.run('awaitTurn', B);
-    expect(c.own).toEqual([{ method: 'close', input: A }]);
+    expect(c.own).toEqual([{ method: 'ended', input: A }]);
+  });
+
+  it('has a turn whose invocation is gone settled by its agent, if the agent said it settles', async () => {
+    const c = companion();
+    // An agent of another SDK does not say it settles its turns: it is sent nothing.
+    await c.run('start', turn(A));
+    await c.run('ended', A);
+    expect(await answering(c)).toBeNull();
+    expect(c.sent).toEqual([]);
+    // The status shows the turn as every SDK's companion does, with no field of this one's own.
+    await c.run('start', { ...turn(B), settles: true });
+    expect((await c.run<{ answering: object }>('status')).answering).toEqual(turn(B));
+    await c.run('ended', B);
+    expect(await answering(c)).toBeNull();
+    expect(c.sent).toEqual([{ service: 'assistant', method: 'settle', key: 'alice', parameter: B }]);
+    // Ended again, or closed by the turn itself first: nothing more.
+    await c.run('ended', B);
+    expect(c.sent).toHaveLength(1);
+  });
+
+  it('has a turn that closed itself settled by no one', async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), settles: true });
+    await c.run('close', A);
+    await c.run('ended', A);
+    expect(c.sent).toEqual([]);
+  });
+
+  it('has a gone turn the next start closes settled by its agent', async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), settles: true });
+    await c.run('start', { ...turn(B), settles: true });
+    expect(c.sent).toEqual([{ service: 'assistant', method: 'settle', key: 'alice', parameter: A }]);
   });
 
   it('hands a turn still answered after its watch to a new watch, and stops watching a closed one', async () => {

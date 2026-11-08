@@ -7,7 +7,8 @@
 // it is resolved by its id, then answers
 // with every tool's result; a signal no one waits for is dropped, unless it
 // is kept; a cancelled wait leaves `pending`; `stop` stops a message being
-// answered; `follow` gives the conversation as it changes; a message may be
+// answered; `follow` gives the conversation as it changes, and a `sync` that
+// waited has the change that ended its wait; a message may be
 // plain text; a webhook's delivery is a message of its own, once, answered
 // after the message being answered, also one that is stopped; `clear`
 // forgets a conversation, stopping its turn;
@@ -21,11 +22,23 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as restate from '@restatedev/restate-sdk';
 import { createModels } from '@earendil-works/pi-ai/models';
-import { call, signal, signals, webhook, workflow, type Messages, type Status, type Waiting } from '@restatedev/agents';
+import {
+  CANCELLED,
+  call,
+  signal,
+  signals,
+  webhook,
+  workflow,
+  type Messages,
+  type Status,
+  type Waiting,
+} from '@restatedev/agents';
 import * as clients from '@restatedev/restate-sdk-clients';
 import { agent, type ChatMessage, follow, type Followed } from '@restatedev/agents/client';
+import * as langgraph from '@restatedev/agents/langgraph';
 import * as pi from '@restatedev/agents/pi';
 import { z } from 'zod';
+import { Teller } from '@restatedev/agents/test/fakes/langgraph';
 import { callTools, fakeProvider, say, textOf } from '@restatedev/agents/test/fakes/pi';
 import { RESTATE_SERVER as SERVER } from './restate-server.ts';
 
@@ -79,6 +92,14 @@ const support = pi.agent({
   ],
 });
 
+// An agent on LangGraph, which stores a tool's result before it publishes the step: asked to audit, its
+// model (the teller) waits for a manager's approval, then reports it.
+const auditor = langgraph.agent({
+  name: 'auditor',
+  model: new Teller({}),
+  tools: [signal('approval', { name: 'audit', description: 'Wait for a manager' })],
+});
+
 // A workflow that calls the agent like any handler, as examples/intermediate/triage.ts does.
 const triage = restate.workflow({
   name: 'triage',
@@ -108,7 +129,7 @@ const server = spawn(SERVER, ['--base-dir', dir], {
   stdio: 'ignore',
 });
 try {
-  await restate.serve({ services: [orders, refund, support, triage, hooks, signals], port: PORT });
+  await restate.serve({ services: [orders, refund, support, auditor, triage, hooks, signals], port: PORT });
   for (
     let i = 0;
     !(await fetch(`${ADMIN}/health`).then(
@@ -179,10 +200,12 @@ try {
     ['assistant', 'order 103: delivered / approved by Kim / refunded 103'],
   ]);
   assert.equal(said.more, false);
-  // A page at a time: the latest two, then the one before them.
+  // A page at a time: the latest two, then the one before them. A message's
+  // id is its position in the conversation: a tool's result takes one too.
+  const ids = said.messages.map((m) => m.id);
   const latest = (await post('support/alice/messages', { limit: 2 })) as Messages;
-  assert.deepEqual([latest.messages.map((m) => m.id), latest.more], [[3, 4], true]);
-  const older = (await post('support/alice/messages', { limit: 1, before: 3 })) as Messages;
+  assert.deepEqual([latest.messages.map((m) => m.id), latest.more], [ids.slice(-2), true]);
+  const older = (await post('support/alice/messages', { limit: 1, before: ids[3] })) as Messages;
   assert.deepEqual(older.messages, [said.messages[2]]);
 
   // A signal no one waits for is dropped: it approves nothing later.
@@ -209,7 +232,7 @@ try {
     await sleep(100);
   }
   // The cancelled turn is over: it ends cancelled, the agent does not go on
-  // (no refund), and the wait's tool call ends with an error.
+  // (no refund), and the wait's tool call, and the turn, end with the note.
   const attached = await fetch(`${INGRESS}/restate/invocation/${sent.invocationId}/attach`);
   assert.equal(attached.status, 409, await attached.text());
   assert.deepEqual(await post('support/grace/status'), { answering: null, waiting: [] });
@@ -218,8 +241,10 @@ try {
     ['user', 'Refund order 103'],
     ['assistant', 'orders_status({"order":"103"}): order 103: delivered'],
   ]);
-  assert.match(String(graces[2]?.[1]), /^wait_for_approval\(\{"order":"103"\}\): .*aborted/s);
-  assert.equal(graces.length, 3, JSON.stringify(graces));
+  assert.deepEqual(graces.slice(2), [
+    ['assistant', `wait_for_approval({"order":"103"}): ${CANCELLED}`],
+    ['assistant', CANCELLED],
+  ]);
 
   // A message as plain text, as `curl -d` sends it.
   await post('support/carol/signal', { name: 'approval', value: 'approved', keep: true });
@@ -310,10 +335,12 @@ try {
   await pat.signal({ name: 'approval', value: 'approved', keep: true });
   assert.match(await pat.chat('Refund order 103'), /refunded 103$/);
   assert.equal(lines((await pat.messages()).messages).length, 5);
-  // Its ids and cursors go on: a follower reads on, and drops what came before `first`.
+  // Its ids and cursors go on: a follower reads on, and drops what came before
+  // `first`, which is past every id before (the stopped turn's close took some
+  // after `forgotten` was read).
   const anew = await pat.messages({ cursor: forgotten.cursor });
   assert.equal(anew.messages.length, 5);
-  assert.equal(anew.first, forgotten.messages.at(-1)!.id + 1);
+  assert.ok(anew.first! > forgotten.messages.at(-1)!.id, `${anew.first} after ${forgotten.messages.at(-1)!.id}`);
   assert.equal(anew.messages[0]!.id, anew.first);
 
   /** Post a delivery of `note` about `customer`, as delivery `id`, and wait until Restate has its message to the agent. */
@@ -405,6 +432,23 @@ try {
   );
   assert.deepEqual(last()?.parts[0], { type: 'text', text: 'order 103: delivered / approved / refunded 103' });
   assert.ok(seen.length < 20, `${seen.length} changes`);
+  // A sync that waited reads its page after the revision it returns: the
+  // change that ended its wait (here, the approval's result) is in it.
+  const olga = ingress.objectClient(agent('auditor'), 'olga');
+  const olgas = await ingress
+    .objectSendClient(agent('auditor'), 'olga')
+    .chat('audit the books', clients.rpc.sendOpts({ idempotencyKey: 'msg-olga' }));
+  await waits('auditor/olga');
+  const asOf = await olga.sync({});
+  const syncing = olga.sync({ cursor: asOf.cursor, revision: asOf.revision, timeoutSeconds: 30 });
+  await sleep(500); // the sync waits
+  await olga.signal({ name: 'approval', value: 'approved' });
+  const synced = await syncing;
+  assert.ok(synced.revision > asOf.revision, JSON.stringify(synced));
+  // (and what changed after it, if the turn went on: the next sync reads on from the cursor)
+  assert.deepEqual(lines(synced.messages)[0], ['assistant', 'audit({}): approved'], JSON.stringify(synced));
+  assert.equal(await ingress.result(olgas), 'Done: approved');
+
   // A watch with nothing new answers at its timeout, with the same revision.
   const mia = ingress.objectClient(agent('support'), 'mia');
   const now = await mia.notifications();

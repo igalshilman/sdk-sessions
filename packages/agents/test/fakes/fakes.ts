@@ -9,8 +9,6 @@
 // - @anthropic-ai/sdk, of the Claude agent: claude.ts;
 // - @langchain/openai and @langchain/anthropic: langgraph.ts;
 // - DeepSeek's provider plugin: deepseek.ts;
-// - @restatedev/agents/opencode/db, whose OpenCode gets the teller's plugin:
-//   opencode-db.ts.
 // Imports of the tellers' modules and of packages are left as they are.
 import { registerHooks } from 'node:module';
 
@@ -25,9 +23,7 @@ const packages: Record<string, string> = {
   '@deepseek-ai/dsh-llm-deepseek-api-key': fake('deepseek.ts'),
 };
 /** The fakes of @restatedev/agents's own modules, by URL. */
-const modules: Record<string, string> = {
-  [fake('../../src/opencode/db.ts')]: fake('opencode-db.ts'),
-};
+const modules: Record<string, string> = {};
 
 registerHooks({
   resolve(specifier, context, next) {

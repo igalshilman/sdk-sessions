@@ -1,21 +1,21 @@
 /**
  * A team of agents on different frameworks: an editor (pi) hands research to
- * a researcher (LangGraph) and drafting to a writer (OpenCode), and puts the
+ * a researcher (LangGraph) and drafting to a writer (Claude), and puts the
  * piece together.
  *
  * Each member is an agent of its own, keyed by the editor's key and the task
  * (`researcher/alice.lisbon`), with its own conversation: the editor can come
  * back to a task, and a crash anywhere resumes where it stopped.
  *
- *   OPENAI_API_KEY=… node intermediate/team.ts
+ *   OPENAI_API_KEY=… ANTHROPIC_API_KEY=… node intermediate/team.ts
  *   npx @restatedev/restate-server   # Restate, in another terminal
  *   npx @restatedev/restate deployments register http://localhost:9080
  *   curl localhost:8080/editor/alice/chat -d 'Write a short guide to Lisbon for a first visit.'
  *   curl localhost:8080/writer/alice.guide/messages   # what the editor asked the writer (the task's name may differ)
  */
 import { serve, subagent } from '@restatedev/agents';
+import * as claude from '@restatedev/agents/claude';
 import * as langgraph from '@restatedev/agents/langgraph';
-import * as opencode from '@restatedev/agents/opencode';
 import * as pi from '@restatedev/agents/pi';
 
 const researcher = langgraph.agent({
@@ -24,7 +24,7 @@ const researcher = langgraph.agent({
   system: 'You research a topic and answer with the facts that matter, as a short list.',
 });
 
-const writer = opencode.agent({
+const writer = claude.agent({
   name: 'writer',
   description: 'Drafts prose from notes',
   system: 'You write clear, warm prose from the notes you are given. Keep it short.',

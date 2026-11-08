@@ -3,8 +3,10 @@
  *
  * `pi.prompt` and `pi.chat` run pi-durable for you. When you need what they
  * leave out, such as extensions of your own, compaction or forks, run it
- * yourself. This lesson does what `pi.prompt` does, written out. Three
- * things make pi-durable durable inside a handler:
+ * yourself. This lesson does what `pi.prompt` does for pi-durable, written
+ * out (`pi.prompt` also keeps the agent's conversation of turns, which its
+ * `messages` view reads: this object has none). Three things make
+ * pi-durable durable inside a handler:
  *
  * - Its storage is the key's database: `openSqlKvStorage(ctx.db)`. Each
  *   pi-durable commit is an SQL transaction there.

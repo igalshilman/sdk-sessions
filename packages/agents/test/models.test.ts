@@ -3,10 +3,9 @@
 // caller waits. LangGraph's agent takes a chat model of its own, here one that
 // fails as a provider would.
 import * as restate from '@restatedev/restate-sdk';
-import { chatHandler, sessionObject, REFUSED, tool } from '@restatedev/agents';
+import { chatHandler, sessionObject, REFUSED, tool, UNANSWERED } from '@restatedev/agents';
 import * as deepseek from '@restatedev/agents/deepseek';
 import * as langgraph from '@restatedev/agents/langgraph';
-import * as opencode from '@restatedev/agents/opencode';
 import * as pi from '@restatedev/agents/pi';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
@@ -38,7 +37,6 @@ const answer = (model: Teller) => conversation(langgraph.chat({ model }), 'k').a
 describe('a wrong model', () => {
   it('that is not provider/model-id fails at the definition', () => {
     expect(() => pi.chat({ model: 'claude' })).toThrow(/not provider\/model-id/);
-    expect(() => opencode.chat({ model: 'claude' })).toThrow(/not provider\/model-id/);
   });
 
   it("of another provider fails at the definition, for an agent of one provider's models", () => {
@@ -73,9 +71,15 @@ describe('a wrong model', () => {
     const key = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;
     try {
-      const refused = conversation(pi.chat({ model: 'openai/gpt-4o-mini' }), 'k').attempt('inv1', 'Hi');
+      const c = conversation(pi.chat({ model: 'openai/gpt-4o-mini' }), 'k');
+      const refused = c.attempt('inv1', 'Hi');
       await expect(refused).rejects.toMatchObject({ code: REFUSED });
       await expect(refused).rejects.toThrow(/check the agent's model/);
+      // Closed as refused: retried (a crash right after its close), it fails
+      // as it did; the conversation says it went unanswered.
+      await expect(c.attempt('inv1', 'Hi')).rejects.toMatchObject({ code: REFUSED });
+      const { messages } = await c.read(pi.messages());
+      expect(messages.at(-1)!.parts).toEqual([{ type: 'text', text: UNANSWERED }]);
     } finally {
       if (key !== undefined) process.env.OPENAI_API_KEY = key;
     }

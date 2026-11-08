@@ -2,7 +2,7 @@
  * An assistant each user sets up as it runs: each user (the object's key)
  * picks its model and persona, kept in the object's database, which `chat`
  * reads for each message (`pi.chat(options)`, with options of the
- * invocation); `compact` has the model summarize the conversation so far, to
+ * invocation); `summarize` has the model summarize the conversation so far, to
  * keep its context short; and `reset` starts the conversation over, with a
  * note to carry on (both on pi's Harness directly, `withPi`).
  *
@@ -11,7 +11,7 @@
  *   npx @restatedev/restate deployments register http://localhost:9080
  *   curl localhost:8080/assistant/alice/configure --json '{"persona": "You answer as a pirate."}'
  *   curl localhost:8080/assistant/alice/chat -d 'What time is it?'
- *   curl localhost:8080/assistant/alice/compact --json '"Keep the times you were asked"'
+ *   curl localhost:8080/assistant/alice/summarize --json '"Keep the times you were asked"'
  *   curl localhost:8080/assistant/alice/reset --json '"Alice likes short answers"'
  *   curl localhost:8080/assistant/alice/messages
  *
@@ -61,7 +61,7 @@ const assistant = sessionObject({
     },
 
     /** Summarize the conversation so far, as `instructions` say, in place of it. */
-    compact: async (ctx, instructions?: string) =>
+    summarize: async (ctx, instructions?: string) =>
       pi.withPi(ctx, await options(ctx), async ({ conversation, context }) => {
         const root = await conversation();
         await root.compact(instructions || undefined, context);

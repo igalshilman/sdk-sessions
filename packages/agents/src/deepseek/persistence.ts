@@ -31,20 +31,13 @@ import {
   type SessionPersistenceCreateOptions,
   type SessionPersistenceSnapshot,
 } from '@deepseek-ai/dsh-session-persistence';
-import type { Database } from '@restatedev/sessions';
+import type { Database, DatabaseWriter } from '@restatedev/sessions';
 import { Schema } from '@restatedev/sessions/internal';
 
 const SCHEMA = new Schema('restate-agents.deepseek', [
   'CREATE TABLE restate_deepseek_sessions (id TEXT PRIMARY KEY, header TEXT NOT NULL, inherited INTEGER NOT NULL)',
   'CREATE TABLE restate_deepseek_events (session TEXT NOT NULL, seq INTEGER NOT NULL, event TEXT NOT NULL, PRIMARY KEY (session, seq))',
 ]);
-
-/** The stored events of session `id`, in order: for reading the log without a harness. */
-export async function storedEvents(db: Database, id: SessionId): Promise<SessionEvent[]> {
-  await SCHEMA.ensure(db);
-  const rows = await db.values('SELECT event FROM restate_deepseek_events WHERE session = ? ORDER BY seq', [id]);
-  return rows.map(([event]) => JSON.parse(String(event)) as SessionEvent);
-}
 
 /** A session as stored: its header, inherited prefix length and event count. */
 interface Stored {
@@ -65,6 +58,12 @@ export class SqlSessionPersistence extends SessionPersistence {
   created = new Map<SessionId, Omit<Stored, 'count'>>();
   handles = new Set<SqlSessionHandle>();
   abandoned = false;
+  /**
+   * What each flush's events are copied into beside the log, in the flush's
+   * transaction: the conversation of turns (index.ts), so that the copy and
+   * the log commit together.
+   */
+  copy: ((tx: DatabaseWriter, events: readonly SessionEvent[]) => Promise<void>) | undefined;
 
   /** `config.db`: the object's database (`ctx.db`). */
   constructor(ctx: Context, config: { db: Database }) {
@@ -268,6 +267,7 @@ class SqlSessionHandle implements SessionHandle {
             JSON.stringify(event),
           ]);
         }
+        if (this.#store.copy) await this.#store.copy(tx, batch);
       }),
     );
     if (created) this.#store.created.delete(this.id);

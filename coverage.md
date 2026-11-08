@@ -6,6 +6,13 @@ every suite passes. Lint 2m; TypeScript tests 1,015 (905 agents, 106 sessions,
 `concurrency` 8s, `tools` 12s, `crash` 2m47s with the server killed twice and
 the agents' process restarted up to 32 times.
 
+Since then, the agents moved onto one conversation of turns
+([packages/agents/docs/](packages/agents/docs/README.md)): 961 agents tests on
+8 November 2026 (OpenCode's left with it; new: the conversation, its views,
+the call records, a crash sweep on a made-up framework, and each framework's
+dead turns closed, never finished), and `crash` passes for the four
+frameworks the package keeps.
+
 ## Status (3 November 2026)
 
 The plan below is implemented:

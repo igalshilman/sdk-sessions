@@ -5,7 +5,7 @@ frameworks take it from there. A triage agent (pi) decides whether the issue
 is ready to build, and leads the work: it asks a planner (pi) for a
 plan, which comes back structured (a summary, and parts that can be built
 at once); it makes a Linear sub-issue for each part, and hands every part to
-a coder (OpenCode) of its own, all at once: each on a git branch of its
+a coder (pi) of its own, all at once: each on a git branch of its
 own, which it opens a pull request of, on GitHub. As each answers with its
 pull request, triage has a reviewer (pi) review it, which posts its
 review on the pull request; triage hands the changes it asks for back to the
@@ -49,13 +49,13 @@ stand-in, [`linear.ts`](linear.ts), with the same tools.
   │  │                      │ │ parser,    │ │ parser,    │  each review on them;      │
   │  │ replies with the     │ │ ENG-1.     │ │ ENG-1.     │  reviewers read them,      │
   │  │ plan, as JSON        │ │ history    │ │ history    │  and post their reviews    │
-  │  │ (its output,         │ │   OpenCode │ │         pi │  on them                   │
+  │  │ (its output,         │ │         pi │ │         pi │  on them                   │
   │  │  checked)            │ │            │ │            │                            │
   │  └──────────────────────┘ └─────┬──────┘ └─────┬──────┘                            │
   └─────────────────────────────────┼──────────────┼───────────────────────────────────┘
    each coder in a clone of its     │ push, PR     │ read, review
    own, on its own branch, with     ▼              ▼
-   OpenCode's read, edit, bash ┌───────────────────────────┐
+   pi's read, edit, bash  ┌───────────────────────────┐
                                │ GitHub: eng-1-parser and  │
                                │ eng-1-history, PRs → main │
                                └───────────────────────────┘
@@ -82,7 +82,7 @@ people to merge.
 ```
   time ──▶
 
-  Linear                     triage (pi), the parent   planner, reviewer   coders (OpenCode)
+  Linear                     triage (pi), the parent   planner, reviewer   coders (pi)
     │                               │                    (pi)           parser     history
   ENG-1  Backlog ──── webhook ─────▶│ reads it              │             │           │
     │◀── In Progress, comment: ─────┤                       │             │           │
@@ -309,7 +309,7 @@ pull requests and the reviews. It changes nothing.
   (`output`), the subagent call's return value, not text to parse.
 - **A conversation between agents, led by their parent**: triage takes a
   coder's pull request to the reviewer, and its review back to the coder,
-  word for word (OpenCode and pi), round by round, each in the same task
+  word for word (pi), round by round, each in the same task
   every time, so the coder knows its work, and the reviewer its last review.
   On GitHub, the pull request shows the conversation: each review, and the
   coder's answer to it, point by point.
@@ -330,6 +330,6 @@ pull requests and the reviews. It changes nothing.
   comment: what was built, how to run it, whether each pull request is
   approved, and what is left open.
 - **MCP tools in any agent**: `mcpTools(url)` turns an MCP server's tools
-  into `tool()`s, which pi and OpenCode take alike. A tool call is
+  into `tool()`s, which every framework takes alike. A tool call is
   stored once it is done; a crash makes again only one that had not
   finished (moving an issue twice is harmless; a comment may show twice).

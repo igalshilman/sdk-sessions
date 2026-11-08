@@ -113,9 +113,15 @@ export const tool = <S extends z.ZodObject>(options: {
  * the tool call runs (see calls.ts): it gets the id of the call, which an
  * earlier attempt may have made, and so its idempotency key.
  */
-async function once<T>(name: string, input: unknown, context: ToolCall, body: (call: ToolContext) => Promise<T>) {
+async function once<T>(
+  name: string,
+  input: unknown,
+  context: ToolCall,
+  body: (call: ToolContext) => Promise<T>,
+  options?: { rejoin?: boolean; approval?: boolean },
+) {
   const { ctx } = context;
-  const call = await callOf(ctx, name, input, context.callId);
+  const call = await callOf(ctx, name, input, context.callId, options);
   try {
     const result = await body({ ctx, callId: call.id, idempotencyKey: `${ctx.request.id}:${call.id}` });
     await call.answered();
@@ -334,10 +340,51 @@ export const signal = (name: string, options: { description: string; input?: z.Z
     name: options.name ?? `wait_for_${name}`,
     description: options.description,
     input: z.object(options.input?.shape ?? {}),
-    run: async (input, context) =>
-      once(`signal/${name}`, input, context, async ({ ctx, idempotencyKey: id }) =>
-        ctx
-          .rpc(signals, signalsOf(ctx), { idempotencyKey: id })
-          .wait({ id, name, ...(options.input ? { input } : {}) }),
-      ),
+    run: async (input, context) => wait(context, name, input, { shown: options.input !== undefined }),
   });
+
+/**
+ * Wait for signal `name` as tool call `toolCall`, once however often it runs;
+ * `pending` shows `input` if `shown`. `rejoin` and `approval` are
+ * {@link callOf}'s.
+ */
+const wait = (
+  toolCall: ToolCall,
+  name: string,
+  input: unknown,
+  { shown, rejoin, approval }: { shown: boolean; rejoin?: boolean; approval?: boolean },
+): Promise<unknown> =>
+  once(
+    `signal/${name}`,
+    input,
+    toolCall,
+    async ({ ctx, idempotencyKey: id }) =>
+      ctx.rpc(signals, signalsOf(ctx), { idempotencyKey: id }).wait({ id, name, ...(shown ? { input } : {}) }),
+    { rejoin, approval },
+  );
+
+/**
+ * Wait for the signal `name` to the agent, for the model's tool call
+ * `callId`, and answer with its value: what a {@link signal} tool does, for
+ * a framework whose own tool calls wait for something outside (an approval,
+ * say). The wait's id is `<invocation id>:<call id>`; `pending` lists it
+ * (with `input`, if given), and `signal` resolves it. It is opened once
+ * however often the tool call runs, and a crash goes on waiting on it.
+ *
+ * The wait is the tool call's alone: the framework stored its tool call
+ * before it waits, so a retried attempt waits again under the same id. A new
+ * call with the same input (the model asking again, after the first's
+ * answer) waits anew, as its answer is not the earlier call's.
+ *
+ * With `approval`, the tool call runs only after the wait: the wait's
+ * answer is not the call's, so a turn stopped before the call's result is
+ * stored reports the call as not done, rather than done.
+ */
+export const waitFor = (
+  ctx: restate.SessionContext,
+  callId: string,
+  name: string,
+  input?: unknown,
+  { approval = false }: { approval?: boolean } = {},
+): Promise<unknown> =>
+  wait({ ctx, callId }, name, input ?? null, { shown: input !== undefined, rejoin: false, approval });

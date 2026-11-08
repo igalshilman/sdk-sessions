@@ -6,6 +6,7 @@
 // The module stands in for @anthropic-ai/sdk (see fakes.ts): its default
 // export is a client of the teller, whatever its options.
 import { Anthropic } from '@anthropic-ai/sdk/client';
+import { createHash } from 'node:crypto';
 
 type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 type Message = Anthropic.Beta.Messages.BetaMessage;
@@ -38,9 +39,9 @@ export function reply(messages: MessageParam[]): Message {
   if (Array.isArray(last.content) && last.content.some((c) => c.type === 'tool_result')) {
     return message([{ type: 'text', text: `Done: ${text}` }]);
   }
-  // A tool call id, unique in the conversation, and the same when a step is
-  // run again.
-  const id = `toolu_${messages.length}`;
+  // A tool call id, unique in the conversation (as a model's), and the same
+  // when a step is run again: of the request.
+  const id = `toolu_${createHash('sha256').update(JSON.stringify(messages)).digest('hex').slice(0, 12)}`;
   const move = /move (\d+) from (\d+) to (\d+)/i.exec(text);
   if (move) {
     const [amount, from, to] = move.slice(1).map(Number);

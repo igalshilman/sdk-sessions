@@ -1,8 +1,22 @@
 // Virtual objects set up for SQL and agents.
 import * as restate from '@restatedev/sessions';
 import { reset } from '@restatedev/sessions/internal';
-import { cleared, isAgent, type Messages, type MessagesRequest, refusalOf, type Turn } from './common.ts';
-import * as log from './log.ts';
+import {
+  type Answering,
+  BUDGET,
+  checkWindow,
+  cleared,
+  isAgent,
+  ITEMS,
+  type Messages,
+  type MessagesRequest,
+  publish,
+  refusalOf,
+  type Summarize,
+  WINDOW,
+  type Window,
+} from './common.ts';
+import { compact, type Items, nextStart, restart, SCHEMA, settle } from './conversation.ts';
 import {
   type Notifications,
   type Resolved,
@@ -27,7 +41,7 @@ const OPTIONS = {
 /** What an object is doing: the message it answers, if any, and what its tools wait for. */
 export interface Status {
   /** The message being answered (by a `chat` handler), or null. */
-  answering: Turn | null;
+  answering: Answering | null;
   /** The waits of its tools, oldest first (see `pending`). */
   waiting: Waiting[];
 }
@@ -72,7 +86,7 @@ const WAITS = { inactivityTimeout: { minutes: 5 } } satisfies restate.HandlerOpt
  * waits, `status`, what the object is doing, `stop`, which stops the message
  * it answers, and `notifications` and `watch`, the revision of its
  * conversation, and a wait for a newer one (an agent's
- * has `clear` and `sync` too: {@link followed}). Each asks the object's
+ * has `clear` and `sync` too: {@link FOLLOWED}). Each asks the object's
  * `signals` companion, which knows what the object does: they run while the
  * object's handler works.
  */
@@ -107,12 +121,12 @@ const BUILT_IN = {
  * conversation by sending each answer's `revision` and `cursor` back, at
  * once while it has `more`.
  */
-const followed = (messages: (ctx: restate.ViewContext, request: MessagesRequest) => Promise<Messages>) => ({
+const FOLLOWED = {
   /**
    * Forget the conversation: stop the message being answered (as `stop`),
    * then empty the key's database, and what its `signals` hold (waits and
-   * kept signals). The log's ids and cursors go on (see
-   * log.ts), so a follower reads on, and drops the messages before `first`.
+   * kept signals). The conversation's ids and cursors go on (see
+   * conversation.ts), so a follower reads on, and drops the messages before `first`.
    * A message sent before it is answered first, then forgotten too; one sent
    * after starts anew.
    */
@@ -134,43 +148,72 @@ const followed = (messages: (ctx: restate.ViewContext, request: MessagesRequest)
     ...WAITS,
     handler: async (
       ctx: restate.ViewContext,
-      { cursor = 0, revision, timeoutSeconds = 50, limit = 100 }: SyncRequest = {},
+      { cursor = 0, revision, timeoutSeconds = 50, limit = 100, view }: SyncRequest = {},
     ): Promise<Synced> => {
       if (revision !== undefined) await companion(ctx, 'watch').watch({ revision, timeoutSeconds });
       // The revision first: a change after it shows in the next sync. Then
-      // what the object does, and its conversation, as they are now.
+      // what the object does, and its conversation, in an invocation of its
+      // own, which starts after the revision: a view reads the database as
+      // committed when it started, and this one started before the revision
+      // (by the whole wait, when it waited). So the page has every change the
+      // revision counts.
       const now = await companion(ctx).notifications();
       const status = await companion(ctx).status();
-      return { revision: now.revision, status, ...(await messages(ctx, { cursor, limit })) };
+      const request: MessagesRequest = { cursor, limit, ...(view ? { view } : {}) };
+      const page = (await ctx.rpc({
+        service: ctx.request.target.service,
+        key: ctx.key,
+        handler: 'messages',
+        input: request,
+      })) as Messages;
+      return { revision: now.revision, status, ...page };
     },
   },
-});
+};
 
 /**
  * The agents' handlers that only their own views call (Restate's ingress
  * refuses them), and their types leave out: `erase`, `clear`'s work, once
  * the handlers before it are done. It empties the key's database and its
- * signals', and the log goes on where it got to (see log.ts).
+ * signals', and the conversation's ids and cursors go on where they got to
+ * (conversation.ts).
  */
-const INTERNAL = {
+const internal = (items: Items<unknown> | undefined) => ({
   erase: {
     ingressPrivate: true,
     handler: async (ctx: restate.SessionContext) => {
-      const start = startAfter(await log.page(ctx.db, { limit: 1 }));
+      // Read first, which also makes the reset apply the conversation's schema again.
+      await SCHEMA.ensure(ctx.db);
+      const start = await nextStart(ctx.db);
       await ctx.db.transaction(async (tx) => {
         await reset(tx);
-        await log.restart(tx, start);
+        await restart(tx, start);
       });
       await cleared(ctx);
       await ctx.rpc(signals, signalsOf(ctx), { idempotencyKey: `${ctx.request.id}:reset` }).reset();
     },
   },
-};
-
-/** Where the log starts after `latest`, its latest message: past its ids and cursor. */
-const startAfter = ({ messages: [latest], cursor, first = 0 }: Messages): log.Start => ({
-  seq: cursor,
-  id: latest ? latest.id + 1 : first,
+  /**
+   * Close the latest turn, unanswered, if invocation `invocationId` ran it
+   * and is gone: the companion sends this once it finds the turn's
+   * invocation ended without answering (killed, say), so that the
+   * conversation shows the turn closed before the next message. Whether it
+   * closed it.
+   */
+  settle: {
+    ingressPrivate: true,
+    handler: async (ctx: restate.SessionContext, invocationId: string) => {
+      if (!items || !(await settle(ctx, items, invocationId))) return false;
+      // The companion published as it closed the turn, before this stored how it ended: publish that too.
+      await publish(ctx);
+      return true;
+    },
+  },
+  /** Summarize the earliest turns, past the agent's budget. Whether it did. */
+  compact: {
+    ingressPrivate: true,
+    handler: async (ctx: restate.SessionContext) => (items ? compact(ctx, items) : false),
+  },
 });
 
 /**
@@ -179,6 +222,8 @@ const startAfter = ({ messages: [latest], cursor, first = 0 }: Messages): log.St
  * `revision`, if given, or at `timeoutSeconds` (default 50, at most 60).
  */
 export interface SyncRequest {
+  /** The messages' view: `full` (the default), or `summary` (see `MessagesRequest`). */
+  view?: MessagesRequest['view'];
   cursor?: number;
   revision?: number;
   timeoutSeconds?: number;
@@ -203,6 +248,20 @@ export interface Definition<P extends string> {
    * sees each turn once it ended. `messages` has every turn as before.
    */
   background?: boolean;
+  /**
+   * For an agent on the conversation of turns: how many of the latest
+   * answered turns its model sees whole, with their tool calls and results
+   * (default 1), or `'all'`.
+   */
+  window?: Window;
+  /** For an agent on the conversation of turns: how many tokens of the turns before the window its model sees (default 32 000). */
+  budget?: number;
+  /**
+   * For an agent on the conversation of turns: how it summarizes the turns
+   * before the window once they outgrow `budget`, in an invocation of its
+   * own (`compact`), after the answer. Without, they are only left out.
+   */
+  summarize?: Summarize;
 }
 
 /** Each entry's function, as clients see it; none for entries left out. */
@@ -211,13 +270,13 @@ type Functions<H> = string extends keyof H ? unknown : { [K in keyof H]: H[K] ex
 /** The names of the handlers and views every object (or agent) has, which its own cannot take. */
 type Reserved = {
   [
-    name in keyof typeof BUILT_IN | keyof ReturnType<typeof followed> | keyof typeof INTERNAL
+    name in keyof typeof BUILT_IN | keyof typeof FOLLOWED | keyof ReturnType<typeof internal>
   ]?: 'a handler every object has: name yours otherwise';
 };
 
 /** What an object with `handlers` and `views` has: those of every object, an agent's `clear` and `sync`, and its own. */
 type With<H, V> = Functions<typeof BUILT_IN> &
-  (V extends { messages: unknown } ? Functions<ReturnType<typeof followed>> : unknown) &
+  (V extends { messages: unknown } ? Functions<typeof FOLLOWED> : unknown) &
   Functions<H> &
   Functions<V>;
 
@@ -245,8 +304,7 @@ type With<H, V> = Functions<typeof BUILT_IN> &
  * `schema`, optional: tables of your own, beside the agent's (which are its
  * own business), made in each key's database as a session object makes
  * them. Any name is yours but those starting with `restate_`, the agent's
- * (`restate_pi_tasks`, `restate_claude_messages`, `restate_agent_log`...);
- * OpenCode's tables are in a database of their own.
+ * (`restate_pi_tasks`, `restate_agent_turns`, `restate_agent_items`...).
  *
  * `options` and `metadata` add to (or replace) the ones set here, such as
  * `options: { retryPolicy: ... }`.
@@ -264,11 +322,12 @@ export const sessionObject = <
   },
 ): restate.VirtualObjectDefinition<P, With<H, V>> => {
   const { name, description, schema, background, handlers = {}, views = {}, metadata, options } = definition;
-  const own = [
-    ...Object.keys(BUILT_IN),
-    ...Object.keys(followed(async () => ({}) as Messages)),
-    ...Object.keys(INTERNAL),
-  ];
+  const { window = WINDOW, budget = BUDGET, summarize } = definition;
+  checkWindow(window);
+  if (!(Number.isInteger(budget) && budget >= 0)) {
+    throw new Error(`${name}: budget must be a number of tokens (0 or more), not ${JSON.stringify(budget)}`);
+  }
+  const own = [...Object.keys(BUILT_IN), ...Object.keys(FOLLOWED), ...Object.keys(internal(undefined))];
   if ('messages' in handlers) {
     throw new Error(`${name}: \`messages\` is a view: put it in \`views\`, so that the object is an agent`);
   }
@@ -287,19 +346,33 @@ export const sessionObject = <
   const page = (typeof messages === 'function' ? messages : messages?.handler) as
     | ((ctx: restate.ViewContext, request: MessagesRequest) => Promise<Messages>)
     | undefined;
-  const agent = page === undefined ? {} : followed(page);
+  const agent = page === undefined ? {} : FOLLOWED;
+  // A framework on the conversation of turns: its view carries its items.
+  const items = (page && ITEMS.of(page)) as Items<unknown> | undefined;
+  // Its `compact` summarizes: without the conversation of turns, it has none, and nothing would.
+  if (summarize && !items) {
+    throw new Error(
+      `${name}: \`summarize\` needs the conversation of turns: a framework's \`messages\` view (\`claude.messages()\`, say)`,
+    );
+  }
+  const { erase, ...stored } = internal(items);
+  const privates: Record<string, restate.Entry<restate.SessionContext>> = messages === undefined
+    ? {}
+    : items
+      ? { erase, ...stored }
+      : { erase };
   return withCompanion(
     isAgent(
       restate.sessionObject({
         name,
         description,
         schema,
-        handlers: { ...(messages === undefined ? {} : INTERNAL), ...yours },
+        handlers: { ...privates, ...yours },
         views: { ...BUILT_IN, ...agent, ...views },
         metadata,
         options: { ...OPTIONS, ...options },
       }),
-      { background, messages },
+      { background, messages, items, window, budget, summarize },
     ),
   );
 };

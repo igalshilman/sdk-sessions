@@ -12,7 +12,7 @@
 import type * as restate from '@restatedev/sessions';
 import { sessionObject, signals } from '@restatedev/agents';
 import { Type } from '@earendil-works/pi-ai';
-import { defineTool } from '@earendil-works/pi-durable';
+import { defineTool, type ToolRegistration } from '@earendil-works/pi-durable';
 import { serveIfMain } from '@restatedev/sessions/test/faults';
 import { ledger } from '@restatedev/sessions/test/ledger';
 import * as pi from '@restatedev/agents/pi';
@@ -55,8 +55,11 @@ const audit = (ctx: restate.SessionContext) =>
     },
   });
 
+/** The bank tools of an invocation. */
+export const tools = (ctx: restate.SessionContext): [ToolRegistration, ToolRegistration] => [transfer(ctx), audit(ctx)];
+
 /** Answer a message, once per invocation. */
-export const prompt = pi.chat((ctx) => ({ tools: [transfer(ctx), audit(ctx)] }));
+export const prompt = pi.chat((ctx) => ({ tools: tools(ctx) }));
 
 export const agent = sessionObject({ name: 'Agent', handlers: { chat: prompt }, views: { messages: pi.messages() } });
 

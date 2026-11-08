@@ -1,12 +1,11 @@
 // What the frameworks share: their options (`Configure`, the model), the
 // ids of an invocation's prompts, the `chat` handler with its turn (status,
-// cancellation, publishing for the clients that follow it), and
-// the `messages` handler with its `Transcript`.
+// cancellation, publishing for the clients that follow it), and what the
+// conversation of turns (conversation.ts) takes: its notes, window and
+// budget.
 import * as restate from '@restatedev/sessions';
 import { cancelCalls, cancelled, definitionOf, Link, ScopeKey } from '@restatedev/sessions/internal';
-import { settle } from './calls.ts';
-import * as log from './log.ts';
-import type { Said } from './log.ts';
+import { settleCalls } from './calls.ts';
 import { signals, signalsOf } from './signals.ts';
 
 /**
@@ -36,7 +35,7 @@ export const nextPromptId = (ctx: restate.SessionContext) => {
   return n === 1 ? ctx.request.id : `${ctx.request.id}:${n}`;
 };
 
-/** The default model of pi, OpenCode and LangGraph, with OPENAI_API_KEY. */
+/** The default model of pi and LangGraph, with OPENAI_API_KEY. */
 export const DEFAULT_MODEL = 'openai/gpt-6-sol';
 
 /** The default model of Claude agents, with ANTHROPIC_API_KEY. */
@@ -124,8 +123,61 @@ export const CANCELLED = 'Cancelled: the turn was stopped before it finished.';
  */
 export const UNANSWERED = "Unanswered: the model's provider refused the request.";
 
+/**
+ * What a turn whose invocation ended without answering it (killed, say)
+ * answers, and each tool call it cut off: the next message, or the companion
+ * once it finds the invocation gone (`settle`), closes it with this.
+ */
+export const ENDED = 'Ended: the turn ended before it finished, and was not answered.';
+
+/** The result of a tool call a stopped turn cut off once its Restate call had answered: it happened. */
+export const RETURNED_UNRECORDED =
+  "Done, but the turn was stopped before this call's result was recorded: it did happen, so check its effect before doing it again.";
+
+/**
+ * What a stopped turn records as the result of its tool call `callId`, which
+ * has none: `text` (cancelled, say), unless the call's Restate call answered
+ * (`outcomes` of calls.ts), which the model would take for undone, and do
+ * again: then the error it answered with, or {@link RETURNED_UNRECORDED}.
+ */
+export function cutOffResult(outcomes: ReadonlyMap<string, string | undefined>, callId: string, text: string) {
+  if (!outcomes.has(callId)) return text;
+  return outcomes.get(callId) ?? RETURNED_UNRECORDED;
+}
+
+/** How many of the latest answered turns the model sees whole (with their tool calls and results), or `'all'`. */
+export type Window = number | 'all';
+
+/** The window by default: the previous turn's tool calls and results stay in view, for a follow-up. */
+export const WINDOW: Window = 1;
+
+/** How many tokens of the turns before the window the model sees, by default, counted as 4 characters each. */
+export const BUDGET = 32_000;
+
+/** How an agent summarizes earlier turns: from the request ({@link SUMMARIZE} and the turns, as text) to the summary. */
+export type Summarize = (ctx: restate.SessionContext, request: string) => Promise<string>;
+
+/** What a request to summarize earlier turns starts with, before the turns themselves. */
+export const SUMMARIZE =
+  "Summarize the conversation below, for the assistant who carries it on: keep the facts, names, numbers, decisions, the user's preferences, and what is still open. Answer with the summary only.\n\n";
+
+/**
+ * What a turn checks its answer with: nothing if the answer is what was
+ * asked for, else the message that asks the model again, once, within the
+ * turn (`answerOnce`'s `check`).
+ */
+export type Check = (answer: string) => string | undefined;
+
+/** `window`, if it is one: a whole number of turns (0 or more), or `'all'`. */
+export function checkWindow(window: Window): Window {
+  if (window !== 'all' && !(Number.isInteger(window) && window >= 0)) {
+    throw new Error(`window must be a number of turns (0 or more) or 'all', not ${JSON.stringify(window)}`);
+  }
+  return window;
+}
+
 /** The message a `chat` handler is answering: its invocation, and when it started. */
-export interface Turn {
+export interface Answering {
   /** The invocation's id: `/restate/invocation/<id>/attach` waits for its answer. */
   invocationId: string;
   /** When it started, as an ISO date. */
@@ -161,21 +213,35 @@ export const stopSignalOf = (ctx: restate.SessionContext): AbortSignal | undefin
 /** What `clear` also empties, beside the agent's database. */
 type Clear = (ctx: restate.SessionContext) => Promise<void>;
 
-/** An agent's own: whether it runs in the background (`background: true`: no one follows it as it works), and what its `clear` also empties. */
-interface Agent {
+/**
+ * An agent's settings: whether it runs in the background (`background:
+ * true`: no one follows it as it works), what its `clear` also empties, and,
+ * for an agent on the conversation of turns (conversation.ts), its
+ * framework's items, how much of the conversation its model sees (`window`
+ * and `budget`), and how it summarizes the earliest turns (`summarize`).
+ */
+export interface Settings {
   background: boolean;
   clear?: Clear;
+  /** The items of its framework, if it keeps the conversation of turns (its `messages` view is `conversationView`'s). */
+  items?: object;
+  window: Window;
+  budget: number;
+  summarize?: Summarize;
 }
 
-/** An agent's own, on its definition. */
-const AGENT = new Link<Agent>('an agent');
+/** An agent's settings, on its definition. */
+const AGENT = new Link<Settings>('an agent');
 
 /** What a framework's `messages` view clears beside the agent's database: see {@link alsoClearing}. */
 const CLEARS = new Link<Clear>('alsoClearing');
 
+/** The items of a framework's `messages` view on the conversation of turns. */
+export const ITEMS = new Link<object>('restate-agents.items');
+
 /**
  * The `messages` view `view` of a framework that keeps a conversation apart
- * (OpenCode, in a database of its own): `clear` empties it too, as an agent
+ * (in a database of its own, say): `clear` empties it too, as an agent
  * with this view is cleared.
  */
 export const alsoClearing = <V extends object>(view: V, clear: Clear) => {
@@ -183,21 +249,40 @@ export const alsoClearing = <V extends object>(view: V, clear: Clear) => {
 };
 
 /**
- * `definition` is an agent's: whether it runs in the background, and its
- * `messages` view, whose clearing (`alsoClearing`) its `clear` does too.
+ * `definition` is an agent's, with these settings: its `messages` view gives
+ * what its `clear` also empties (`alsoClearing`), and its framework's items,
+ * if it is on the conversation of turns.
  */
 export const isAgent = <D extends object>(
   definition: D,
-  { background = false, messages = undefined as object | undefined },
+  {
+    background = false,
+    messages = undefined as object | undefined,
+    items = undefined as object | undefined,
+    window = WINDOW as Window,
+    budget = BUDGET,
+    summarize = undefined as Summarize | undefined,
+  },
 ) => {
-  return AGENT.on(definition, { background, clear: messages && CLEARS.of(messages) });
+  return AGENT.on(definition, {
+    background,
+    clear: messages && CLEARS.of(messages),
+    items,
+    window,
+    budget,
+    summarize,
+  });
 };
 
-/** The agent of `ctx`'s own (see {@link isAgent}). */
+/** The settings of the agent of `ctx`, if it is one. */
 const agentOf = (ctx: restate.SessionContext) => {
   const definition = definitionOf(ctx);
   return definition && AGENT.of(definition);
 };
+
+/** The settings of the agent of `ctx`: the defaults, for an object that is no agent. */
+export const settingsOf = (ctx: restate.SessionContext): Settings =>
+  agentOf(ctx) ?? { background: false, window: WINDOW, budget: BUDGET };
 
 /** Clear what the agent of `ctx` keeps beside its database. */
 export const cleared = async (ctx: restate.SessionContext) => agentOf(ctx)?.clear?.(ctx);
@@ -209,14 +294,15 @@ const unfollowed = (ctx: restate.SessionContext) => agentOf(ctx)?.background ===
 const signalsOfAgent = (ctx: restate.SessionContext) => ctx.rpc(signals, signalsOf(ctx));
 
 /**
- * The conversation of `ctx` changed (see `watch` in object.ts): its log takes
- * the change (while a framework answers: {@link transcribing}), its revision
- * increases, and the clients that follow it read it again. It is a call to
- * Restate, so it also sends what the handler wrote before, for them to read.
+ * The conversation of `ctx` changed (see `watch` in object.ts): its revision
+ * increases, and the clients that follow it read it again; while a framework
+ * answers ({@link answering}), the calls whose results it stored are
+ * forgotten first. It is a call to Restate, so it also sends what the
+ * handler wrote before, for them to read.
  */
-const publish = async (ctx: restate.SessionContext) => {
-  const read = READING.get(ctx);
-  if (read) await logged(ctx, read);
+export const publish = async (ctx: restate.SessionContext) => {
+  const stored = ANSWERING.get(ctx);
+  if (stored) await settled(ctx, stored);
   await signalsOfAgent(ctx).publish();
 };
 
@@ -233,16 +319,56 @@ const stepped = async (ctx: restate.SessionContext) => {
  */
 export async function toolCallStarted(ctx: restate.SessionContext) {
   if (!unfollowed(ctx)) return publish(ctx);
-  const read = READING.get(ctx);
-  if (read) {
-    const transcript = await read();
-    await settle(ctx, (id, failed) => transcript.answered(id, failed));
-  }
+  const stored = ANSWERING.get(ctx);
+  if (stored) await settled(ctx, stored);
 }
 
 /** A tool call of the turn of `ctx` (a `chat` handler's) ended: {@link publish} it, unless the agent runs in the background. */
 export async function toolCallEnded(ctx: restate.SessionContext) {
   await stepped(ctx);
+}
+
+/** Whether a tool call's result is stored: `stored(callId, failed)`, `failed` the error the call answered with. */
+export type Stored = (callId: string, failed?: string) => boolean;
+
+/** What the attempt's turn has stored, while it answers (see {@link answering}). */
+const ANSWERING = new ScopeKey<Stored>('answering');
+
+/** The attempt's latest settling of calls: one after another, as parallel tool calls publish at once. */
+const SETTLING = new ScopeKey<Promise<void>>('settling');
+
+/** Forget the calls whose results the conversation stored (calls.ts), after any settling before. */
+function settled(ctx: restate.SessionContext, stored: Stored): Promise<void> {
+  const settle = () => settleCalls(ctx, stored);
+  const done = (SETTLING.get(ctx) ?? Promise.resolve()).then(settle, settle);
+  SETTLING.set(ctx, done);
+  return done;
+}
+
+/**
+ * Run `work`, a framework's turn on the conversation of turns, forgetting
+ * the calls whose results it stores as it goes: each publish while it runs
+ * (a tool call's start and end), and its end, forget the Restate calls of
+ * the tool calls whose results `stored` says are stored (calls.ts).
+ */
+export async function answering<T>(ctx: restate.SessionContext, stored: Stored, work: () => Promise<T>): Promise<T> {
+  const outer = ANSWERING.get(ctx);
+  ANSWERING.set(ctx, stored);
+  let failed = false;
+  try {
+    return await work();
+  } catch (error) {
+    failed = !(error instanceof restate.TerminalError);
+    throw error;
+  } finally {
+    try {
+      // A failed attempt stores nothing more: its retry runs again.
+      if (!failed) await settled(ctx, stored);
+    } finally {
+      if (outer) ANSWERING.set(ctx, outer);
+      else ANSWERING.delete(ctx);
+    }
+  }
 }
 
 /** A promise that rejects with `signal`'s reason once it aborts. */
@@ -259,7 +385,7 @@ export const aborted = (signal: AbortSignal) =>
  *   curl localhost:8080/assistant/alice/chat -d 'Hi'
  *   curl localhost:8080/assistant/alice/chat --json '"Hi"'
  *
- * While it answers, the object's `status` says so (its {@link Turn}). Its
+ * While it answers, the object's `status` says so (its {@link Answering}). Its
  * invocation's cancellation (Restate's, explicit: `cancelled(ctx)` of
  * @restatedev/sessions/internal) aborts {@link stopSignalOf} its
  * context, whenever it comes, and cancels the calls its tools made
@@ -278,14 +404,19 @@ export const chatHandler = <A = string>(answer: (ctx: restate.SessionContext, me
   handler: async (ctx: restate.SessionContext, text: string): Promise<A> => {
     const invocationId = ctx.request.id;
     // The companion knows the turn from here to its close: `status` and `stop` ask it.
-    await ctx.rpc(signals, signalsOf(ctx)).start({ invocationId, since: new Date().toISOString() });
+    // An agent on the conversation of turns has `settle`: the companion sends it
+    // this turn, should its invocation be gone without closing it.
+    const settles = agentOf(ctx)?.items !== undefined;
+    await ctx
+      .rpc(signals, signalsOf(ctx))
+      .start({ invocationId, since: new Date().toISOString(), ...(settles ? { settles } : {}) });
     await stepped(ctx);
     // The log takes the turn's last change, then the companion closes the
     // turn, which publishes it: one revision. The close is a call the turn
     // waits for, so that it is done before the turn ends (see `awaitTurn`).
     const end = async () => {
-      const read = READING.get(ctx);
-      if (read) await logged(ctx, read);
+      const stored = ANSWERING.get(ctx);
+      if (stored) await settled(ctx, stored);
       await signalsOfAgent(ctx).close(invocationId);
     };
     const turn = new AbortController();
@@ -386,13 +517,20 @@ export function refusal(error: unknown): restate.TerminalError | undefined {
 }
 
 /**
- * A prompt's stored answer, as the prompt returns it: {@link UNANSWERED},
- * stored as its provider refused it, fails as the prompt did then
- * ({@link REFUSED}), also in a retry after a crash right after it was stored.
+ * A prompt's stored answer, as the prompt returns it, by how its turn ended
+ * (`status`): a turn refused ({@link UNANSWERED}) fails with
+ * {@link REFUSED}, one failed for good with its error, one cancelled with
+ * the cancellation, one another invocation ended with its note; so that a
+ * retry after a crash right after the close fails as the prompt did.
  */
-export function storedAnswer(answer: string): string {
-  if (answer !== UNANSWERED) return answer;
-  throw new restate.TerminalError(`the model's provider refused the request: ${CHECK_MODEL}`, { errorCode: REFUSED });
+export function storedAnswer(answer: string, status = 'answered'): string {
+  if (status === 'refused') {
+    throw new restate.TerminalError(`the model's provider refused the request: ${CHECK_MODEL}`, { errorCode: REFUSED });
+  }
+  if (status === 'cancelled') throw new restate.CancelledError();
+  if (status === 'failed') throw new restate.TerminalError(answer.replace(/^Error: /, ''));
+  if (status === 'ended') throw new restate.TerminalError(answer);
+  return answer;
 }
 
 /** A message of a conversation, as an agent's `messages` handler returns it. */
@@ -418,6 +556,12 @@ export type Part =
  * follow it.
  */
 export interface MessagesRequest {
+  /**
+   * `full` (the default): every message, with its tool calls; `summary`:
+   * each turn's message of the user and its answer, under the ids they have
+   * in the full view.
+   */
+  view?: 'full' | 'summary';
   /** At most this many messages (default 50). */
   limit?: number;
   /** The messages before this one (its `id`): older ones, such as for scrolling back. */
@@ -443,130 +587,3 @@ export interface Messages {
    */
   first?: number;
 }
-
-/**
- * A conversation as `messages` gives it, built from a framework's transcript:
- * each message is started by `say`, a tool call goes to the assistant's
- * message, and its result to its call. Messages without parts are left out.
- *
- * A message, once given out by `messages()`, is never changed: a change
- * makes a new one in its place. So a framework can keep its transcript and
- * add to it as its conversation grows, and the log stores only the messages
- * that are not the ones it stored last (see log.ts).
- */
-export class Transcript {
-  #messages: Said[] = [];
-  /** The message of each tool call, by the call's id: its index. */
-  #calls = new Map<string, number>();
-
-  /** A new message of `role`, with `text` if there is any. */
-  say(role: ChatMessage['role'], text = '') {
-    this.#messages.push({ role, parts: text.trim() ? [{ type: 'text', text }] : [] });
-  }
-
-  /** Tool call `id` of the assistant's message. */
-  call(id: string, name: string, input: unknown) {
-    if (this.#messages.at(-1)?.role !== 'assistant') this.say('assistant');
-    const at = this.#messages.length - 1;
-    this.#change(at, (parts) => [...parts, { type: 'tool', id, name, input }]);
-    this.#calls.set(id, at);
-  }
-
-  /** The output of tool call `id`; an error's if the framework says so, or it is a tool's `Error: <message>`. */
-  result(id: string, output: string, error = false) {
-    const at = this.#calls.get(id);
-    if (at === undefined) return;
-    const failed = error || output.startsWith('Error: ');
-    this.#change(at, (parts) =>
-      parts.map((p) => (p.type === 'tool' && p.id === id ? { ...p, output, ...(failed ? { error: true } : {}) } : p)),
-    );
-  }
-
-  /**
-   * Whether tool call `id` has its output: not an error's, unless it is
-   * `failed`, the error the call answered with.
-   */
-  answered(id: string, failed?: string) {
-    const at = this.#calls.get(id);
-    return (
-      at !== undefined &&
-      this.#messages[at]!.parts.some(
-        (p) => p.type === 'tool' && p.id === id && p.output !== undefined && (!p.error || p.output === failed),
-      )
-    );
-  }
-
-  /** Its messages, in order: those with parts. */
-  messages(): Said[] {
-    return this.#messages.filter((m) => m.parts.length > 0);
-  }
-
-  /** Message `at` with its parts as `change` makes them: a new message, in its place. */
-  #change(at: number, change: (parts: Part[]) => Part[]) {
-    const message = this.#messages[at]!;
-    this.#messages[at] = { ...message, parts: change(message.parts) };
-  }
-}
-
-/**
- * A framework's transcript as it stands, while it answers (see
- * {@link transcribing}): a new one, or the one it keeps and adds to.
- */
-export type Read = () => Promise<Transcript>;
-
-/** The transcript of the attempt's turn, while it answers. */
-const READING = new ScopeKey<Read>('transcribing');
-
-/** The attempt's log writes, one after another: tool calls in parallel publish at once. */
-const WRITING = new ScopeKey<Promise<void>>('the log');
-
-/** The log of the conversation of `ctx` takes its transcript as `read` gives it. */
-function logged(ctx: restate.SessionContext, read: Read): Promise<void> {
-  const write = async () => {
-    const transcript = await read();
-    await log.sync(ctx, transcript.messages());
-    // The calls whose results the framework stored are made: see calls.ts.
-    await settle(ctx, (id, failed) => transcript.answered(id, failed));
-  };
-  const done = (WRITING.get(ctx) ?? Promise.resolve()).then(write, write);
-  WRITING.set(ctx, done);
-  return done;
-}
-
-/**
- * Run `work`, a framework's turn (or a compaction, a reset), with `read`
- * giving the framework's transcript as it stands, from the framework as
- * `work` holds it open: each publish meanwhile (a tool call's start and end)
- * takes it into the conversation's log, and so does `work`'s end, before the
- * framework closes. `messages` and `sync` read the log.
- */
-export async function transcribing<T>(ctx: restate.SessionContext, read: Read, work: () => Promise<T>): Promise<T> {
-  const outer = READING.get(ctx);
-  READING.set(ctx, read);
-  let failed = false;
-  try {
-    return await work();
-  } catch (error) {
-    failed = !(error instanceof restate.TerminalError);
-    throw error;
-  } finally {
-    try {
-      // A failed attempt stores nothing more: its retry runs again.
-      if (!failed) await logged(ctx, read);
-    } finally {
-      if (outer) READING.set(ctx, outer);
-      else READING.delete(ctx);
-    }
-  }
-}
-
-/**
- * The handler of an agent's conversation as clients read it, from its log:
- * a page of it (`{limit, before}`), or what is new or changed since a cursor
- * (`{cursor}`). It is a view: it answers while a message is answered, with
- * what was stored so far, and stores nothing.
- */
-export const messagesHandler =
-  () =>
-  async (ctx: restate.ViewContext, request?: MessagesRequest): Promise<Messages> =>
-    log.page(ctx.db, request ?? {});

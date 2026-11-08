@@ -4,8 +4,15 @@
 import * as restate from '@restatedev/sessions';
 import { describe, expect, it, vi } from 'vitest';
 import { CANCELLED, REFUSED, tool, UNANSWERED } from '@restatedev/agents';
+import { invoke } from '@restatedev/sessions/internal';
+import { fakeContext, type Made } from '@restatedev/sessions/test/support';
+import { ToolError } from '@anthropic-ai/sdk/lib/tools/ToolError';
+import type Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
-import { AttemptEnded } from '../src/common.ts';
+import { AttemptEnded, ENDED } from '../src/common.ts';
+import { SUMMARY } from '../src/conversation.ts';
+
+type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 import {
   afterCancel,
   cancelledTransfer,
@@ -15,7 +22,7 @@ import {
   followedWhileWorking,
   conversation,
   crashedAnywhere,
-  SAID,
+  SAID_IN_TURNS as SAID,
   handlerOf,
   sqlAttempt,
   withoutIds,
@@ -75,7 +82,7 @@ describe('the Claude agent', () => {
         { type: 'text', text: 'On it.' },
         {
           type: 'tool',
-          id: 'toolu_1',
+          id: expect.stringMatching(/^toolu_/),
           name: 'transfer',
           input: { from: 1, to: 2, amount: 5 },
           output: CANCELLED,
@@ -113,7 +120,7 @@ describe('the Claude agent', () => {
       [{ type: 'text', text: 'Please move 5 from 1 to 2' }],
       [
         { type: 'text', text: 'On it.' },
-        { type: 'tool', id: 'toolu_1', name: 'transfer', input: { from: 1, to: 2, amount: 5 } },
+        { type: 'tool', id: expect.stringMatching(/^toolu_/), name: 'transfer', input: { from: 1, to: 2, amount: 5 } },
       ],
     ]);
     gate.resolve();
@@ -147,12 +154,12 @@ describe('the Claude agent', () => {
       more: true,
       cursor: expect.any(Number),
     });
-    expect(await c.read(claude.messages(), { limit: 3, before: 4 })).toEqual({
+    expect(await c.read(claude.messages(), { limit: 3, before: SAID[4]!.id })).toEqual({
       messages: SAID.slice(1, 4),
       more: true,
       cursor: expect.any(Number),
     });
-    expect(await c.read(claude.messages(), { before: 1 })).toEqual({
+    expect(await c.read(claude.messages(), { before: SAID[1]!.id })).toEqual({
       messages: SAID.slice(0, 1),
       more: false,
       cursor: expect.any(Number),
@@ -178,7 +185,7 @@ describe('the Claude agent', () => {
     // Its attempt retried: the same answer, no new transfer.
     expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toEqual(first);
     expect(c.ledger.calls).toHaveLength(1);
-    expect([...c.ledger.transfers.keys()]).toEqual(['ClaudeAgent/a/toolu_1']);
+    expect([...c.ledger.transfers.keys()]).toEqual([expect.stringMatching(/^ClaudeAgent\/a\/toolu_/)]);
     // The next prompt goes on in the same thread.
     const audit = await c.attempt('inv3', 'audit the books');
     expect(audit).toMatch(/^Done: .*"transfers":1/);
@@ -230,9 +237,11 @@ describe('the Claude agent', () => {
       teller.reply = reply;
     }
     // The same transfer id and idempotency key both times: the money moved once.
+    const id = c.ledger.calls[0]!.id.split('/').at(-1)!;
+    expect(id).toMatch(/^toolu_/);
     expect(c.ledger.calls).toEqual([
-      { name: 'transfer', id: 'ClaudeAgent/b/toolu_1', key: 'inv1:toolu_1' },
-      { name: 'transfer', id: 'ClaudeAgent/b/toolu_1', key: 'inv1:toolu_1' },
+      { name: 'transfer', id: `ClaudeAgent/b/${id}`, key: `inv1:${id}` },
+      { name: 'transfer', id: `ClaudeAgent/b/${id}`, key: `inv1:${id}` },
     ]);
     expect(c.ledger.transfers.size).toBe(1);
   });
@@ -289,6 +298,47 @@ describe('the Claude agent', () => {
     expect(c.ledger.calls).toEqual([]);
   });
 
+  it("goes on from a reply the API paused (a server tool's long turn), in the same turn", async () => {
+    const c = conversation(prompt, 'paused');
+    const reply = teller.reply;
+    const asked: MessageParam[][] = [];
+    teller.reply = (messages) => {
+      asked.push(messages);
+      const [text, stop] = asked.length === 1 ? ['Searching...', 'pause_turn'] : ['Found it.', 'end_turn'];
+      return { ...reply(messages), content: [{ type: 'text', text }], stop_reason: stop } as never;
+    };
+    let answer: string;
+    try {
+      answer = await c.attempt('inv1', 'Hello');
+    } finally {
+      teller.reply = reply;
+    }
+    expect(answer).toBe('Found it.');
+    // Asked again with the paused reply, to go on from.
+    expect(asked).toHaveLength(2);
+    expect(asked[1]!.at(-1)).toEqual({ role: 'assistant', content: [{ type: 'text', text: 'Searching...' }] });
+  });
+
+  it('sends a reply of the model with nothing in it back as one that says so: the API refuses it empty', async () => {
+    const c = conversation(prompt, 'empty');
+    const reply = teller.reply;
+    teller.reply = (messages) => {
+      // As the API: only the last message may be empty.
+      const empty = messages
+        .slice(0, -1)
+        .some((m) => (typeof m.content === 'string' ? !m.content.trim() : m.content.length === 0));
+      if (empty) throw new HttpError(400, 'invalid_request_error', 'all messages must have non-empty content');
+      return messages.length === 1 ? { ...reply(messages), content: [] } : reply(messages);
+    };
+    const answers: string[] = [];
+    try {
+      answers.push(await c.attempt('inv1', 'Hello'), await c.attempt('inv2', 'Hello again'));
+    } finally {
+      teller.reply = reply;
+    }
+    expect(answers).toEqual(['', 'Ask me to "move 5 from 1 to 2", or to "audit" the books.']);
+  });
+
   it('ends a prompt the provider refused, and answers the next message afresh', async () => {
     const c = conversation(prompt, 'refused');
     const reply = teller.reply;
@@ -305,49 +355,155 @@ describe('the Claude agent', () => {
     expect(messages[1]!.parts).toEqual([{ type: 'text', text: UNANSWERED }]);
   });
 
-  it('ends an earlier prompt the provider refuses as it is finished, and answers the next message', async () => {
-    const c = conversation(prompt, 'refused-earlier');
-    const reply = teller.reply;
-    // An overloaded provider fails the attempt, which leaves the prompt unfinished.
-    teller.reply = () => {
-      throw new HttpError(529, 'overloaded_error', 'Overloaded');
-    };
-    await expect(c.attempt('inv1', 'Please move 5 from 1 to 2')).rejects.toThrow(/Overloaded/);
-    // The next message finishes it first, which the provider refuses.
-    teller.reply = () => {
-      teller.reply = reply;
-      throw new HttpError(401, 'authentication_error', 'invalid x-api-key');
-    };
-    expect(await c.attempt('inv2', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
-    expect(c.ledger.calls).toEqual([]);
-    const { messages } = await c.read(claude.messages());
-    expect(messages[1]!.parts).toEqual([{ type: 'text', text: UNANSWERED }]);
-  });
-
-  it('ends an earlier prompt cut off as it is finished, and answers the next message', async () => {
-    const c = conversation(claude.chat({ tools: bank('ClaudeAgent'), maxTokens: 100 }), 'cut-earlier');
-    const reply = teller.reply;
-    // An overloaded provider fails the attempt, which leaves the prompt unfinished.
-    teller.reply = () => {
-      throw new HttpError(529, 'overloaded_error', 'Overloaded');
-    };
-    await expect(c.attempt('inv1', 'Please move 5 from 1 to 2')).rejects.toThrow(/Overloaded/);
-    // The next message finishes it first, whose reply is cut off.
-    teller.reply = (messages) => {
-      teller.reply = reply;
-      return { ...reply(messages), stop_reason: 'max_tokens' };
-    };
-    expect(await c.attempt('inv2', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
-    expect(c.ledger.calls).toEqual([]);
-  });
-
-  it('finishes an interrupted prompt before starting the next one', async () => {
+  it('closes a turn its gone invocation left, by the next message: never finishes it', async () => {
     const c = conversation(prompt, 'c');
-    await c.crash('inv1', 'Please move 1 from 0 to 1');
-    // Its caller gave up; the next prompt comes.
-    const second = await c.attempt('inv2', 'Please move 2 from 0 to 1');
-    expect(second).toBe('Done: moved 2 from account 0 to account 1');
-    expect(await c.attempt('inv1', 'Please move 1 from 0 to 1')).toBe('Done: moved 1 from account 0 to account 1');
+    const asked: MessageParam[][] = [];
+    const reply = teller.reply;
+    teller.reply = (messages) => {
+      asked.push(messages);
+      return reply(messages);
+    };
+    try {
+      // Killed in its transfer: its invocation is gone, and the next message comes.
+      await c.crash('inv1', 'Please move 1 from 0 to 1');
+      asked.length = 0;
+      const second = await c.attempt('inv2', 'Please move 2 from 0 to 1');
+      expect(second).toBe('Done: moved 2 from account 0 to account 1');
+    } finally {
+      teller.reply = reply;
+    }
+    // The model was asked for the second message only, and saw how the first ended.
+    expect(asked).toHaveLength(2);
+    expect(JSON.stringify(asked[0])).toContain(ENDED);
+    // The first's transfer was not made again; its call has the note as its result.
     expect(c.ledger.transfers.size).toBe(2);
+    const { messages } = await c.read(claude.messages());
+    expect(messages[1]!.parts[1]).toMatchObject({ type: 'tool', output: ENDED, error: true });
+    expect(messages[2]!.parts).toEqual([{ type: 'text', text: ENDED }]);
+    // Its invocation, should it come again, fails with the note.
+    await expect(c.attempt('inv1', 'Please move 1 from 0 to 1')).rejects.toThrow(ENDED);
+    expect(c.ledger.transfers.size).toBe(2);
+  });
+
+  it("closes a turn its gone invocation left on its companion's `settle`", async () => {
+    const c = conversation(prompt, 'settled');
+    await c.crash('inv1', 'Please move 1 from 0 to 1');
+    const agent = claude.agent({ name: 'ClaudeAgent', tools: bank('ClaudeAgent') });
+    const map = c.state as Map<string, Uint8Array>;
+    const settle = (id: string) =>
+      invoke(agent, 'settle', fakeContext({ map, service: 'ClaudeAgent', key: 'settled', id: `inv_s${id}` }), 'inv1');
+    expect(await settle('1')).toBe(true);
+    expect(await settle('2')).toBe(false);
+    const { messages } = await c.read(claude.messages());
+    expect(messages.at(-1)!.parts).toEqual([{ type: 'text', text: ENDED }]);
+  });
+
+  it('answers a stored final reply without asking the model again', async () => {
+    const reply = teller.reply;
+    let requests = 0;
+    teller.reply = (messages) => {
+      requests++;
+      return reply(messages);
+    };
+    let stored = 0;
+    try {
+      // Crashed at each state request in turn: once the final reply is stored, the retry does not ask for it again.
+      for (let at = 1; ; at++) {
+        const c = conversation(prompt, `final-${at}`);
+        requests = 0;
+        if ((await c.attempt('inv1', 'Hello', at)) !== 'crashed') break;
+        const replied = (await c.read(claude.messages())).messages.length > 1;
+        const asked = requests;
+        expect(await c.attempt('inv1', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
+        if (replied) stored++;
+        expect(requests - asked).toBe(replied ? 0 : 1);
+      }
+    } finally {
+      teller.reply = reply;
+    }
+    // Some crash came after the reply was stored, and before the turn's answer.
+    expect(stored).toBeGreaterThan(0);
+  });
+
+  it('gives the model earlier turns as their prompt and answer only', async () => {
+    const c = conversation(prompt, 'earlier');
+    await c.attempt('inv1', 'Please move 5 from 1 to 2');
+    await c.attempt('inv2', 'Hello');
+    const reply = teller.reply;
+    const asked: MessageParam[][] = [];
+    teller.reply = (messages) => {
+      asked.push(messages);
+      return reply(messages);
+    };
+    try {
+      await c.attempt('inv3', 'Hello again');
+    } finally {
+      teller.reply = reply;
+    }
+    // The first turn, out of the window: its prompt and answer, without its tool call.
+    expect(asked[0]).toEqual([
+      { role: 'user', content: 'Please move 5 from 1 to 2' },
+      { role: 'assistant', content: 'Done: moved 5 from account 1 to account 2' },
+      { role: 'user', content: 'Hello' },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Ask me to "move 5 from 1 to 2", or to "audit" the books.' }],
+      },
+      { role: 'user', content: 'Hello again' },
+    ]);
+  });
+
+  it('summarizes a long conversation rather than refuse it', async () => {
+    const reply = teller.reply;
+    const summaries: string[] = [];
+    teller.reply = (messages) => {
+      const first = messages[0]!.content;
+      if (typeof first === 'string' && first.startsWith('Summarize the conversation')) {
+        summaries.push(first);
+        return {
+          ...reply([{ role: 'user', content: 'hi' }]),
+          content: [{ type: 'text', text: 'they chatted', citations: null }],
+        };
+      }
+      return reply(messages);
+    };
+    const agent = claude.agent({ name: 'ClaudeAgent', tools: bank('ClaudeAgent'), budget: 20 });
+    const map = new Map<string, Uint8Array>();
+    const sends: Made[] = [];
+    let n = 0;
+    const run = (handler: string, input?: unknown) =>
+      invoke(agent, handler, fakeContext({ map, service: 'ClaudeAgent', key: 'long', id: `inv_${++n}`, sends }), input);
+    try {
+      for (let i = 0; i < 5; i++) await run('chat', `Hello ${i}`);
+      // The turns before the window outgrew the budget: the agent was sent `compact`, which summarizes them.
+      expect(sends.some((s) => s.method === 'compact')).toBe(true);
+      expect(await run('compact')).toBe(true);
+      expect(summaries[0]).toContain('User: Hello 0');
+      const asked: MessageParam[][] = [];
+      const summarizing = teller.reply;
+      teller.reply = (messages) => {
+        asked.push(messages);
+        return summarizing(messages);
+      };
+      await run('chat', 'Hello 5');
+      expect(asked[0]![0]).toEqual({ role: 'user', content: `${SUMMARY}they chatted` });
+    } finally {
+      teller.reply = reply;
+    }
+  });
+
+  it("hands the SDK's ToolError to the model, rather than fail the attempt", async () => {
+    const strict = {
+      type: 'custom' as const,
+      name: 'transfer',
+      description: 'Move money.',
+      input_schema: { type: 'object' as const, properties: {} },
+      parse: (args: unknown) => args,
+      run: () => {
+        throw new ToolError('the bank is closed');
+      },
+    };
+    const c = conversation(claude.chat({ tools: [strict] }), 'tool-error');
+    expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe('Done: the bank is closed');
   });
 });

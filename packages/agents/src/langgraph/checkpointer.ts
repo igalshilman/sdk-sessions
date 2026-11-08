@@ -22,7 +22,12 @@
 // thread's earlier checkpoints, their writes and the values only they had:
 // a thread then takes the space of its state once, not once per step (a
 // message list stored again at each step grows with the square of its
-// length).
+// length). A graph with a `DeltaChannel` keeps the checkpoints LangGraph
+// rebuilds that channel from too (`#kept`).
+//
+// A checkpoint's channel versions are matched as rows, `(channel, version)
+// IN (VALUES (?, ?), …)`, never as an `OR` of each pair: the database refuses
+// an expression more than 100 deep, and a graph may have more channels.
 import { randomUUID } from 'node:crypto';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import {
@@ -102,23 +107,44 @@ function matches(actual: unknown, expected: unknown): boolean {
 }
 
 /**
- * Drop what the thread `threadId` (namespace `ns`) keeps from before
- * `checkpoint`: its other checkpoints, their pending writes, and the channel
- * values at versions other than `checkpoint`'s.
+ * `versions`, pairs of a channel and its version, as SQL rows to match
+ * `(channel, version)` against, `(VALUES (?, ?), …)`, and their parameters.
  */
-async function dropEarlier(tx: DatabaseWriter, threadId: string, ns: string, checkpoint: Checkpoint) {
+function pairs(versions: [string, unknown][]): [string, string[]] {
+  return [
+    `(VALUES ${versions.map(() => '(?, ?)').join(', ')})`,
+    versions.flatMap(([channel, version]) => [channel, String(version)]),
+  ];
+}
+
+/**
+ * Drop what the thread `threadId` (namespace `ns`) keeps besides `kept`, its
+ * latest checkpoint and those it needs (by id): the other checkpoints, their
+ * pending writes, and the channel values at versions none of `kept` has.
+ */
+async function dropEarlier(tx: DatabaseWriter, threadId: string, ns: string, kept: Map<string, Checkpoint>) {
   const thread = [threadId, ns];
+  const ids = [...kept.keys()];
   for (const table of ['restate_langgraph_checkpoints', 'restate_langgraph_writes']) {
-    await tx.execute(`DELETE FROM ${table} WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id <> ?`, [
-      ...thread,
-      checkpoint.id,
-    ]);
+    await tx.execute(
+      `DELETE FROM ${table} WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id NOT IN (${ids.map(() => '?').join(', ')})`,
+      [...thread, ...ids],
+    );
   }
-  const versions = Object.entries(checkpoint.channel_versions ?? {});
-  const kept = versions.map(() => '(channel = ? AND version = ?)').join(' OR ') || '0';
+  const versions = new Map<string, [string, unknown]>();
+  for (const checkpoint of kept.values()) {
+    for (const [channel, version] of Object.entries(checkpoint.channel_versions ?? {})) {
+      versions.set(`${channel}\u0000${String(version)}`, [channel, version]);
+    }
+  }
+  if (versions.size === 0) {
+    await tx.execute('DELETE FROM restate_langgraph_channel_values WHERE thread_id = ? AND checkpoint_ns = ?', thread);
+    return;
+  }
+  const [rows, params] = pairs([...versions.values()]);
   await tx.execute(
-    `DELETE FROM restate_langgraph_channel_values WHERE thread_id = ? AND checkpoint_ns = ? AND NOT (${kept})`,
-    [...thread, ...versions.flatMap(([channel, version]) => [channel, String(version)])],
+    `DELETE FROM restate_langgraph_channel_values WHERE thread_id = ? AND checkpoint_ns = ? AND (channel, version) NOT IN ${rows}`,
+    [...thread, ...params],
   );
 }
 
@@ -167,11 +193,10 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     const versions = Object.entries(checkpoint.channel_versions ?? {});
     const values: Record<string, unknown> = {};
     if (versions.length === 0) return values;
+    const [pairsOf, params] = pairs(versions);
     const rows = await this.#db.values(
-      `SELECT channel, type, value FROM restate_langgraph_channel_values WHERE thread_id = ? AND checkpoint_ns = ? AND (${versions
-        .map(() => '(channel = ? AND version = ?)')
-        .join(' OR ')})`,
-      [threadId, ns, ...versions.flatMap(([channel, version]) => [channel, String(version)])],
+      `SELECT channel, type, value FROM restate_langgraph_channel_values WHERE thread_id = ? AND checkpoint_ns = ? AND (channel, version) IN ${pairsOf}`,
+      [threadId, ns, ...params],
     );
     for (const [channel, type, value] of rows as [string, string, Uint8Array][]) {
       if (type !== EMPTY) values[channel] = await this.serde.loadsTyped(type, value);
@@ -226,6 +251,40 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     const versions = Object.values(checkpoint.channel_versions);
     checkpoint.channel_versions[TASKS] =
       versions.length > 0 ? maxChannelVersion(...versions) : this.getNextVersion(undefined);
+  }
+
+  /**
+   * The checkpoints of `threadId` (namespace `ns`) that its latest,
+   * `checkpoint`, needs, by id: itself, and the ancestors LangGraph reads to
+   * rebuild its delta channels (`getDeltaChannelHistory`), back to the
+   * snapshot of each. A checkpoint's metadata counts, for each delta channel,
+   * the steps since its snapshot (`counters_since_delta_snapshot`): a channel
+   * with no count there was snapshotted at that checkpoint, and one the
+   * checkpoint does not hold (`channel_versions`) was never written, so has
+   * nothing to rebuild.
+   */
+  async #kept(tx: DatabaseWriter, threadId: string, ns: string, checkpoint: Checkpoint) {
+    const kept = new Map<string, Checkpoint>();
+    let waiting: Set<string> | undefined;
+    let at: string | null = checkpoint.id;
+    while (at !== null && waiting?.size !== 0) {
+      const rows = await tx.values(
+        'SELECT parent_checkpoint_id, type, checkpoint, metadata FROM restate_langgraph_checkpoints WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?',
+        [threadId, ns, at],
+      );
+      const row = rows[0] as [string | null, string, Uint8Array, Uint8Array] | undefined;
+      if (!row) break;
+      const [parent, type, stored, metadata] = row;
+      const loaded: Checkpoint = await this.serde.loadsTyped(type, stored);
+      kept.set(at, loaded);
+      const counters = ((await this.serde.loadsTyped(type, metadata)) as { counters_since_delta_snapshot?: object })
+        .counters_since_delta_snapshot;
+      const versions = loaded.channel_versions ?? {};
+      const counted = new Set(Object.keys(counters ?? {}).filter((channel) => channel in versions));
+      waiting = waiting === undefined ? counted : new Set([...waiting].filter((channel) => counted.has(channel)));
+      at = parent;
+    }
+    return kept;
   }
 
   getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
@@ -309,7 +368,8 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
           `INSERT OR REPLACE INTO restate_langgraph_checkpoints (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [thread_id, checkpoint_ns, checkpoint.id, parentId ?? null, type, stored, metadataValue],
         );
-        if (this.#latest) await dropEarlier(tx, thread_id, checkpoint_ns, checkpoint);
+        if (this.#latest)
+          await dropEarlier(tx, thread_id, checkpoint_ns, await this.#kept(tx, thread_id, checkpoint_ns, checkpoint));
       });
       return { configurable: { thread_id, checkpoint_ns, checkpoint_id: checkpoint.id } };
     });
