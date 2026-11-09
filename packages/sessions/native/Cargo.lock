@@ -1654,8 +1654,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "restate-sdk-shared-core"
-version = "8.2.0"
-source = "git+https://github.com/restatedev/sdk-shared-core?branch=sessions-storage#8937202d88ce6400b351134ccd0558d62588a94b"
+version = "8.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08cd57336afa55c59eb52b63a9d46608677718332f2a813014c37acad74f9fe4"
 dependencies = [
  "base64",
  "bytes",
