@@ -96,7 +96,8 @@ npm install @restatedev/agents @langchain/core @langchain/langgraph @langchain/l
 npm install @restatedev/agents @earendil-works/pi-ai @deepseek-ai/cordis \
   @deepseek-ai/{dsh-agent,dsh-agent-loop,dsh-llm,dsh-llm-deepseek-api-key,dsh-llm-pi-ai,dsh-session}@0.2.1-rc.2 \
   @deepseek-ai/{dsh-session-checkpoint-policy,dsh-session-persistence,dsh-session-projection}@0.2.1-rc.2 \
-  @deepseek-ai/{dsh-system-prompt,dsh-tools,dsh-user-approval}@0.2.1-rc.2   # DeepSeek
+  @deepseek-ai/{dsh-system-prompt,dsh-tools,dsh-user-approval}@0.2.1-rc.2 \
+  @deepseek-ai/{dsh-commands,dsh-compaction,dsh-compaction-basic,dsh-compaction-tool-result-pruner,dsh-token-meter}@0.2.1-rc.2   # DeepSeek
 ```
 
 OpenCode was a framework of this package until its agents moved onto the
