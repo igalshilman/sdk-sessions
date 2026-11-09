@@ -8,7 +8,7 @@
  *   OPENAI_API_KEY=… node basic/langgraph.ts
  *   npx @restatedev/restate-server   # Restate, in another terminal
  *   npx @restatedev/restate deployments register http://localhost:9080
- *   curl localhost:8080/assistant/alice/chat -d 'Hi, I am Alice. Is it warm in Lisbon?'
+ *   curl localhost:8080/langgraph_assistant/alice/chat -d 'Hi, I am Alice. Is it warm in Lisbon?'
  */
 import { serve, tool } from '@restatedev/agents';
 import * as langgraph from '@restatedev/agents/langgraph';
@@ -23,6 +23,6 @@ const weather = tool({
   run: async ({ city }) => `Sunny and 21°C in ${city}`,
 });
 
-const assistant = langgraph.agent({ name: 'assistant', tools: [weather] });
+const assistant = langgraph.agent({ name: 'langgraph_assistant', tools: [weather] });
 
 await serve(assistant);

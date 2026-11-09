@@ -7,9 +7,9 @@
  *   OPENAI_API_KEY=… node basic/memory.ts
  *   npx @restatedev/restate-server   # Restate, in another terminal
  *   npx @restatedev/restate deployments register http://localhost:9080
- *   curl localhost:8080/assistant/alice/chat -d 'I am vegetarian, and I live in Lisbon.'
- *   curl localhost:8080/assistant/alice/chat -d 'Suggest a restaurant for tonight.'
- *   curl localhost:8080/assistant/alice/facts
+ *   curl localhost:8080/memory_assistant/alice/chat -d 'I am vegetarian, and I live in Lisbon.'
+ *   curl localhost:8080/memory_assistant/alice/chat -d 'Suggest a restaurant for tonight.'
+ *   curl localhost:8080/memory_assistant/alice/facts
  */
 import { sessionObject, serve, tool } from '@restatedev/agents';
 import * as pi from '@restatedev/agents/pi';
@@ -37,7 +37,7 @@ const recall = tool({
 
 // An object of your own: the agent's handler and view, and yours beside them.
 const assistant = sessionObject({
-  name: 'assistant',
+  name: 'memory_assistant',
   // Your own table, in each user's database next to the agent's tables.
   schema: ['CREATE TABLE facts (fact TEXT PRIMARY KEY)'],
   handlers: {

@@ -9,7 +9,7 @@ Restate: each model step and each tool call is stored.
 ```
 you ──▶ pair.ts (a terminal) ──▶ pair/<project> (pi) ──▶ WORKSPACE/<project>: read, write, edit, bash
           ▲   chat, approve         │  plan (a table of its own)
-          └── follow ◀──────────────┤  reviewer/<project>.<task> (another model): what to fix
+          └── follow ◀──────────────┤  pair_reviewer/<project>.<task> (another model): what to fix
                                     └▶ approval (you) ──▶ shipping/<…> (a workflow): CI, then a pull request
 ```
 

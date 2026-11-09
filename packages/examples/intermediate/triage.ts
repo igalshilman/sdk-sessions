@@ -7,10 +7,10 @@
  *   OPENAI_API_KEY=… node intermediate/triage.ts
  *   npx @restatedev/restate-server   # Restate, in another terminal
  *   npx @restatedev/restate deployments register http://localhost:9080
- *   curl localhost:8080/triage/t1/run/send --json '"I was charged twice for order 103."'
- *   curl localhost:8080/triage/t1/draft                               # the drafted reply
- *   curl localhost:8080/triage/t1/review --json '"Sorry about that! We refunded the second charge."'
- *   curl localhost:8080/restate/workflow/triage/t1/output              # what went out
+ *   curl localhost:8080/ticket_triage/t1/run/send --json '"I was charged twice for order 103."'
+ *   curl localhost:8080/ticket_triage/t1/draft                               # the drafted reply
+ *   curl localhost:8080/ticket_triage/t1/review --json '"Sorry about that! We refunded the second charge."'
+ *   curl localhost:8080/restate/workflow/ticket_triage/t1/output              # what went out
  */
 import * as restate from '@restatedev/restate-sdk';
 import { serve } from '@restatedev/agents';
@@ -28,7 +28,7 @@ const drafter = pi.agent({
 });
 
 const triage = restate.workflow({
-  name: 'triage',
+  name: 'ticket_triage',
   handlers: {
     run: async (ctx: restate.WorkflowContext, ticket: string) => {
       // Each ticket has its own conversation with each agent, keyed by its id.

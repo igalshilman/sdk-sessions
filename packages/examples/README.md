@@ -14,7 +14,7 @@ that put them together. New to it all? Begin with
 
 | File                                 | What                                                                                                                                       |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`chat.ts`](basic/chat.ts)           | **Start here.** A durable chat agent on pi, with a tool: `pi.agent({ name: 'assistant', tools: [weather] })`                               |
+| [`chat.ts`](basic/chat.ts)           | **Start here.** A durable chat agent on pi, with a tool: `pi.agent({ name: 'pi_assistant', tools: [weather] })`                            |
 | [`langgraph.ts`](basic/langgraph.ts) | The same agent on LangGraph                                                                                                                |
 | [`claude.ts`](basic/claude.ts)       | The same agent on Claude (the Anthropic SDK's tool runner; `ANTHROPIC_API_KEY`)                                                            |
 | [`deepseek.ts`](basic/deepseek.ts)   | The same agent on the DeepSeek Harness (`DEEPSEEK_API_KEY`)                                                                                |
@@ -53,8 +53,8 @@ crash resumes the reply. The agents are in
 OPENAI_API_KEY=… node basic/chat.ts                                          # the agent, on port 9080
 npx @restatedev/restate-server                                               # Restate, in another terminal
 npx @restatedev/restate deployments register http://localhost:9080           # tell Restate where the agent is
-curl localhost:8080/assistant/alice/chat -d 'Hi, I am Alice'
-curl localhost:8080/assistant/alice/messages                                 # the conversation so far
+curl localhost:8080/pi_assistant/alice/chat -d 'Hi, I am Alice'
+curl localhost:8080/pi_assistant/alice/messages                              # the conversation so far
 ```
 
 Without the CLI, register through the admin API:

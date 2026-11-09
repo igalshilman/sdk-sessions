@@ -9,11 +9,11 @@
  *   OPENAI_API_KEY=… node intermediate/harness.ts
  *   npx @restatedev/restate-server   # Restate, in another terminal
  *   npx @restatedev/restate deployments register http://localhost:9080
- *   curl localhost:8080/assistant/alice/configure --json '{"persona": "You answer as a pirate."}'
- *   curl localhost:8080/assistant/alice/chat -d 'What time is it?'
- *   curl localhost:8080/assistant/alice/summarize --json '"Keep the times you were asked"'
- *   curl localhost:8080/assistant/alice/reset --json '"Alice likes short answers"'
- *   curl localhost:8080/assistant/alice/messages
+ *   curl localhost:8080/harness_assistant/alice/configure --json '{"persona": "You answer as a pirate."}'
+ *   curl localhost:8080/harness_assistant/alice/chat -d 'What time is it?'
+ *   curl localhost:8080/harness_assistant/alice/summarize --json '"Keep the times you were asked"'
+ *   curl localhost:8080/harness_assistant/alice/reset --json '"Alice likes short answers"'
+ *   curl localhost:8080/harness_assistant/alice/messages
  *
  * A model of another provider takes its API key, such as
  * `{"model": "anthropic/claude-sonnet-5-5"}` with ANTHROPIC_API_KEY.
@@ -48,7 +48,7 @@ const options = async (ctx: restate.SessionContext): Promise<pi.Options> => {
 };
 
 const assistant = sessionObject({
-  name: 'assistant',
+  name: 'harness_assistant',
   schema: ['CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 0), json TEXT NOT NULL)'],
   handlers: {
     chat: pi.chat(options),

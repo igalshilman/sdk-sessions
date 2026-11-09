@@ -31,7 +31,7 @@ import { done, plan, PLAN, tasksOf } from './tools.ts';
 const workspace = process.env.WORKSPACE ?? '/tmp/restate-pairing';
 
 const reviewer = pi.agent({
-  name: 'reviewer',
+  name: 'pair_reviewer',
   description: 'Reads a diff, and says what to fix',
   model: process.env.REVIEWER ?? 'openai/gpt-6-astra',
   system:

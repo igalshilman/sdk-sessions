@@ -85,7 +85,8 @@ export const payments = restate.service({
         const { total } = await ctx.run('GET /orders', () => fetchOrder(order));
         if (amount > total) throw new restate.TerminalError(`order ${order} totals ${total}, less than ${amount}`);
         const idempotencyKey = ctx.request().id; // the same on every attempt
-        return ctx.run('POST /refunds', () => makeRefund(idempotencyKey));
+        const { refund } = await ctx.run('POST /refunds', () => makeRefund(idempotencyKey));
+        return { refund, order, amount, status: 'refunded' };
       },
     ),
   },

@@ -8,7 +8,7 @@
  *   DEEPSEEK_API_KEY=… node basic/deepseek.ts
  *   npx @restatedev/restate-server   # Restate, in another terminal
  *   npx @restatedev/restate deployments register http://localhost:9080
- *   curl localhost:8080/assistant/alice/chat -d 'Hi, I am Alice. Is it warm in Lisbon?'
+ *   curl localhost:8080/deepseek_assistant/alice/chat -d 'Hi, I am Alice. Is it warm in Lisbon?'
  */
 import { serve, tool } from '@restatedev/agents';
 import * as deepseek from '@restatedev/agents/deepseek';
@@ -24,7 +24,7 @@ const weather = tool({
 });
 
 const assistant = deepseek.agent({
-  name: 'assistant',
+  name: 'deepseek_assistant',
   system: 'You are a friendly assistant. Answer briefly.',
   tools: [weather],
 });

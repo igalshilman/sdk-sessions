@@ -207,7 +207,9 @@ const chatModel = async (named: string): Promise<BaseChatModel> => {
   const [provider, id] = providerOfModel(named);
   if (provider === 'openai') {
     const { ChatOpenAI } = await integration('@langchain/openai', () => import('@langchain/openai'));
-    return new ChatOpenAI({ model: id });
+    // OpenAI's reasoning models take function tools only on the Responses API
+    // (on Chat Completions they refuse them, unless reasoning is off).
+    return new ChatOpenAI({ model: id, useResponsesApi: true });
   }
   const { ChatAnthropic } = await integration('@langchain/anthropic', () => import('@langchain/anthropic'));
   return new ChatAnthropic({ model: id });

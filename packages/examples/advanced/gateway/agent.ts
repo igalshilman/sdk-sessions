@@ -87,7 +87,7 @@ async function gatewayTools(ctx: restate.SessionContext, tenant: string, user: s
         const { content, isError = false } = await ctx
           .rpc(gateway, tenant, { idempotencyKey: `${ctx.request.id}:${api.callId}` })
           .call({ user, name: tool.name, arguments: args });
-        return { content, isError };
+        return { output: content, isError };
       },
     }),
   );
