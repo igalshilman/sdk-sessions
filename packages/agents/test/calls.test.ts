@@ -115,6 +115,24 @@ describe('waitFor', () => {
     expect(made[0]?.parameter).toEqual({ id: 'inv1:call-1', name: 'approval' });
   });
 
+  it('with `rejoin`, joins the wait an earlier attempt opened with the same input, under a new id', async () => {
+    const state = new Map<string, Uint8Array>();
+    const rejoin = { approval: true, rejoin: true };
+    await waitFor(attempt(state).ctx, 'call-1', 'approval', { refund: 5 }, rejoin);
+    // The call made again by a later attempt (DeepSeek's, after a crash): the same wait.
+    const next = attempt(state);
+    await waitFor(next.ctx, 'call-2', 'approval', { refund: 5 }, rejoin);
+    // Another call in the same attempt, or with another input: a wait of its own.
+    await waitFor(next.ctx, 'call-3', 'approval', { refund: 5 }, rejoin);
+    await waitFor(next.ctx, 'call-4', 'approval', { refund: 6 }, rejoin);
+    expect(next.made.map((m) => m.idempotencyKey)).toEqual(['inv1:call-1', 'inv1:call-3', 'inv1:call-4']);
+    expect((await records(state)).map((c) => [c.ids, c.approval])).toEqual([
+      [['call-1', 'call-2'], true],
+      [['call-3'], true],
+      [['call-4'], true],
+    ]);
+  });
+
   it('is not what a `signal` tool is: that one rejoins an earlier attempt’s wait by its input', async () => {
     const state = new Map<string, Uint8Array>();
     const approval = signal('approval', { description: 'Wait', input: z.object({ refund: z.number() }) });

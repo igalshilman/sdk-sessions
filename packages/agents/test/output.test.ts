@@ -154,7 +154,7 @@ describe("an agent's output", () => {
     const c = conversation(chat, 'kept');
     expect(await c.attempt('inv1', 'Plan if reminded')).toEqual(PLAN);
     expect(await promptsIn(c, pi.messages())).toEqual(['Plan if reminded']);
-    // Claude and DeepSeek: the model's request ends the prompt with the reminder.
+    // Claude (asked in the prompt, not natively) and DeepSeek: the model's request ends the prompt with the reminder.
     const prompted: string[] = [];
     const { reply } = teller;
     teller.reply = (messages) => {
@@ -179,7 +179,7 @@ describe("an agent's output", () => {
     };
     try {
       for (const [planner, view] of [
-        [claude.chat({ output: Plan }), claude.messages()],
+        [claude.chat({ output: Plan, nativeOutput: false }), claude.messages()],
         [deepseek.chat({ output: Plan }), deepseek.messages()],
       ] as const) {
         const k = conversation(planner as unknown as PromptHandler, `kept-${prompted.length}`);

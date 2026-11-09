@@ -290,7 +290,7 @@ export const publish = async (ctx: restate.SessionContext) => {
 };
 
 /** A step of a turn of `ctx`: {@link publish} it, unless the agent runs in the background, which publishes the turn's end only. */
-const stepped = async (ctx: restate.SessionContext) => {
+export const stepped = async (ctx: restate.SessionContext) => {
   if (!unfollowed(ctx)) await publish(ctx);
 };
 

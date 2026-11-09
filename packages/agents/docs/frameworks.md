@@ -39,8 +39,8 @@ What the core gives an integration, once ported:
   `askAgain`) and its reads (`finalReply`, `openCalls`, `latestAsk`,
   `stored`).
 - **Tools**, as today (`tool()`'s `run` gets `ctx` and the call's id), and
-  `waitFor(ctx, callId, signal, input, { approval })` for a framework's own
-  durable wait.
+  `waitFor(ctx, callId, signal, input, { approval, rejoin })` for a
+  framework's own durable wait.
 - **The turn's signal** (`stopSignalOf`), refusals (`refusalOf`, `fromTool`),
   and publishing (`toolCallStarted`, `toolCallEnded`), as today.
 
@@ -138,6 +138,15 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   returns a signed `compaction` block, which must be sent back as it came.
 - What changes per attempt: message ids, `tool_use` ids (stable here, as a
   reply is stored before its tools run), the container id.
+- Structured outputs: `output_config.format`, a JSON schema the API holds
+  the final text reply to, without a beta header (Claude's 4.5 models and
+  later, and Mythos Preview). The runner sends it with each request, so
+  tool calls go on, and drops it only for a compaction request.
+  `betaZodOutputFormat` (`helpers/beta/zod`) makes one of a zod schema, and
+  moves into descriptions what the API does not take (string lengths,
+  number bounds), and `enum` and `const` too, which it does. A declined
+  reply, or one cut off at `max_tokens`, may not fit the schema; a schema
+  too complex for the API is a 400.
 
 ### Target: the turn projection
 
@@ -165,6 +174,11 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   terminal error); `pause_turn` stores the paused reply as a step and goes
   on.
 - **Summaries**: `summarize` with the agent's own client and model.
+- **Output**: a model with structured outputs is asked for `output`
+  natively (`nativeOutput`): `output_config.format` on each request, and
+  nothing in the system prompt or the prompt (no `reminder`); the check
+  stays (D9), for what the API does not hold the reply to. Other models
+  are asked in the prompt.
 - **Goes**: `src/claude/conversation.ts` (both tables, `pending`, `close`,
   `cancel`, `since`), `transcribe`, `TRANSCRIPT`, `storedText`, the pending
   loop, the `transcribing` wiring (`index.ts:226-231`, `:247-286`,
@@ -276,8 +290,10 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   `failing`, `index.ts:69-95`), then publishes; START goes to the tools node
   if the turn has open calls; a stored final reply returns at once. The input
   is `{ messages: conversation.history() }`.
-- **Errors**: a `recursionLimit` of about 10 000, and `GraphRecursionError`
-  terminal; a `TerminalError` closes the turn as failed (`answerOnce` does).
+- **Errors**: a `recursionLimit` of about 10 000, and LangGraph's own
+  errors that a retry would meet again terminal (`GraphRecursionError`,
+  `InvalidUpdateError`, `EmptyInputError`: `errors.ts`, as the Python SDK's
+  `_errors.py`); a `TerminalError` closes the turn as failed (`answerOnce` does).
 - **Summaries**: `summarize` with the agent's own model.
 - **Goes**: the `prompt` and `answers` channels, the `answer` node, `close()`,
   the `for (;;)` loop, `transcribe`.
@@ -290,11 +306,14 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   finds them from those its parent needed, as the `put` before kept them in
   memory: a child needs some of its parent's, so a thread's steps read none
   back (Python's reads them at each `put`).
-- **Later, not in this port**: `agent({ graph })`, a graph of your own on
-  framework-owned history (the Python SDK's `_graph.py`: the messages after
-  the run's input copied by id, the prompt's id `prompt:<turn>`, a window of
-  at least 1, a closed turn's closing record as the run's input), with
-  `interrupt()` as Restate signals.
+- **A graph of your own** (`agent({ graph })`, `graph.ts`, as the Python
+  SDK's `_graph.py`): framework-owned history, its checkpoints in the key's
+  database; the messages after the run's input copied by id, the prompt's id
+  `prompt:<turn>`, a window of 1, a closed turn's closing record as the
+  run's input; `interrupt()` as Restate signals. Unlike Python's, the run's
+  prompt is stamped on its checkpoints by the saver (`metadata`), since the
+  loop does not merge `config.metadata`; and an interrupt's wait id adds the
+  count of resume values stored, since a node's interrupts share one id.
 - **Tests** (`test/langgraph.test.ts`, 15 today): invert `:187-195`; add a
   stored final reply not asked again, counting model calls (the Python SDK's
   `langgraph-reask-stored-reply` mutant survived its crash tests, and would
@@ -368,8 +387,9 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   model's tool call ids, and a full `request/header` logged by each loop
   instance (every invocation logs the tools' schemas again). None breaks a
   resume: the harness never replays.
-- Approvals exist (`dsh-user-approval`: `approval/asked|decided`), not
-  mounted; nor are subagents, forks or background jobs.
+- Approvals (`dsh-user-approval`: `approval/asked|decided`) are mounted
+  with the `approval` option ([Approvals](#approvals)); subagents, forks
+  and background jobs are not.
 
 ### Target: framework-owned history
 
@@ -412,6 +432,62 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   holds the summary in place of the oldest messages, the views every
   message, and a crash at any state request of the turn that condenses is
   answered once.
+
+### Approvals
+
+**The harness.** A `tools/pre-execute` policy decides a call: `allow`,
+`deny`, `cancel` or `ask`. On `ask`, the tool runtime asks `ctx.approval`
+(`dsh-user-approval`'s `ApprovalService`) for a decision, which logs
+`approval/asked`, puts the question to the `approval/request` waterfall (the
+answerers), and logs `approval/decided`: `allowed-once` runs the call; a
+`rejected`, `cancelled` or `unavailable` (no answerer) denies it, with the
+harness's own reason (`the user rejected tool "x"`). The request names the
+tool and the call id, not the arguments; the call's `tool/call` event is
+appended before the policy runs, and stored by the checkpoint before the
+tool body, after the decision. Each call of a parallel group is decided
+before the next one starts.
+
+**Before.** Nothing asked: no policy of this composition answers `ask`, and
+without `ApprovalService` an `ask` is denied (`requires approval (not yet
+supported)`). A harness tool that asks itself (the sandboxed bash tool, a
+`run_code` escalation) is not mounted.
+
+**Now.** The `approval` option (tool names, or a function of a call)
+mounts `ApprovalService`, and the agent's scope gets a `tools/pre-execute`
+policy that answers `ask` for the calls it names (once the other policies
+allow them), and an `approval/request` answerer: a wait for the signal
+`approval`, `waitFor(ctx, callId, 'approval', { tool, args }, { approval:
+true, rejoin: true })`. Its value decides (`true`, `{ approved: true }`, or
+a text such as `approved` or `yes` allows; anything else rejects, as the
+Python SDK's `approval_of`, though the denial's reason cannot reach the
+model). Before it waits, it publishes (`toolCallStarted`), which forgets the
+calls whose results are stored. An error of the wait fails the attempt,
+and its ask never settles, so the harness stores no decision.
+
+- **The wait rejoins.** The session is not flushed before the wait: a crash
+  or a suspension while it waits leaves the log at the model request, and
+  the resume has the model asked again (`CONTINUE`). Stored first, the call
+  (its `tool/call` already appended) would get a result saying its outcome
+  is unknown, which tells the model not to retry blindly. The model makes
+  the call again under a new id: with the same tool and input it joins the
+  earlier attempt's wait, so the person is asked once. A call with other
+  arguments (a transfer retried with `retryOf`) asks anew. A rejected
+  call's record stays until the invocation ends (its result is the
+  harness's error, which `Turn.stored` does not count), so a later attempt
+  of the same invocation that makes the same call again is rejected again,
+  without asking.
+- **An approval is not the call** (`approval: true`): a turn stopped while
+  an approved tool runs closes its call as cancelled, not as done.
+- **The model's input** gets the approval service's runtime context ("Approval
+  policy: ask. …"), after the prompt, on the first request: only with
+  `approval`.
+- **Tests** (`test/deepseek.test.ts`, "the DeepSeek Harness agent's
+  approvals"): approved (the tool runs after the wait, not before), denied
+  (never runs; the model gets the denial), the values that decide, a crash
+  while it waits (one wait, joined; the tool runs once), a crash at any
+  state request (one wait for each call made), and a turn cancelled while it
+  waits, or while the approved tool runs. Without `rejoin` the two crash
+  tests fail; without `approval: true` the last one does.
 
 ## pi
 

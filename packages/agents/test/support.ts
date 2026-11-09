@@ -133,6 +133,13 @@ export type PromptHandler =
   | ((ctx: restate.SessionContext, message: string) => Promise<string>)
   | { handler: (ctx: restate.SessionContext, message: string) => Promise<string> };
 
+/** A wait for a signal, as the companion's `wait` gets it. */
+export interface Wait {
+  id: string;
+  name: string;
+  input?: unknown;
+}
+
 /** The fake ledger of a conversation. */
 export interface FakeLedger {
   /** Each transfer, once, by id. */
@@ -193,8 +200,16 @@ export function conversation(
     },
   });
   if (from) for (const [id, transfer] of from.ledger.transfers) ledger.transfers.set(id, transfer);
+  // The companion's waits: each wait the attempts made, but a fenced one's, and what answers them.
+  const signals: { waits: Wait[]; answer?: (wait: Wait) => unknown } = { waits: [] };
   return {
     ledger,
+    /**
+     * Each wait for a signal the attempts made (`waits`), but a fenced
+     * attempt's, and what the companion answers a wait with (`answer`): by
+     * default, it waits forever.
+     */
+    signals,
     /** Each call the attempts made to the books (`transfer` or else `audit`), but a fenced attempt's. */
     calls: calls as readonly Made[],
     /** The object's state. */
@@ -224,7 +239,12 @@ export function conversation(
           ? books.transfer(call.parameter as Transfer, call.idempotencyKey)
           : books.audit();
       };
-      const sql = sqlAttempt({ map, fence, key, id: requestId, onRequest, route });
+      const signal = (wait: Wait) => {
+        if (current.closed) return new Promise(() => {});
+        signals.waits.push(wait);
+        return signals.answer ? signals.answer(wait) : new Promise(() => {});
+      };
+      const sql = sqlAttempt({ map, fence, key, id: requestId, onRequest, route, signal });
       abort = sql.abort;
       const answer = sql.end(() => handlerOf(handler)(sql.ctx, prompt));
       if (crashAt === undefined) return answer;

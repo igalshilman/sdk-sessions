@@ -26,6 +26,7 @@ await serve(assistant);
 | `model`      | `provider/model-id`; or else `MODEL`, or else `deepseek/deepseek-flash` (see below)                                                                            |
 | `system`     | The system prompt                                                                                                                                              |
 | `tools`      | `tool()`s and Restate's tools of `@restatedev/agents`, or the harness's `defineTool`s                                                                          |
+| `approval`   | The tool calls that wait for a person's approval before they run: the names of their tools, or a function of a call (see [Approvals](#approvals))              |
 | `output`     | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
 | `compaction` | When the model's input is condensed: `@deepseek-ai/dsh-compaction-basic`'s settings, such as `thresholdRatio` (by default 0.8 of the model's context window)   |
 
@@ -50,6 +51,57 @@ For a session object of your own, `deepseek.chat(options)` is the handler and
 invocation's context (each user's system prompt, say). `deepseek.prompt(ctx,
 text, options)` answers a prompt in a handler of your own, once, however
 often the handler runs; each prompt of an invocation is a prompt of its own.
+
+## Approvals
+
+The harness can ask a person before a tool call runs. `approval` names the
+calls that ask: by their tools, or as a function of a call (its tool's
+`name`, and its `args`):
+
+```ts
+deepseek.agent({ name: 'bank', tools: [transfer, audit], approval: ['transfer'] });
+deepseek.agent({
+  name: 'bank',
+  tools: [transfer, audit],
+  approval: ({ name, args }) => name === 'transfer' && (args as { amount: number }).amount > 100,
+});
+```
+
+Such a call waits, before it runs, for the signal `approval`
+(`deepseek.APPROVAL`) to the agent, as a `signal()` tool waits
+([Signals](../../README.md#signals)): without holding a process, for as
+long as it takes. `pending` lists the wait, with the call's tool and
+arguments, and `signal` answers it, by its id, or as the oldest wait for
+`approval`:
+
+```sh
+curl localhost:8080/bank/alice/pending
+# [{"id": "inv_1f…:call_01", "name": "approval", "input": {"tool": "transfer", "args": {"from": 1, "to": 2, "amount": 500}}, "since": "…"}]
+curl localhost:8080/bank/alice/signal --json '{"id": "inv_1f…:call_01", "value": "approved"}'
+curl localhost:8080/bank/alice/signal --json '{"name": "approval", "value": "no"}'
+```
+
+`true`, `{"approved": true}`, or a text such as `approved`, `yes` or `ok`
+approves the call, once; anything else denies it, and the tool never runs.
+The model gets the harness's denial (`Error: the user rejected tool
+"transfer"`): the text of a denial does not reach it.
+
+It is the harness's own approval: a policy of its tool runtime
+(`tools/pre-execute`) asks, and its approval service
+(`@deepseek-ai/dsh-user-approval`, mounted with `approval`) puts the
+question to its answerer, the wait. The log keeps each question and its
+decision (`approval/asked`, `approval/decided`), and the model is told, in
+the harness's runtime context, that a call may ask for an approval.
+
+A crash while a call waits, or a suspension (a wait that outlasts
+Restate's inactivity timeout restarts the handler), asks the model again
+([below](#through-crashes)): it makes the call again under a new id, and
+the call, with the same arguments, joins the wait. The person is asked
+once, and the tool runs once, after the decision. A call with other
+arguments, such as a transfer retried with `retryOf` after a crash left its
+outcome unknown, is a call of its own, and asks anew. A turn stopped while
+the call waits, or while the approved tool runs, ends the call as
+cancelled: its approval is not its outcome.
 
 ## Through crashes
 
@@ -115,7 +167,8 @@ which makes a fresh tool call id for every call, as a model does
 
 - [`test/deepseek.test.ts`](../../test/deepseek.test.ts):
   each point above, with crashes that stop an attempt in a tool call, or
-  at any of its state requests; and
+  at any of its state requests; approvals (approved, denied, waited for
+  through a crash, at any state request, and cancelled); and
   `messages`. Without the checkpoint policy four of its tests fail, and with
   a transfer tool that ignores `retryOf` three do.
 - [`test/deepseek.ts`](../../test/deepseek.ts): the

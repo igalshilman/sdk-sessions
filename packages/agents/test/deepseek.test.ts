@@ -5,7 +5,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 import * as restate from '@restatedev/restate-sdk';
-import { CANCELLED, REFUSED, UNANSWERED } from '@restatedev/agents';
+import { z } from 'zod';
+import { CANCELLED, REFUSED, tool, UNANSWERED } from '@restatedev/agents';
 import { AttemptEnded, ENDED } from '../src/common.ts';
 import { Conversation } from '../src/conversation.ts';
 import {
@@ -13,8 +14,10 @@ import {
   cancelledTransfer,
   cancelledWhileWorking,
   endedWhileWorking,
+  handlerOf,
   invalidArguments,
   followedWhileWorking,
+  sqlAttempt,
   withoutIds,
   conversation,
   crashedAnywhere,
@@ -22,6 +25,7 @@ import {
 } from './support.ts';
 import { teller } from './fakes/deepseek.ts';
 import * as deepseek from '@restatedev/agents/deepseek';
+import { bank } from './bank.ts';
 import { prompt } from './deepseek.ts';
 
 vi.mock('@deepseek-ai/dsh-llm-deepseek-api-key', () => import('./fakes/deepseek.ts'));
@@ -53,6 +57,19 @@ const saidIn = (messages: RequestMessage[]) =>
 
 /** An agent that condenses from half the model's window on, a tenth of it kept as it is. */
 const condensing = deepseek.chat({ compaction: { thresholdRatio: 0.5, retainRatio: 0.1, headroomTokens: 100 } });
+
+/** The bank agent, whose transfers wait for a person's approval. */
+const approving = deepseek.chat({ tools: bank('DeepSeekAgent'), approval: ['transfer'] });
+
+/** The wait of invocation `inv1` for an approval of tool call `callId`, a transfer of 5 from 1 to 2. */
+const approvalOf = (callId: string) => ({
+  id: `inv1:${callId}`,
+  name: deepseek.APPROVAL,
+  input: { tool: 'transfer', args: { from: 1, to: 2, amount: 5 } },
+});
+
+/** The id of the tool call that made the transfer of id `transfer` (`DeepSeekAgent/<key>/<call id>`). */
+const callIdOf = (transfer: string) => transfer.split('/').at(-1)!;
 
 /** The first two characters of each of the conversation's user messages, as clients read it. */
 const prompts = async (c: ReturnType<typeof conversation>) =>
@@ -387,5 +404,183 @@ describe('the DeepSeek Harness agent', () => {
       teller.reply = reply;
     }
     expect(await c.attempt('inv2', 'Hello')).toBe('Ask me to "move 5 from 1 to 2", or to "audit" the books.');
+  });
+});
+
+describe("the DeepSeek Harness agent's approvals", () => {
+  it('runs a tool call that needs an approval once a person approved it, and not before', async () => {
+    const c = conversation(approving, 'approved');
+    // How many transfers there were as each wait was made.
+    const before: number[] = [];
+    c.signals.answer = () => {
+      before.push(c.ledger.calls.length);
+      return 'approved';
+    };
+    expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe('Done: moved 5 from account 1 to account 2');
+    expect(before).toEqual([0]);
+    expect(c.ledger.calls).toHaveLength(1);
+    // The wait is the transfer's tool call's, and shows its tool and arguments.
+    expect(c.signals.waits).toEqual([approvalOf(callIdOf(c.ledger.calls[0]!.id))]);
+    // A tool call that needs none runs as it is.
+    expect(await c.attempt('inv2', 'audit the books')).toMatch(/^Done: .*"transfers":1/);
+    expect(c.signals.waits).toHaveLength(1);
+  });
+
+  it('never runs a tool call a person denied, and the model is told', async () => {
+    const c = conversation(approving, 'denied');
+    c.signals.answer = () => 'no, not today';
+    const denied = 'Error: the user rejected tool "transfer"';
+    expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe(`Done: ${denied}`);
+    expect(c.ledger.calls).toEqual([]);
+    const { messages } = await c.read(deepseek.messages());
+    expect(messages[1]!.parts).toEqual([
+      {
+        type: 'tool',
+        id: expect.any(String),
+        name: 'transfer',
+        input: { from: 1, to: 2, amount: 5 },
+        output: denied,
+        error: true,
+      },
+    ]);
+  });
+
+  it('approves with true, or a text that says so, and denies with anything else', async () => {
+    const values = [true, 'approved', ' Yes ', 'OK', { approved: true }, false, 'no', 'not approved', null, {}];
+    const ran = await Promise.all(
+      values.map(async (value, i) => {
+        const c = conversation(approving, `decided-${i}`);
+        c.signals.answer = () => value;
+        await c.attempt('inv1', 'Please move 5 from 1 to 2');
+        return c.ledger.calls.length === 1;
+      }),
+    );
+    expect(ran).toEqual([true, true, true, true, true, false, false, false, false, false]);
+  });
+
+  it('waits for an approval through a crash: the person is asked once, and the tool runs once, after it', async () => {
+    const c = conversation(approving, 'approval-crash');
+    const input = 'Please move 5 from 1 to 2';
+    const before: number[] = [];
+    const asked = Promise.withResolvers<void>();
+    // No decision yet: the attempt crashes (or is suspended) while it waits.
+    c.signals.answer = () => {
+      before.push(c.ledger.calls.length);
+      asked.resolve();
+      return new Promise(() => {});
+    };
+    c.attempt('inv1', input).catch(() => {});
+    await asked.promise;
+    c.signals.answer = () => {
+      before.push(c.ledger.calls.length);
+      return 'approved';
+    };
+    // The retry asks the model again, which makes the call again under a new
+    // id: it joins the first call's wait, which the person answers.
+    expect(await c.attempt('inv1', input)).toBe('Done: moved 5 from account 1 to account 2');
+    const [wait, again] = c.signals.waits;
+    expect(c.signals.waits).toHaveLength(2);
+    expect(again).toEqual(wait);
+    expect(before).toEqual([0, 0]);
+    expect(c.ledger.transfers.size).toBe(1);
+  });
+
+  it('is asked once for each call through a crash at any of its state requests', async () => {
+    const wrong: string[] = [];
+    const crashAt = async (n: number) => {
+      const c = conversation(approving, 'approval-anywhere');
+      // How many transfers there were as each wait was made.
+      const before: number[] = [];
+      c.signals.answer = () => {
+        before.push(c.ledger.calls.length);
+        return 'approved';
+      };
+      if ((await c.attempt('inv1', 'Please move 5 from 1 to 2', n)) !== 'crashed') return 'finished';
+      const answer = await c.attempt('inv1', 'Please move 5 from 1 to 2').catch((error: unknown) => String(error));
+      // One wait for each call the model made: a retry with `retryOf` (a crash
+      // left the transfer's outcome unknown) is a call of its own, and asks anew.
+      const ids = new Set(c.signals.waits.map((w) => w.id));
+      const calls = new Set(c.signals.waits.map((w) => JSON.stringify(w.input)));
+      const ok =
+        answer === 'Done: moved 5 from account 1 to account 2' &&
+        c.ledger.transfers.size === 1 &&
+        before[0] === 0 &&
+        ids.size === calls.size;
+      if (!ok)
+        wrong.push(`${n}: ${answer}, ${c.ledger.transfers.size} transfers, ${ids.size} waits for ${calls.size} calls`);
+      return 'crashed';
+    };
+    let crashes = 0;
+    for (let from = 1, done = false; !done; from += 8) {
+      const batch = await Promise.all(Array.from({ length: 8 }, (_, i) => crashAt(from + i)));
+      crashes += batch.filter((r) => r === 'crashed').length;
+      done = batch.includes('finished');
+    }
+    expect(wrong).toEqual([]);
+    expect(crashes).toBeGreaterThan(10);
+  }, 600_000);
+
+  it('ends a turn cancelled while it waits for an approval, and never runs the tool', async () => {
+    const map = new Map<string, Uint8Array>();
+    let ran = false;
+    const transfer = tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: () => {
+        ran = true;
+        return 'moved';
+      },
+    });
+    const handler = handlerOf(deepseek.chat({ tools: [transfer], approval: ['transfer'] }));
+    const asked = Promise.withResolvers<void>();
+    const sql = sqlAttempt({
+      map,
+      key: 'approval-cancel',
+      id: 'inv1',
+      signal: () => {
+        asked.resolve();
+        return new Promise(() => {});
+      },
+    });
+    const answering = sql.end(() => handler(sql.ctx, 'Please move 5 from 1 to 2'));
+    await asked.promise;
+    sql.cancel();
+    await expect(answering).rejects.toBeInstanceOf(restate.CancelledError);
+    const next = sqlAttempt({ map, key: 'approval-cancel', id: 'inv2' });
+    expect(await next.end(() => handler(next.ctx, 'Hello'))).toBe(ANSWER);
+    expect(ran).toBe(false);
+    const read = sqlAttempt({ map, key: 'approval-cancel', id: 'read', shared: true });
+    const { messages } = await read.end(() => deepseek.messages()(read.view, {}));
+    expect(messages.map((m) => m.parts)).toEqual([
+      [{ type: 'text', text: 'Please move 5 from 1 to 2' }],
+      [{ type: 'text', text: CANCELLED }],
+      [{ type: 'text', text: 'Hello' }],
+      [{ type: 'text', text: ANSWER }],
+    ]);
+  });
+
+  it('ends a turn cancelled while an approved tool runs with the call cancelled, not done', async () => {
+    const map = new Map<string, Uint8Array>();
+    const started = Promise.withResolvers<void>();
+    const transfer = tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: async () => {
+        started.resolve();
+        return new Promise<never>(() => {});
+      },
+    });
+    const handler = handlerOf(deepseek.chat({ tools: [transfer], approval: ['transfer'] }));
+    const sql = sqlAttempt({ map, key: 'approved-cancel', id: 'inv1', signal: () => 'approved' });
+    const answering = sql.end(() => handler(sql.ctx, 'Please move 5 from 1 to 2'));
+    await started.promise;
+    sql.cancel();
+    await expect(answering).rejects.toBeInstanceOf(restate.CancelledError);
+    const read = sqlAttempt({ map, key: 'approved-cancel', id: 'read', shared: true });
+    const { messages } = await read.end(() => deepseek.messages()(read.view, {}));
+    // Its approval returned, but the call did not: it is closed as cancelled.
+    expect(messages[1]!.parts[0]).toMatchObject({ type: 'tool', name: 'transfer', output: CANCELLED, error: true });
   });
 });

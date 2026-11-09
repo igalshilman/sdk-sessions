@@ -25,15 +25,30 @@ const assistant = claude.agent({ name: 'assistant', system: 'Answer briefly.', t
 await serve(assistant);
 ```
 
-| Option      | What                                                                                                                                                           |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`     | `anthropic/model-id`; or else `MODEL`, or else `anthropic/claude-sonnet-5-5` (`ANTHROPIC_API_KEY`)                                                             |
-| `system`    | The system prompt                                                                                                                                              |
-| `tools`     | `tool()`s and Restate's tools of `@restatedev/agents`, or the SDK's runnable tools (such as `betaZodTool`)                                                     |
-| `output`    | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
-| `client`    | The Anthropic client (a base URL or a proxy of your own, say); by default one with `ANTHROPIC_API_KEY`                                                         |
-| `maxTokens` | The most tokens of each of the model's replies (default 16000): a reply cut off there fails its message (a terminal error)                                     |
-| `effort`    | How much effort the model puts into each reply: `low`, `medium`, `high`, `xhigh` or `max` (default: the model's)                                               |
+| Option         | What                                                                                                                                                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`        | `anthropic/model-id`; or else `MODEL`, or else `anthropic/claude-sonnet-5-5` (`ANTHROPIC_API_KEY`)                                                                                                                        |
+| `system`       | The system prompt                                                                                                                                                                                                         |
+| `tools`        | `tool()`s and Restate's tools of `@restatedev/agents`, or the SDK's runnable tools (such as `betaZodTool`)                                                                                                                |
+| `output`       | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)): asked for natively where the model has structured outputs |
+| `nativeOutput` | Whether `output` is asked for with the API's structured outputs (`output_config.format`) rather than in the prompt (default: if the model has them, as Claude's 4.5 models and later do)                                  |
+| `client`       | The Anthropic client (a base URL or a proxy of your own, say); by default one with `ANTHROPIC_API_KEY`                                                                                                                    |
+| `maxTokens`    | The most tokens of each of the model's replies (default 16000): a reply cut off there fails its message (a terminal error)                                                                                                |
+| `effort`       | How much effort the model puts into each reply: `low`, `medium`, `high`, `xhigh` or `max` (default: the model's)                                                                                                          |
+
+With `output`, a model with structured outputs is asked for the answer
+natively: each request of the run has the JSON schema of `output` as its
+`output_config.format` (the SDK's `betaZodOutputFormat`), which holds the
+model's final reply to it, while its tool calls go on as before. Neither
+the system prompt nor the prompt asks for it. The reply is checked all the
+same, against what the API does not hold it to (a string's `max`, an
+`enum`: the SDK moves them into the schema's descriptions), and a reply
+that does not fit is asked again once, as when asked in the prompt. A
+declined reply, or one cut off at `maxTokens`, ends the turn, as without
+`output`. A schema the API refuses (one too complex for it, say) refuses
+the message: `nativeOutput: false` asks in the prompt, as for a model
+without structured outputs (Claude 3, Opus 4 and 4.1, Sonnet 4) or a model
+id the agent does not know.
 
 For a session object of your own, `claude.chat(options)` is the handler and
 `claude.messages()` the view; `options` may be a function of the

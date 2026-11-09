@@ -129,7 +129,16 @@ const NO_USAGE = {
  */
 export const items: Items<Item> = {
   dump: (item) => JSON.stringify(item),
-  load: (stored) => JSON.parse(stored) as Item,
+  load: (stored) => {
+    // Only a pi message, with the entry it was copied from: another framework's row is not one.
+    const item = JSON.parse(stored) as Item;
+    const { message, entry, ...rest } = item;
+    if (typeof message !== 'object' || message === null || typeof message.role !== 'string')
+      throw new Error("not a pi item (a pi-ai message, with its entry's id)");
+    if (Object.keys(rest).length > 0 || (entry !== undefined && typeof entry !== 'number'))
+      throw new Error(`not a pi item: ${Object.keys(item).join(', ')}`);
+    return item;
+  },
   prompt: (text) => ({ message: { role: 'user', content: text, timestamp: 0 } }),
   reply: (text) => ({
     message: {

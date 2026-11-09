@@ -621,6 +621,34 @@ describe("a framework's copy into its turn", () => {
     expect(written.map((e) => e.item.text)).toEqual(['copied', 'again']);
     expect(ordered).toEqual(written.map((e) => e.n));
   });
+
+  it("gives the turn's answer a seq after the copy's, when the answer waits for the copy's transaction", async () => {
+    const map = new Map<string, Uint8Array>();
+    const sql = sqlAttempt({ map, key: 'k', id: 'inv1' });
+    let copying: Promise<void> | undefined;
+    await sql.end(async () => {
+      await answerOnce(sql.ctx, 'q', ITEMS, async (conversation) => {
+        const turn = conversation.turn;
+        await turn.appendReply([{ role: 'assistant', text: 'done' }]);
+        const gate = Promise.withResolvers<void>();
+        // The framework's transaction copies an item that says nothing (a reasoning item, say) into the turn...
+        copying = sql.ctx.db.transaction(async (tx) => {
+          await gate.promise;
+          await turn.copyIn(tx, [{ item: {} }]);
+        });
+        // ...and commits once the turn's answer, which ends with the reply above, waits for it.
+        setTimeout(gate.resolve, 10);
+        return 'done';
+      });
+      await copying;
+    });
+    // A follower whose cursor is at the copy reads the answer after it: the answer's seq is the latest.
+    const read = sqlAttempt({ map, key: 'k', id: 'read', shared: true });
+    const [[answered, copied]] = (await read.end(() =>
+      read.view.db.values(`SELECT (SELECT answered_seq FROM restate_agent_turns), (SELECT MAX(seq) FROM ${STEPS})`),
+    )) as [[number, number]];
+    expect(answered).toBeGreaterThan(copied);
+  });
 });
 
 /** A handler on the made-up framework whose message `die` leaves its turn open (its invocation gone). */

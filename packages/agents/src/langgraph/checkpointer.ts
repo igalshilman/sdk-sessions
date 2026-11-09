@@ -118,6 +118,9 @@ function pairs(versions: [string, unknown][]): [string, string[]] {
   ];
 }
 
+/** The tables of a thread's checkpoints. */
+const TABLES = ['restate_langgraph_checkpoints', 'restate_langgraph_channel_values', 'restate_langgraph_writes'];
+
 /**
  * A checkpoint the latest of its thread needs (see `#kept`): its id, its
  * parent's, its channels' versions, and the delta channels whose steps since
@@ -178,6 +181,7 @@ async function dropEarlier(tx: DatabaseWriter, threadId: string, ns: string, kep
 export class SqlCheckpointSaver extends BaseCheckpointSaver {
   #db: Database;
   #latest: boolean;
+  #metadata: Record<string, unknown>;
   /**
    * With `history: 'latest'`, the checkpoints the latest of each thread
    * (`[thread, namespace]`) needs, from it back, as the last `put` stored
@@ -190,15 +194,21 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
   /**
    * `db`: a database session (`ctx.db`). `history`: the checkpoints a thread
    * keeps, `all` (the default) or the `latest` only; `serde`: LangGraph's
-   * serializer, by default its own.
+   * serializer, by default its own; `metadata`: added to each checkpoint's
+   * metadata (LangGraph's JavaScript runs do not store their config's).
    */
   constructor(
     db: Database,
-    { history = 'all', serde }: { history?: 'all' | 'latest'; serde?: SerializerProtocol } = {},
+    {
+      history = 'all',
+      serde,
+      metadata = {},
+    }: { history?: 'all' | 'latest'; serde?: SerializerProtocol; metadata?: Record<string, unknown> } = {},
   ) {
     super(serde);
     this.#db = db;
     this.#latest = history === 'latest';
+    this.#metadata = metadata;
   }
 
   /**
@@ -386,7 +396,7 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
       if (!thread_id) throw new Error('Missing "thread_id" field in passed "config.configurable".');
       const { channel_values: values, ...rest } = copyCheckpoint(checkpoint);
       const [type, stored] = await this.serde.dumpsTyped(rest);
-      const [metadataType, metadataValue] = await this.serde.dumpsTyped(metadata);
+      const [metadataType, metadataValue] = await this.serde.dumpsTyped({ ...metadata, ...this.#metadata });
       if (type !== metadataType) throw new Error('Failed to serialize checkpoint and metadata to the same type.');
       // The channels this step changed, at their new versions.
       const changed = await Promise.all(
@@ -451,16 +461,43 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     });
   }
 
+  /**
+   * Delete checkpoints of `threadIds`: all but the latest of each namespace
+   * (`keepLatest`, the default), or all (`delete`), as LangGraph's `prune`.
+   * With `keepLatest`, the writes and channel values that only the deleted
+   * checkpoints referenced go with them; the latest keeps its pending writes,
+   * so a paused run still resumes, and its ancestors back to the snapshot of
+   * each of its delta channels (see `#kept`). A namespace is the thread's own
+   * (`''`) or a subgraph run's, which keeps its latest checkpoint too.
+   */
+  prune(threadIds: string[], { strategy = 'keepLatest' }: { strategy?: 'keepLatest' | 'delete' } = {}): Promise<void> {
+    return this.#serial(() =>
+      this.#db.transaction(async (tx) => {
+        for (const threadId of threadIds) {
+          if (strategy === 'delete') {
+            for (const table of TABLES) await tx.execute(`DELETE FROM ${table} WHERE thread_id = ?`, [threadId]);
+            continue;
+          }
+          const latest = await tx.values(
+            'SELECT c.checkpoint_ns, c.checkpoint_id FROM restate_langgraph_checkpoints c WHERE c.thread_id = ? AND c.checkpoint_id = ' +
+              '(SELECT max(l.checkpoint_id) FROM restate_langgraph_checkpoints l WHERE l.thread_id = c.thread_id AND l.checkpoint_ns = c.checkpoint_ns)',
+            [threadId],
+          );
+          for (const [ns, id] of latest) {
+            const checkpoint = await this.#read(tx, threadId, String(ns), String(id));
+            if (!checkpoint) continue;
+            this.#needed.delete(JSON.stringify([threadId, String(ns)]));
+            await dropEarlier(tx, threadId, String(ns), await this.#kept(tx, threadId, String(ns), checkpoint));
+          }
+        }
+      }),
+    );
+  }
+
   deleteThread(threadId: string): Promise<void> {
     return this.#serial(() =>
       this.#db.transaction(async (tx) => {
-        for (const table of [
-          'restate_langgraph_checkpoints',
-          'restate_langgraph_channel_values',
-          'restate_langgraph_writes',
-        ]) {
-          await tx.execute(`DELETE FROM ${table} WHERE thread_id = ?`, [threadId]);
-        }
+        for (const table of TABLES) await tx.execute(`DELETE FROM ${table} WHERE thread_id = ?`, [threadId]);
       }),
     );
   }

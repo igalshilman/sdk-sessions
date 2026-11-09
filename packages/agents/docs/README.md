@@ -67,12 +67,14 @@ flowchart LR
 
 ## The pages
 
-| Page                                | What it holds                                                                                                                                           |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [The plan](plan.md)                 | the decisions, the steps in order (each with its files, design, tests and when it is done), what must hold afterwards, the tests that define it, review |
-| [Turn semantics](turns.md)          | what a turn is; its life, its end, attempts, stops, dead turns and `settle`; the turn model in code; what clients see; the guarantees                   |
-| [The conversation](conversation.md) | the data layout (every table), a worked example, which turns a turn loads, what the model gets, framework-owned history, the call records, the schemas  |
-| [The frameworks](frameworks.md)     | per framework: how it works today (with the problems found), the library's own model, and how it maps onto the store                                    |
+| Page                                  | What it holds                                                                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [The plan](plan.md)                   | the decisions, the steps in order (each with its files, design, tests and when it is done), what must hold afterwards, the tests that define it, review |
+| [Turn semantics](turns.md)            | what a turn is; its life, its end, attempts, stops, dead turns and `settle`; the turn model in code; what clients see; the guarantees                   |
+| [The conversation](conversation.md)   | the data layout (every table), a worked example, which turns a turn loads, what the model gets, framework-owned history, the call records, the schemas  |
+| [The frameworks](frameworks.md)       | per framework: how it works today (with the problems found), the library's own model, and how it maps onto the store                                    |
+| [Testing](testing.md)                 | how the agents are tested, and each past bug brought back to see which tests notice (`scripts/resurrect.ts`)                                            |
+| [Access patterns](access-patterns.md) | what a conversation asks of Restate state, turn after turn, warm and in a new process (`scripts/access-patterns.ts`)                                    |
 
 To implement it, read [the plan](plan.md) first, then turns, the
 conversation and the frameworks. To understand it, read turns, then the
@@ -132,6 +134,10 @@ chain here, `Stop.guard` is a race with the turn's `AbortSignal`
   history, and its turns hold copies of its messages
   ([The conversation](conversation.md#framework-owned-history)). The Python
   SDK has this only for a LangGraph graph of your own (`graph=`).
+- **`waitFor` can rejoin** (`rejoin`), which Python's `wait_for` never does:
+  the DeepSeek Harness makes a call cut off by a crash again under a new id,
+  so its approvals join the earlier attempt's wait by their input, as
+  Restate's own tools do. Pydantic AI keeps a deferred call's id.
 - **Snapshots are not ported** (no framework here needs them). Their table is
   created anyway, so that the schema is the Python SDK's, step for step.
 - **Names** follow this package: `answerOnce`, `askAgain`, `stopSignalOf`,

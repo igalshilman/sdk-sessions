@@ -30,6 +30,11 @@
 // - A message is answered once per invocation: its message carries the
 //   invocation id, and a retried attempt returns the answer of the turn that
 //   finished it.
+// - A tool call that needs a person's approval (`approval`) waits for the
+//   signal `approval` before it runs: the harness asks its approval service
+//   (@deepseek-ai/dsh-user-approval), which this answers with a wait
+//   (`waitFor` of ../tools.ts). The wait is opened once: a crash, or a
+//   suspension, has the model make the call again, which joins it.
 import * as restate from '@restatedev/sessions';
 import { Context } from '@deepseek-ai/cordis';
 import { AgentRegistry } from '@deepseek-ai/dsh-agent';
@@ -44,6 +49,7 @@ import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
 import { TokenMeter } from '@deepseek-ai/dsh-token-meter';
 import { ToolResultPruner } from '@deepseek-ai/dsh-compaction-tool-result-pruner';
 import { BasicCompactionEngine, type BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic';
+import { ApprovalService, type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval';
 import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
 import {
   defineTool,
@@ -73,7 +79,7 @@ import { answerOnce, type Items, type Parsed, type Run, type Turn } from '../con
 import { conversationView } from '../messages.ts';
 import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
-import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
+import { isTool, jsonSchemaOf, type Tool as AnyTool, waitFor } from '../tools.ts';
 import type { z } from 'zod';
 import { SqlSessionPersistence } from './persistence.ts';
 
@@ -124,19 +130,25 @@ function routeOf(model: string): Route {
 /**
  * The harness, its session in `db`: the services
  * an agent loop needs, the persistence and its checkpoints, compaction (with
- * `compaction`'s settings), and the provider of `route`.
+ * `compaction`'s settings), the provider of `route`, and with `approvals`
+ * the approval service, which asks before a tool call that needs a person's
+ * approval runs (see {@link approving}).
  */
 async function boot(
   db: restate.Database,
   route: Route,
   system?: string,
   compaction: BasicCompactionConfig = {},
+  approvals = false,
 ): Promise<Context> {
   const harness = new Context();
   await harness.plugin(LlmRuntime);
   await harness.plugin(SessionStore);
   await harness.plugin(SystemPrompt, system ? { personaPrefix: system } : {});
   await harness.plugin(ToolRuntime, {});
+  // Without it, the harness denies a call that asks for an approval. With it,
+  // the model is also told that some calls may ask for one.
+  if (approvals) await harness.plugin(ApprovalService, {});
   await harness.plugin(AgentRegistry);
   await harness.plugin(SessionProjectionRegistry);
   await harness.plugin(SqlSessionPersistence, { db });
@@ -264,6 +276,72 @@ const native = (t: AnyTool, ctx: restate.SessionContext): ToolDefinition =>
     },
   });
 
+/** The signal that a tool call waits for, to the agent, when it needs a person's approval (`approval`). */
+export const APPROVAL = 'approval';
+
+/** Which tool calls wait for a person's approval: the names of their tools, or a function of a call that says whether it does. */
+export type Approval = readonly string[] | ((call: { name: string; args: unknown }) => boolean);
+
+/** The texts that approve a tool call, whatever their case. */
+const APPROVED: ReadonlySet<string> = new Set(['approved', 'approve', 'yes', 'ok', 'allow', 'allowed']);
+
+/**
+ * What the value of an {@link APPROVAL} signal decides about its tool call:
+ * `true`, `{ "approved": true }`, or a text such as "approved" or "yes"
+ * approves it once; anything else rejects it, so a value that does not say
+ * "approved" never runs the tool.
+ */
+const decided = (value: unknown): ApprovalOutcome =>
+  value === true ||
+  (typeof value === 'string' && APPROVED.has(value.trim().toLowerCase())) ||
+  (typeof value === 'object' && value !== null && (value as { approved?: unknown }).approved === true)
+    ? 'allowed-once'
+    : 'rejected';
+
+/**
+ * Have the harness of the agent of `agentCtx` ask for an approval before
+ * each tool call that `approval` names (`tools/pre-execute`, once the call
+ * is allowed otherwise), and answer each ask (`approval/request`) with a
+ * person's decision: a wait for the signal {@link APPROVAL} (`waitFor`),
+ * which `pending` shows with the call's tool and arguments, without holding
+ * a process.
+ *
+ * A crash, or a suspension, ends the attempt before the harness stored the
+ * call: the retry asks the model again, which makes the call again under a
+ * new id. Made with the same arguments, it joins the wait (`rejoin`): the
+ * person is asked once. The wait is an approval (`approval`): a stopped
+ * turn does not report its call as done because it was approved. An error
+ * of the wait fails the attempt (`fail`), and its ask never ends: the
+ * harness does not go on without a decision.
+ */
+function approving(agentCtx: Context, ctx: restate.SessionContext, approval: Approval, fail: (error: unknown) => void) {
+  const needs = typeof approval === 'function' ? approval : ({ name }: { name: string }) => approval.includes(name);
+  // The calls asked about, by id: what `pending` shows of each.
+  const asked = new Map<string, { tool: string; args: unknown }>();
+  agentCtx.on('tools/pre-execute', async (exec, next) => {
+    const decision = await next();
+    if (decision.kind !== 'allow' || !needs({ name: exec.name, args: exec.arguments })) return decision;
+    asked.set(exec.callId, { tool: exec.name, args: exec.arguments });
+    return { kind: 'ask' };
+  });
+  agentCtx.on('approval/request', async ({ callId }, next) => {
+    const call = callId === undefined ? undefined : asked.get(callId);
+    // Asked by another (none is mounted): no one answers, and the harness denies it.
+    if (callId === undefined || call === undefined) return next();
+    asked.delete(callId);
+    try {
+      // The calls whose results are stored are forgotten first: an earlier
+      // attempt's call with the same arguments, approved and done, is not this one.
+      await toolCallStarted(ctx);
+      return decided(await waitFor(ctx, callId, APPROVAL, call, { approval: true, rejoin: true }));
+    } catch (error) {
+      fromTool(ctx, error);
+      fail(error);
+      return new Promise<never>(() => {});
+    }
+  });
+}
+
 /** An agent's options: `chat` and `prompt` take them. */
 export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undefined> {
   /**
@@ -275,6 +353,15 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   system?: string;
   /** The agent's tools: `tool()`s, Restate's (`call`, `signal`...), or the harness's (`defineTool`). */
   tools?: (AnyTool | ToolDefinition)[];
+  /**
+   * The tool calls that wait for a person's approval before they run: the
+   * names of their tools, or a function of a call (its tool's name, and its
+   * arguments) that says whether it does. Each waits for the signal
+   * {@link APPROVAL} to the agent, which `pending` shows with the call's
+   * tool and arguments; `true`, or a text such as "approved" or "yes",
+   * approves it, anything else denies it.
+   */
+  approval?: Approval;
   /**
    * When the model's input is condensed: the settings of the harness's
    * compaction (@deepseek-ai/dsh-compaction-basic), such as `thresholdRatio`
@@ -296,7 +383,13 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
  */
 export const items: Items<Message> = {
   dump: (m) => JSON.stringify(m),
-  load: (stored) => freezeMessage(JSON.parse(stored) as Message),
+  load: (stored) => {
+    // Only a harness's message (an id, a role, a list of content parts): another framework's row is not one.
+    const m = JSON.parse(stored) as Message;
+    if (typeof m.id !== 'string' || typeof m.role !== 'string' || !Array.isArray(m.content))
+      throw new Error("not a DeepSeek harness's message (an id, a role and a list of content parts)");
+    return freezeMessage(m);
+  },
   prompt: (text) => message('prompt', text),
   reply: (text) =>
     freezeMessage({
@@ -383,11 +476,11 @@ const copying =
  * continued after a crash.
  */
 const runOf =
-  (ctx: restate.SessionContext, { model: named, system, tools = [], compaction }: Options): Run<Message> =>
+  (ctx: restate.SessionContext, { model: named, system, tools = [], compaction, approval }: Options): Run<Message> =>
   async (conversation) => {
     const turn = conversation.turn;
     const route = routeOf(modelOf(named, DEEPSEEK_MODEL));
-    const harness = await boot(ctx.db, route, system, compaction);
+    const harness = await boot(ctx.db, route, system, compaction, approval !== undefined);
     const persistence = harness.sessionPersistence as SqlSessionPersistence;
     // A tool's error fails the attempt, which Restate retries: the harness
     // stores nothing more, so the retry finds the tool's call without a result.
@@ -417,6 +510,7 @@ const runOf =
         agentOptions: route,
         setup: (agentCtx: Context) => {
           for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail, returned));
+          if (approval !== undefined) approving(agentCtx, ctx, approval, fail);
         },
       };
       // Resuming closes a harness turn a crash, or a killed invocation, left open.

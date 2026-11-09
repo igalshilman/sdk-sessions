@@ -24,10 +24,11 @@ import {
   crashedAnywhere,
   SAID_IN_TURNS as SAID,
   handlerOf,
+  type PromptHandler,
   sqlAttempt,
   withoutIds,
 } from './support.ts';
-import { HttpError, teller } from './fakes/claude.ts';
+import { HttpError, reply as tellerReply, teller } from './fakes/claude.ts';
 import * as claude from '@restatedev/agents/claude';
 import { bank } from './bank.ts';
 import { prompt } from './claude.ts';
@@ -510,5 +511,176 @@ describe('the Claude agent', () => {
     };
     const c = conversation(claude.chat({ tools: [strict] }), 'tool-error');
     expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe('Done: the bank is closed');
+  });
+});
+
+const Plan = z.object({ summary: z.string(), parts: z.array(z.string()) });
+const PLAN = { summary: 'A calculator', parts: ['parser', 'history'] };
+type Message = ReturnType<typeof teller.reply>;
+type Request = { system?: string; messages: MessageParam[]; output_config?: Record<string, unknown> };
+
+/** The teller's reply to `messages`, saying `text`. */
+const say = (messages: MessageParam[], text: string): Message => ({
+  ...tellerReply(messages),
+  content: [{ type: 'text', text, citations: null }],
+  stop_reason: 'end_turn',
+});
+
+/** A summary of a calculator too long for `Short`. */
+const Short = z.object({ summary: z.string().max(10) });
+const long = (messages: MessageParam[]) => say(messages, JSON.stringify({ summary: 'A calculator, at length' }));
+
+/** The requests of a prompt of `options` to the teller, whose replies `replies` gives, and its answer or error. */
+async function prompted(
+  key: string,
+  options: claude.Options,
+  replies: (messages: MessageParam[], said: string) => Message,
+  text = 'Plan it',
+) {
+  const reply = teller.reply;
+  const requests: Request[] = [];
+  teller.reply = (messages, request) => {
+    requests.push(request as Request);
+    const last = messages.at(-1)!.content;
+    return replies(messages, typeof last === 'string' ? last : '');
+  };
+  try {
+    const chat = claude.chat(options) as unknown as PromptHandler;
+    const answer = await conversation(chat, key)
+      .attempt('inv1', text)
+      .catch((error: unknown) => error);
+    return { answer, requests };
+  } finally {
+    teller.reply = reply;
+  }
+}
+
+/** How an agent of `options` asks for the plan: natively, or in the system prompt and the prompt. */
+async function howAsked(options: claude.Options) {
+  const key = `${options.model}-${options.nativeOutput}`;
+  const { answer, requests } = await prompted(key, { output: Plan, ...options }, (messages) =>
+    say(messages, JSON.stringify(PLAN)),
+  );
+  const [request] = requests;
+  return {
+    answer,
+    natively: request!.output_config?.format !== undefined,
+    system: request!.system,
+    prompt: request!.messages[0]!.content,
+  };
+}
+
+const NATIVELY = { answer: PLAN, natively: true, system: undefined, prompt: 'Plan it' };
+const IN_THE_PROMPT = {
+  answer: PLAN,
+  natively: false,
+  // The system prompt asks for it, with the schema, and the prompt is reminded of it.
+  system: expect.stringMatching(/^Your final reply is your answer, as JSON only .*\n\{"\$schema"/),
+  prompt: expect.stringMatching(/^Plan it\n\nWhen you are done, reply with your answer as JSON/),
+};
+
+describe("the Claude agent's output", () => {
+  it('is asked for natively: its JSON schema on each request, with tool calls, and nothing in the prompt', async () => {
+    // A tool call, then the plan once the tool answered.
+    const { answer, requests } = await prompted(
+      'native',
+      { system: 'Plan briefly.', tools: bank('ClaudeAgent'), effort: 'low', output: Plan },
+      (messages) => {
+        const made = tellerReply(messages);
+        return made.content.some((c) => c.type === 'tool_use') ? made : say(messages, JSON.stringify(PLAN));
+      },
+      'Please move 5 from 1 to 2',
+    );
+    expect(answer).toEqual(PLAN);
+    const format = {
+      type: 'json_schema',
+      schema: expect.objectContaining({
+        type: 'object',
+        properties: { summary: { type: 'string' }, parts: { type: 'array', items: { type: 'string' } } },
+        required: ['summary', 'parts'],
+        additionalProperties: false,
+      }),
+    };
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request.output_config).toEqual({ effort: 'low', format });
+      // The system prompt and the prompt as they are: the API holds the reply to the schema.
+      expect(request.system).toBe('Plan briefly.');
+      expect(request.messages[0]).toEqual({ role: 'user', content: 'Please move 5 from 1 to 2' });
+    }
+  });
+
+  it('is asked for natively by the models with structured outputs, and in the prompt by the others', async () => {
+    const natively = [
+      'claude-sonnet-5-5',
+      'claude-opus-5-5',
+      'claude-fable-5-1',
+      'claude-haiku-5-5',
+      'claude-opus-4-8',
+      'claude-opus-4-5-20251101',
+      'claude-haiku-4-5-20251001',
+      'claude-mythos-preview',
+    ];
+    const inThePrompt = [
+      'claude-3-7-sonnet-latest',
+      'claude-opus-4-1-20250805',
+      'claude-opus-4-20250514',
+      'claude-sonnet-4-0',
+      'a-gateway-model',
+    ];
+    for (const model of natively) {
+      expect([model, await howAsked({ model: `anthropic/${model}` })]).toEqual([model, NATIVELY]);
+    }
+    for (const model of inThePrompt) {
+      expect([model, await howAsked({ model: `anthropic/${model}` })]).toEqual([model, IN_THE_PROMPT]);
+    }
+    // `nativeOutput` decides, whatever the model.
+    expect(await howAsked({ nativeOutput: false })).toEqual(IN_THE_PROMPT);
+    expect(await howAsked({ model: 'anthropic/a-gateway-model', nativeOutput: true })).toEqual(NATIVELY);
+  });
+
+  it('is asked for again, natively, if the reply does not fit what the API cannot hold it to; then the turn fails', async () => {
+    // A string's maxLength is not the API's to keep: the SDK puts it in the description, and the check asks again.
+    const fixed = await prompted('again', { output: Short }, (messages, said) =>
+      said.startsWith('Your reply is not') ? say(messages, JSON.stringify({ summary: 'Calculator' })) : long(messages),
+    );
+    expect(fixed.answer).toEqual({ summary: 'Calculator' });
+    expect(fixed.requests).toHaveLength(2);
+    for (const request of fixed.requests) {
+      expect(request.output_config).toEqual({
+        format: {
+          type: 'json_schema',
+          schema: expect.objectContaining({
+            properties: { summary: { type: 'string', description: '{maxLength: 10}' } },
+          }),
+        },
+      });
+    }
+    expect(fixed.requests[1]!.messages.at(-1)!.content).toMatch(
+      /^Your reply is not the answer asked for: .*<=10 characters/,
+    );
+    // Asked again, a reply that still does not fit fails the turn.
+    const failed = await prompted('again-failed', { output: Short }, long);
+    expect(failed.answer).toBeInstanceOf(restate.TerminalError);
+    expect((failed.answer as Error).message).toMatch(/^The agent's reply is not the answer asked for: /);
+    expect(failed.requests).toHaveLength(2);
+  });
+
+  it('ends a turn the model declined, natively asked, without asking again', async () => {
+    const { answer, requests } = await prompted('declined', { output: Plan }, (messages) => ({
+      ...say(messages, 'I cannot help with that.'),
+      stop_reason: 'refusal',
+      stop_details: {
+        type: 'refusal',
+        category: 'cyber',
+        explanation: null,
+        fallback_credit_token: null,
+        fallback_has_prefill_claim: null,
+        recommended_model: null,
+      },
+    }));
+    expect(answer).toBeInstanceOf(restate.TerminalError);
+    expect((answer as Error).message).toBe('the model declined to answer (cyber)');
+    expect(requests).toHaveLength(1);
   });
 });

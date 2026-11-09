@@ -342,10 +342,11 @@ sequenceDiagram
   way, through `waitFor(ctx, callId, signal, input, { approval })`. Such a
   wait is its tool call's alone: the framework stored the call before it
   waits, so a new call with the same input (the model asking again after the
-  first's answer) waits anew, and never gets an earlier call's approval. An
-  approval (`approval: true`) is not the call: a turn stopped before the
-  call's result is stored reports the call as not done, whatever its
-  approval returned.
+  first's answer) waits anew, and never gets an earlier call's approval
+  (DeepSeek, which gives a cut-off call a new id, rejoins the wait by its
+  input instead: `rejoin`). An approval (`approval: true`) is not the call:
+  a turn stopped before the call's result is stored reports the call as not
+  done, whatever its approval returned.
 - **A dead attempt stops.** An attempt that ends while its process lives on
   (Restate suspended it, gave up on it, or lost its connection) stops its
   work, a model's request included: `stopSignalOf(ctx)` aborts with

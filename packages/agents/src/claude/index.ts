@@ -27,9 +27,14 @@
 // - A reply cut off at `maxTokens`, declined, or past the model's context
 //   window ends the turn: its tool calls do not run, and the handler fails
 //   with a terminal error.
+// - With `output`, a model with structured outputs is asked for it natively:
+//   each request of the run has its JSON schema (`output_config.format`),
+//   which holds the final reply to it, and tool calls go on as before. The
+//   reply is checked all the same (output.ts).
 import * as restate from '@restatedev/sessions';
 import { ScopeKey } from '@restatedev/sessions/internal';
 import Anthropic from '@anthropic-ai/sdk';
+import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
 import type { BetaRunnableTool, BetaToolRunContext } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 import { ToolError } from '@anthropic-ai/sdk/lib/tools/ToolError';
 import {
@@ -89,7 +94,16 @@ const storedText = (content: string | readonly { type: string; text?: string }[]
  */
 export const items: Items<MessageParam> = {
   dump: (message) => JSON.stringify(message),
-  load: (stored) => JSON.parse(stored) as MessageParam,
+  load: (stored) => {
+    // Only a message of the API's (a role and its content): another framework's row is not one.
+    const message = JSON.parse(stored) as MessageParam;
+    const { role, content, ...rest } = message;
+    if ((role !== 'user' && role !== 'assistant') || (typeof content !== 'string' && !Array.isArray(content)))
+      throw new Error('not a message of the Claude API (a role and its content)');
+    if (Object.keys(rest).length > 0)
+      throw new Error(`not a message of the Claude API: ${Object.keys(rest).join(', ')}`);
+    return message;
+  },
   prompt: (text) => ({ role: 'user', content: text }),
   // The API refuses an empty text: an empty answer, as the model sees it later, says so.
   reply: (text) => ({ role: 'assistant', content: text.trim() ? text : NO_ANSWER }),
@@ -171,6 +185,8 @@ interface Agent {
   effort?: Effort;
   system?: string;
   tools: BetaRunnableTool[];
+  /** The JSON schema of `output`, asked for natively: the API holds the final reply to it. */
+  format?: Anthropic.Beta.Messages.BetaJSONOutputFormat;
 }
 
 /**
@@ -182,7 +198,7 @@ interface Agent {
 const runOf =
   (ctx: restate.SessionContext, agent: Agent): Run<MessageParam> =>
   async (conversation) => {
-    const { client, model, maxTokens, effort, system } = agent;
+    const { client, model, maxTokens, effort, system, format } = agent;
     const turn = conversation.turn;
     for (;;) {
       // A stored final reply is the answer: the model is not asked for it again.
@@ -193,7 +209,7 @@ const runOf =
         {
           model,
           max_tokens: maxTokens,
-          ...(effort === undefined ? {} : { output_config: { effort } }),
+          ...(effort === undefined && format === undefined ? {} : { output_config: { effort, format } }),
           ...(system === undefined ? {} : { system }),
           tools,
           messages: sendable(conversation.history()),
@@ -293,38 +309,74 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
    * (checked), and `chat` and `prompt` answer with (see output.ts).
    */
   output?: O;
+  /**
+   * Whether the model is asked for `output` natively, with the API's
+   * structured outputs (`output_config.format`: the JSON schema the API
+   * holds the final reply to), rather than in the prompt (default: if the
+   * model has them, as Claude's have since the 4.5 models). A schema the API
+   * cannot take (too complex, say) refuses the message: `false` asks in the
+   * prompt instead.
+   */
+  nativeOutput?: boolean;
 }
+
+/**
+ * The Claude models with structured outputs: of each family, the 4.5 models
+ * and later (and Mythos Preview); not Claude 3, Opus 4 and 4.1, or Sonnet 4.
+ */
+const STRUCTURED_OUTPUTS =
+  /claude-(?:(?:opus|sonnet|haiku)-4-[5-9](?!\d)|(?:opus|sonnet|haiku|fable|mythos)-(?:[5-9]|[1-9]\d)|mythos-preview)/;
+
+/** Whether an agent of `options` asks the model for its `output` natively (see `nativeOutput`). */
+const asksNatively = ({ model, output, nativeOutput }: Options) =>
+  output !== undefined &&
+  (nativeOutput ?? STRUCTURED_OUTPUTS.test(modelIdOf(modelOf(model, CLAUDE_MODEL), 'anthropic')));
+
+/**
+ * `output`'s JSON schema, as the API takes it (the SDK's helper's): what the
+ * API does not take (a string's `minLength`, say) goes to a description, and
+ * is left to the check of the reply.
+ */
+const formatOf = (output: z.ZodObject): Anthropic.Beta.Messages.BetaJSONOutputFormat => {
+  const { type, schema } = betaZodOutputFormat(output);
+  return { type, schema };
+};
 
 /** The client of an agent without one of its own, on the context of the turn it answers. */
 const CLIENT = new ScopeKey<Anthropic>('the Anthropic client');
 
 /** The agent of `options`, for the turn of `ctx`. */
-const agentOf = (
-  ctx: restate.SessionContext,
-  { model, system, tools = [], client, maxTokens = 16_000, effort }: Options,
-): Agent => ({
-  client: client ?? CLIENT.of(ctx, () => new Anthropic()),
-  model: modelIdOf(modelOf(model, CLAUDE_MODEL), 'anthropic'),
-  maxTokens,
-  effort,
-  system,
-  tools: tools.map((t) => (isTool(t) ? native(t, ctx) : t)),
-});
+const agentOf = (ctx: restate.SessionContext, options: Options): Agent => {
+  const { model, system, tools = [], client, maxTokens = 16_000, effort, output } = options;
+  return {
+    client: client ?? CLIENT.of(ctx, () => new Anthropic()),
+    model: modelIdOf(modelOf(model, CLAUDE_MODEL), 'anthropic'),
+    maxTokens,
+    effort,
+    system,
+    tools: tools.map((t) => (isTool(t) ? native(t, ctx) : t)),
+    ...(output !== undefined && asksNatively(options) ? { format: formatOf(output) } : {}),
+  };
+};
 
 /**
  * Answer `text`, once: a retried attempt resumes the same prompt. Each prompt
  * of an invocation is a prompt of its own.
  * With `output`, it answers with the value the agent replies with (see
  * output.ts), not its text: a reply that is not one is asked again within
- * its turn, once.
+ * its turn, once. A model with structured outputs is asked for it natively
+ * (`nativeOutput`), else in the prompt.
  */
-export const prompt = <O extends z.ZodObject | undefined = undefined>(
+export const prompt = async <O extends z.ZodObject | undefined = undefined>(
   ctx: restate.SessionContext,
   text: string,
   options: Options<O> = {},
 ): Promise<Answer<O>> =>
-  withChecked(text, options, (t, o, check, reminder) =>
-    answerOnce(ctx, t, items, runOf(ctx, agentOf(ctx, o)), { check, reminder }),
+  withChecked(
+    text,
+    options,
+    (t, o, check, reminder) => answerOnce(ctx, t, items, runOf(ctx, agentOf(ctx, o)), { check, reminder }),
+    asksNatively(options),
   ) as Promise<Answer<O>>;
 
 /**

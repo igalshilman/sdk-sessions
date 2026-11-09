@@ -19,7 +19,7 @@
 // the turns' rows alone, under the ids they have in the full view.
 import type { DatabaseReader, ViewContext } from '@restatedev/sessions';
 import { type ChatMessage, ITEMS, type Messages, type MessagesRequest, type Part } from './common.ts';
-import { failed, type Items, lastOf, SCHEMA, startOf, STEPS, TURNS } from './conversation.ts';
+import { failed, type Items, lastOf, loadItem, SCHEMA, startOf, STEPS, TURNS } from './conversation.ts';
 
 /** A message as rendered, with when it last changed. */
 interface Rendered {
@@ -38,7 +38,7 @@ function render<I>(items: Items<I>, rows: unknown[][]): Rendered[] {
   for (const [n, seq, stored] of rows) {
     const position = Number(n);
     const changed = Number(seq);
-    const { said, calls = [], results = [] } = items.read(items.load(String(stored)));
+    const { said, calls = [], results = [] } = items.read(loadItem(items, String(stored)));
     if (said) {
       const [role, text] = said;
       messages.push({ id: position, role: role === 'user' ? 'user' : 'assistant', parts: [], seq: changed });
@@ -173,7 +173,7 @@ const TURN = `SELECT n, seq, item, answer, answered_at, answered_seq FROM ${TURN
 function summarized<I>(items: Items<I>, rows: unknown[][]): Rendered[] {
   const messages: Rendered[] = [];
   for (const [n, seq, stored, answer, answeredAt, answeredSeq] of rows) {
-    const text = items.read(items.load(String(stored))).said?.[1] ?? '';
+    const text = items.read(loadItem(items, String(stored))).said?.[1] ?? '';
     messages.push({
       id: Number(n),
       role: 'user',

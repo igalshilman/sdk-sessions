@@ -1,7 +1,10 @@
 // The conversation every framework shares (conversation.ts), with items of a
 // made-up framework (fakes/items.ts): the Python SDK's
 // tests/agents_conversation.py, test for test.
+import { randomUUID } from 'node:crypto';
 import * as restate from '@restatedev/sessions';
+import { asDatabase, open as openDatabase } from '@restatedev/sessions/internal';
+import { memoryStore } from '@restatedev/sessions/test/support';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { callOf } from '../src/calls.ts';
 import { CANCELLED, ENDED, fromTool, refusalOf, RETURNED_UNRECORDED, type Window } from '../src/common.ts';
@@ -10,11 +13,16 @@ import {
   Conversation,
   type Entry,
   type Items,
+  lastOf,
+  loadItem,
   type Parsed,
   type Run,
+  SCHEMA,
   settle,
   type Status,
+  STEPS,
   SUMMARY,
+  TURNS,
   windowStart,
 } from '../src/conversation.ts';
 import { calling, FakeItems, type Item, ITEMS } from './fakes/items.ts';
@@ -631,5 +639,97 @@ describe('the turns', () => {
     const [turn] = (await inAttempt((ctx) => Conversation.load(ctx.db, ITEMS))).transcript;
     expect(turn!.askedAt).toBeGreaterThanOrEqual(before);
     expect(turn!.askedAt).toBeLessThanOrEqual(after);
+  });
+});
+
+describe('the last position and seq', () => {
+  // `lastOf` runs at every turn and in the views: a scan would read the whole database in a new process.
+  it('are read from the ends of the tables, without a scan', async () => {
+    const stored = new Map<string, Uint8Array>();
+    let seed = 7;
+    /** Pseudo-random text, the same each run. */
+    const text = (k: number) =>
+      Array.from({ length: k }, () => {
+        seed = (seed * 1103515245 + 12345) % 2 ** 31;
+        return 'abcdefghijklmnopqrstuvwxyz '[seed % 27];
+      }).join('');
+    const db = asDatabase(await openDatabase(`memory-${randomUUID()}`, memoryStore(stored)));
+    await SCHEMA.ensure(db);
+    // Six commits of a hundred turns of three long results each, laid out as turns are: each among its steps.
+    for (let first = 0; first < 2400; first += 400) {
+      await db.transaction(async (tx) => {
+        for (let turn = first; turn < first + 400; turn += 4) {
+          await tx.execute(
+            `INSERT INTO ${TURNS} (n, seq, prompt, item, status, answer, answered_at, answered_seq) ` +
+              "VALUES (?, ?, ?, ?, 'answered', 'done', ?, ?)",
+            [turn, turn, `inv_${turn}:0`, ITEMS.dump(ITEMS.prompt('go')), turn + 3, turn + 3],
+          );
+          for (let step = 1; step < 4; step++) {
+            await tx.execute(`INSERT INTO ${STEPS} (n, turn, seq, item) VALUES (?, ?, ?, ?)`, [
+              turn + step,
+              turn,
+              turn + step,
+              JSON.stringify({ result: `c${step}`, output: text(2000) }),
+            ]);
+          }
+        }
+      });
+    }
+    /** `read` on the stored state in a new process (a database no one has read), and the pack parts it fetched. */
+    const cold = async <T>(read: (db: restate.Database) => Promise<T>): Promise<[T, number]> => {
+      const store = memoryStore(new Map(stored));
+      let packs = 0;
+      const counting = { ...store, get: (key: string) => ((packs += key.includes('/pack/') ? 1 : 0), store.get(key)) };
+      const result = await read(asDatabase(await openDatabase(`memory-${randomUUID()}`, counting)));
+      return [result, packs];
+    };
+    const [, scanned] = await cold((fresh) =>
+      fresh.values(`SELECT (SELECT SUM(LENGTH(item)) FROM ${TURNS}), (SELECT SUM(LENGTH(item)) FROM ${STEPS})`),
+    );
+    const [last, read] = await cold(lastOf);
+    expect(last).toEqual([2399, 2399]);
+    // A scan reads every part of the file; the maxima, at most a part for the end of each of the five b-trees
+    // they come from (both tables, and the seq and answered_seq indexes). A SELECT of several maxima scans.
+    expect(scanned).toBeGreaterThanOrEqual(20);
+    expect(read).toBeLessThanOrEqual(5);
+  });
+});
+
+/** Another framework's items, which have a `kind`: it cannot read the made-up framework's. */
+class OtherFramework extends FakeItems {
+  override load(stored: string): Item {
+    const item = JSON.parse(stored) as Item & { kind?: string };
+    if (item.kind === undefined) throw new Error('an item has a kind');
+    return item;
+  }
+}
+
+/** A run that answers hello. */
+const hello: Run<Item> = async (conversation) => {
+  await conversation.turn.appendReply([{ role: 'assistant', text: 'hello' }]);
+  return 'hello';
+};
+
+describe('a conversation this agent cannot read', () => {
+  it('fails for good: a retry would read the same row', async () => {
+    const run = hello;
+    const map = new Map<string, Uint8Array>();
+    expect(await asking(run, { map }).ask('hi')).toBe('hello');
+    // An agent of the same name on another framework.
+    const other = asking(run, { map, items: new OtherFramework() });
+    const failure = other.ask('hi');
+    await expect(failure).rejects.toBeInstanceOf(restate.TerminalError);
+    await expect(failure).rejects.toThrow(/cannot read .*Error: an item has a kind/);
+  });
+
+  it('is the error of loadItem, whatever the framework throws', () => {
+    const throwing = new (class extends FakeItems {
+      override load(): Item {
+        throw new TypeError('no such field');
+      }
+    })();
+    expect(() => loadItem(throwing, '{}')).toThrow(restate.TerminalError);
+    expect(() => loadItem(throwing, '{}')).toThrow(/cannot read .*TypeError: no such field/);
+    expect(loadItem(ITEMS, '{"role":"user","text":"hi"}')).toEqual({ role: 'user', text: 'hi' });
   });
 });

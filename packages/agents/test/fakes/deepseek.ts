@@ -33,8 +33,14 @@ export type Reply =
 /** How the agent asks to finish an interrupted prompt (@restatedev/agents/deepseek's CONTINUE). */
 const CONTINUE = /^Continue: your last turn was interrupted/;
 
-/** The teller's reply to `messages`: `{ text }`, or `{ call: { id, name, args } }`. */
-export function reply(messages: RequestMessage[]): Reply {
+/**
+ * The teller's reply to `messages`: `{ text }`, or `{ call: { id, name, args } }`.
+ * The harness's runtime context (such as the approval policy, after the
+ * prompt) is no message it answers.
+ */
+export function reply(all: RequestMessage[]): Reply {
+  // Its source is dsh-agent-loop's, which the types here do not know.
+  const messages = all.filter((m) => (m.source?.kind as string | undefined) !== 'runtime-context');
   const last = messages.at(-1)!;
   if (last.role === 'tool') return { text: `Done: ${textOf(last)}` };
   // A fresh tool call id, unique like a model's: a step run again calls its

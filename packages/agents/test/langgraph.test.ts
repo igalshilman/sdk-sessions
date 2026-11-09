@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import * as restate from '@restatedev/restate-sdk';
 import { CANCELLED, REFUSED, UNANSWERED } from '@restatedev/agents';
 import { AIMessage } from '@langchain/core/messages';
+import { EmptyInputError, InvalidUpdateError } from '@langchain/langgraph';
 import { AttemptEnded, ENDED } from '../src/common.ts';
 import {
   afterCancel,
@@ -268,6 +269,33 @@ describe('the LangGraph agent', () => {
     expect(String(failed)).toMatch(/Recursion limit/i);
     // The turn is closed with the error, for the next message to start afresh.
     const { messages } = await c.read(langgraph.messages());
-    expect(messages.at(-1)!.parts).toEqual([{ type: 'text', text: expect.stringMatching(/^Error: Recursion limit/) }]);
+    expect(messages.at(-1)!.parts).toEqual([
+      {
+        type: 'text',
+        text: expect.stringMatching(/^Error: the graph stopped at its recursion limit: Recursion limit/),
+      },
+    ]);
+  });
+
+  it("ends a turn on LangGraph's own errors, which a retry would meet again", async () => {
+    for (const [error, why] of [
+      [new InvalidUpdateError('two values for one field'), 'the graph made an invalid state update'],
+      [new EmptyInputError('no input'), 'the graph got no input'],
+    ] as const) {
+      let runs = 0;
+      const model = new (class extends Teller {
+        override reply(): never {
+          runs++;
+          throw error;
+        }
+      })({});
+      const c = conversation(langgraph.chat({ model, tools: bank('GraphAgent') }), why);
+      const failed = await c.attempt('inv1', 'Hello').catch((e: unknown) => e);
+      expect(failed).toBeInstanceOf(restate.TerminalError);
+      expect(String(failed)).toContain(`${why}: ${error.message}`);
+      // A retry answers as the turn ended, without running the graph again.
+      await expect(c.attempt('inv1', 'Hello')).rejects.toThrow(why);
+      expect(runs).toBe(1);
+    }
   });
 });

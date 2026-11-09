@@ -580,7 +580,9 @@ dead turn closed, never finished.
 **Past bugs.** The Python SDK's
 [`scripts/resurrect.py`](https://github.com/restatedev/sdk-python/blob/434bb6fe05ab17f3384709b48f060a47e68f5fb7/scripts/resurrect.py)
 brings each past bug back, one at a time, to see which tests notice. Those
-that apply here, each of which should have a test that fails for it:
+that apply here, each of which should have a test that fails for it (this
+package's port, `scripts/resurrect.ts`, brings them back here, beside its
+own history's bugs: [Testing](testing.md)):
 
 | Bug brought back                | What it does                                                                                                          |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
@@ -620,10 +622,10 @@ The PR's author asks for a review after each step, or a few. The review:
 ## Out of scope
 
 Not in this PR, on purpose: snapshots (D3); steps retention (the Python
-SDK's `steps-retention.md`); a LangGraph graph of your own on framework-owned
-history (`agent({ graph })`) and `interrupt()` as signals; durable approvals
-for the frameworks that have them (DeepSeek's `approval/request`, OpenCode's
-permission hook); steering; a port of `scripts/resurrect.py`; changes to
+SDK's `steps-retention.md`); durable approvals
+for the frameworks that have them (OpenCode's permission hook; DeepSeek's
+`approval/request` came after this PR, as its `approval` option:
+[Approvals](frameworks.md#approvals)); steering; changes to
 `@restatedev/sessions`, unless a step needs one (then in a commit of its
 own).
 

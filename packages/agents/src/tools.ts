@@ -379,12 +379,18 @@ const wait = (
  * With `approval`, the tool call runs only after the wait: the wait's
  * answer is not the call's, so a turn stopped before the call's result is
  * stored reports the call as not done, rather than done.
+ *
+ * With `rejoin`, for a framework that makes a call cut off by a crash again
+ * under a new id (the DeepSeek Harness), the call joins the wait an earlier
+ * attempt opened with the same input, as Restate's own tools do: the call
+ * made again, waiting on (or getting the answer of) the same wait, until
+ * the earlier call's result is stored. Within one attempt, a call with the
+ * same input waits anew.
  */
 export const waitFor = (
   ctx: restate.SessionContext,
   callId: string,
   name: string,
   input?: unknown,
-  { approval = false }: { approval?: boolean } = {},
-): Promise<unknown> =>
-  wait({ ctx, callId }, name, input ?? null, { shown: input !== undefined, rejoin: false, approval });
+  { approval = false, rejoin = false }: { approval?: boolean; rejoin?: boolean } = {},
+): Promise<unknown> => wait({ ctx, callId }, name, input ?? null, { shown: input !== undefined, rejoin, approval });

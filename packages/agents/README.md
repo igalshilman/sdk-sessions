@@ -77,7 +77,7 @@ the handler `chat` (a message in, the answer out), and the views
 | Import                                                    | Framework                       | Choose it when                                                                                |
 | --------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------- |
 | [`@restatedev/agents/pi`](src/pi/README.md)               | pi-durable                      | You want the default: any provider, coding tools on request, and its Harness (compact, reset) |
-| [`@restatedev/agents/langgraph`](src/langgraph/README.md) | LangGraph                       | You use LangChain: its tools, or a chat model of your own                                     |
+| [`@restatedev/agents/langgraph`](src/langgraph/README.md) | LangGraph                       | You use LangChain: its tools, a chat model of your own, or a graph of your own                |
 | [`@restatedev/agents/claude`](src/claude/README.md)       | the Anthropic SDK's tool runner | You want Claude with nothing in between: the lightest, the API's own messages                 |
 | [`@restatedev/agents/deepseek`](src/deepseek/README.md)   | DeepSeek Harness                | You want DeepSeek's harness: DeepSeek's models, or any pi-ai knows                            |
 
@@ -95,7 +95,7 @@ npm install @restatedev/agents @langchain/core @langchain/langgraph @langchain/l
 npm install @restatedev/agents @earendil-works/pi-ai @deepseek-ai/cordis \
   @deepseek-ai/{dsh-agent,dsh-agent-loop,dsh-llm,dsh-llm-deepseek-api-key,dsh-llm-pi-ai,dsh-session}@0.2.1-rc.2 \
   @deepseek-ai/{dsh-session-checkpoint-policy,dsh-session-persistence,dsh-session-projection}@0.2.1-rc.2 \
-  @deepseek-ai/{dsh-system-prompt,dsh-tools}@0.2.1-rc.2   # DeepSeek
+  @deepseek-ai/{dsh-system-prompt,dsh-tools,dsh-user-approval}@0.2.1-rc.2   # DeepSeek
 ```
 
 OpenCode was a framework of this package until its agents moved onto the
@@ -447,6 +447,10 @@ curl localhost:8080/support/alice/signal --json '{"id": "inv_1f…:toolu_01", "v
 curl localhost:8080/support/alice/signal --json '{"name": "approval", "value": "approved", "keep": true}'
 ```
 
+A DeepSeek agent's tool calls that need a person's approval (its `approval`
+option) wait the same way, for the signal `approval`: see
+[its README](src/deepseek/README.md#approvals).
+
 A wait ends with its agent's invocation: a cancelled or killed one leaves `pending`.
 The waits are kept by the `signals` object, keyed `<agent>:<key>`, which
 `serve` serves beside the agents. See
@@ -455,11 +459,14 @@ The waits are kept by the `signals` object, keyed `<agent>:<key>`, which
 ## Structured answers
 
 With `output`, a zod object, an agent answers with data rather than text:
-its reply is its answer, as JSON of the schema (which its system prompt
-asks for, with the schema, and the model is reminded of after each prompt,
-though `messages` shows the prompt as it was asked), and `chat` answers
-with the value, checked against the schema: the answer is the call's
-return value, as with any handler. Every framework takes it.
+its reply is its answer, as JSON of the schema, and `chat` answers with the
+value, checked against the schema: the answer is the call's return value,
+as with any handler. Every framework takes it. Claude asks the model for it
+natively where the model has structured outputs (the API's
+`output_config.format`, which holds the reply to the schema), or as its
+`nativeOutput` says; otherwise, and in the other frameworks, the system
+prompt asks for it, with the schema, and the model is reminded of it after
+each prompt, though `messages` shows the prompt as it was asked.
 
 ```ts
 const Plan = z.object({ summary: z.string(), parts: z.array(z.string()) });
@@ -468,13 +475,14 @@ const planner = claude.agent({ name: 'planner', output: Plan });
 const plan = await ctx.rpc(planner, 'ENG-1').chat('Plan the work on ENG-1'); // a Plan
 ```
 
-A reply that is not such JSON (a code fence around it is fine) is answered
-with what is wrong with it, once, for the model to reply again; then the
-invocation fails, with a terminal error, and the conversation shows its turn
-failed, with that error. A retried attempt resumes the
-conversation, and reads the same reply. In a handler of your own, `prompt(ctx, text, {
-output })` answers with it too. As a subagent's, the parent's model gets it
-as JSON.
+A reply that is not such JSON (a code fence around it is fine; asked
+natively, the API holds it to the schema's types, not to checks such as a
+string's `max`) is answered with what is wrong with it, once, for the model
+to reply again; then the invocation fails, with a terminal error, and the
+conversation shows its turn failed, with that error. A retried attempt
+resumes the conversation, and reads the same reply. In a handler of your
+own, `prompt(ctx, text, { output })` answers with it too. As a subagent's,
+the parent's model gets it as JSON.
 
 ## Webhooks
 
