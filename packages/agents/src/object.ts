@@ -4,9 +4,14 @@ import { reset } from '@restatedev/sessions/internal';
 import {
   type Answering,
   BUDGET,
+  type Chat,
+  chatOf,
+  type Steers,
+  chatTurn,
   checkWindow,
   isAgent,
   ITEMS,
+  messageSerde,
   type Messages,
   type MessagesRequest,
   publish,
@@ -15,13 +20,16 @@ import {
   WINDOW,
   type Window,
 } from './common.ts';
-import { compact, type Items, nextStart, restart, SCHEMA, settle } from './conversation.ts';
+import { compact, type Items, nextStart, restart, SCHEMA, settle, steerStored } from './conversation.ts';
 import {
   type Notifications,
   type Resolved,
   type Signal,
   signals,
   signalsOf,
+  type Steer,
+  type Steered,
+  type Steering,
   withCompanion,
   type Waiting,
   type Watch,
@@ -43,6 +51,8 @@ export interface Status {
   answering: Answering | null;
   /** The waits of its tools, oldest first (see `pending`). */
   waiting: Waiting[];
+  /** The messages steered to the message being answered that it has not taken yet, oldest first; absent if none. */
+  steering?: Steering[];
 }
 
 /** What `stop` did: the invocation of the message it stopped, or null if none was answered. */
@@ -113,14 +123,16 @@ const BUILT_IN = {
 
 /**
  * The views that agents (an object with a `messages` view) have beside
- * those of every object: `clear`, which forgets the conversation; and
- * `sync`, the conversation since `cursor` (by default, all of it), what the
- * agent is doing, and the revision, in one request; with `revision`, once
- * there is a newer one, or at the timeout. A client follows the
- * conversation by sending each answer's `revision` and `cursor` back, at
- * once while it has `more`.
+ * those of every object: `clear`, which forgets the conversation; `steer`,
+ * which sends a message while a turn is answered (for an agent whose `chat`
+ * a framework's `chat()` made: `chatHandler`'s, which answers it as a turn
+ * of its own if no turn takes it); and `sync`, the conversation since
+ * `cursor` (by default, all of it), what the agent is doing, and the
+ * revision, in one request; with `revision`, once there is a newer one, or
+ * at the timeout. A client follows the conversation by sending each
+ * answer's `revision` and `cursor` back, at once while it has `more`.
  */
-const FOLLOWED = {
+const followed = (steerable: boolean) => ({
   /**
    * Forget the conversation: stop the message being answered (as `stop`),
    * then empty the key's database, and what its `signals` hold (waits and
@@ -141,6 +153,29 @@ const FOLLOWED = {
         idempotencyKey: `${ctx.request.id}:erase`,
       });
       return stop;
+    },
+  },
+  /**
+   * Send a message to the agent while it answers another: the turn being
+   * answered takes it at its next step (once the model's tool calls have
+   * their results), if its framework takes steered messages and it reaches
+   * one; otherwise the message is answered as a turn of its own, after the
+   * messages before it, in the order it was sent. With no message being
+   * answered, it starts a turn. Either way it is answered once: send it with
+   * an idempotency key, so that a retried request is the same message. It
+   * takes the message as plain text or as a JSON string, as `chat` does.
+   */
+  steer: {
+    input: messageSerde,
+    accept: '*/*',
+    handler: async (ctx: restate.ViewContext, text: string): Promise<Steered> => {
+      if (!steerable) {
+        throw new restate.TerminalError(
+          `${ctx.request.target.service} takes no steered messages: its \`chat\` handler is no framework's \`chat()\` (chatHandler)`,
+          { errorCode: 400 },
+        );
+      }
+      return companion(ctx, 'steer').steer({ id: ctx.request.id, text });
     },
   },
   sync: {
@@ -168,7 +203,10 @@ const FOLLOWED = {
       return { revision: now.revision, status, ...page };
     },
   },
-};
+});
+
+/** The views of every agent: {@link followed}'s. */
+const FOLLOWED = followed(false);
 
 /**
  * The agents' handlers that only their own views call (Restate's ingress
@@ -211,6 +249,22 @@ const internal = (items: Items<unknown> | undefined) => ({
   compact: {
     ingressPrivate: true,
     handler: async (ctx: restate.SessionContext) => (items ? compact(ctx, items) : false),
+  },
+});
+
+/**
+ * The private `steered` of an agent whose `chat` is `chat` (`chatHandler`'s):
+ * it answers a message sent to `steer` as a turn of its own, with that
+ * `chat`, unless the turn it was sent to took it. The companion sends it as
+ * the message is sent, so that it keeps its place in the key's queue: it runs
+ * once the messages before it are answered.
+ */
+const steeredOf = ({ answer, steers }: { answer: Chat; steers: Steers }) => ({
+  ingressPrivate: true,
+  explicitCancellation: true,
+  handler: async (ctx: restate.SessionContext, { id, text }: Steer) => {
+    if (await steerStored(ctx.db, id)) return;
+    await chatTurn(ctx, text, answer, steers);
   },
 });
 
@@ -268,7 +322,7 @@ type Functions<H> = string extends keyof H ? unknown : { [K in keyof H]: H[K] ex
 /** The names of the handlers and views every object (or agent) has, which its own cannot take. */
 type Reserved = {
   [
-    name in keyof typeof BUILT_IN | keyof typeof FOLLOWED | keyof ReturnType<typeof internal>
+    name in keyof typeof BUILT_IN | keyof typeof FOLLOWED | keyof ReturnType<typeof internal> | 'steered'
   ]?: 'a handler every object has: name yours otherwise';
 };
 
@@ -325,7 +379,7 @@ export const sessionObject = <
   if (!(Number.isInteger(budget) && budget >= 0)) {
     throw new Error(`${name}: budget must be a number of tokens (0 or more), not ${JSON.stringify(budget)}`);
   }
-  const own = [...Object.keys(BUILT_IN), ...Object.keys(FOLLOWED), ...Object.keys(internal(undefined))];
+  const own = [...Object.keys(BUILT_IN), ...Object.keys(FOLLOWED), ...Object.keys(internal(undefined)), 'steered'];
   if ('messages' in handlers) {
     throw new Error(`${name}: \`messages\` is a view: put it in \`views\`, so that the object is an agent`);
   }
@@ -344,7 +398,10 @@ export const sessionObject = <
   const page = (typeof messages === 'function' ? messages : messages?.handler) as
     | ((ctx: restate.ViewContext, request: MessagesRequest) => Promise<Messages>)
     | undefined;
-  const agent = page === undefined ? {} : FOLLOWED;
+  // A `chat` that `chatHandler` made: its answer answers the steered messages no turn took (`steered`).
+  const chatEntry = (handlers as Record<string, unknown>).chat;
+  const chat = typeof chatEntry === 'object' || typeof chatEntry === 'function' ? chatOf(chatEntry!) : undefined;
+  const agent = page === undefined ? {} : followed(chat !== undefined);
   // A framework on the conversation of turns: its view carries its items.
   const items = (page && ITEMS.of(page)) as Items<unknown> | undefined;
   // Its `compact` summarizes: without the conversation of turns, it has none, and nothing would.
@@ -354,11 +411,12 @@ export const sessionObject = <
     );
   }
   const { erase, ...stored } = internal(items);
+  const steering: Record<string, restate.Entry<restate.SessionContext>> = chat ? { steered: steeredOf(chat) } : {};
   const privates: Record<string, restate.Entry<restate.SessionContext>> = messages === undefined
     ? {}
     : items
-      ? { erase, ...stored }
-      : { erase };
+      ? { erase, ...stored, ...steering }
+      : { erase, ...steering };
   return withCompanion(
     isAgent(
       restate.sessionObject({

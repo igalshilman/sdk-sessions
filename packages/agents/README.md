@@ -69,8 +69,9 @@ Restate, wherever it is.
 
 The same agent runs on each of them: `agent({ name, ...options })`, with
 the handler `chat` (a message in, the answer out), and the views
-`messages` (the conversation so far), `status` (what it is doing), `stop`
-(the message it answers), `clear` (forget it all), `sync`,
+`messages` (the conversation so far), `status` (what it is doing), `steer`
+(add to the message it answers), `stop` (the message it answers), `clear`
+(forget it all), `sync`,
 `notifications` and `watch` (to follow it), and `signal` and `pending`
 ([Signals](#signals)).
 
@@ -187,9 +188,30 @@ An attempt that ends before its turn does, while its process lives on
 work too, a model's request included: it can store nothing more, and the
 next attempt goes on with the turn, which is not cancelled.
 
-**A message while it works.** A message sent while the agent answers
-another waits for it: Restate answers a key's messages one at a time, in
-order. To change course, stop the turn (`stop`) and send the message that
+**A message while it works.** A message sent to `chat` while the agent
+answers another waits for it: Restate answers a key's messages one at a
+time, in order. To add to the message being answered ("use Celsius", "skip
+Friday"), send it to `steer`: the turn takes it at its next step (once the
+model's tool calls have their results, before its next request), and its
+answer covers it. A message that comes too late for a step (the model is
+writing its final answer, say) is answered as a turn of its own, right after
+the turn, before the messages sent after it; so is one sent with no turn
+being answered. Either way it is answered once: send it with an idempotency
+key, so that a request sent again is the same message.
+
+```sh
+curl localhost:8080/assistant/alice/chat/send -d 'Plan my week'
+curl localhost:8080/assistant/alice/steer -H 'idempotency-key: 7f3c…' -d 'Skip Friday'   # {"id": "inv_…", "turn": "inv_1f…"}
+```
+
+`steer` answers the message's id and the turn that holds it for its next
+step, or `turn: null` if it is answered as a turn of its own; `status`
+lists the messages the turn holds and has not taken yet (`steering`). A
+turn takes at most 16. Claude and LangGraph's built-in agent take them
+before each model request that follows a round of tool calls; pi and
+DeepSeek through their own inboxes; a LangGraph graph of your own, and a
+background agent, take none ([Steering a turn](docs/turns.md#steering-a-turn)).
+To change course outright, stop the turn (`stop`) and send the message that
 replaces it.
 
 **Forget a conversation.** `clear` starts a key over, such as for a UI's
@@ -635,8 +657,8 @@ journal in Restate's UI. Its `options` (such as `retryPolicy`) and
 [`@restatedev/sessions`](../sessions/README.md): `handlers` run one at a time per
 key, and `views` beside them. Its own cannot be named `signal`, `pending`,
 `status`, `stop`, `notifications` or `watch`, views every agent's
-session object has, nor `sync`, `clear` or `erase`, which an agent has (one with a
-`messages` view). A view of yours reads the database too: `ctx.db` is the
+session object has, nor `sync`, `clear`, `steer`, `erase`, `settle`, `compact`
+or `steered`, which an agent has (one with a `messages` view). A view of yours reads the database too: `ctx.db` is the
 database as committed, beside a message being answered.
 
 ## Build your own

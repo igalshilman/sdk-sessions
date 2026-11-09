@@ -19,10 +19,18 @@ export class Following {
   revision = 0;
   /** Each turn closed, by its invocation id. */
   readonly closed: string[] = [];
-  /** The message being answered, from its turn's start to its close, and whether its agent settles it. */
-  answering: { invocationId: string; since: string; settles?: boolean } | null = null;
+  /** The message being answered, from its turn's start to its close, whether its agent settles it, and whether it takes steered messages. */
+  answering: { invocationId: string; since: string; settles?: boolean; steers?: boolean } | null = null;
   /** Each turn the companion would have its agent `settle`: closed as gone, by its invocation id. */
   readonly settled: string[] = [];
+  /**
+   * The messages steered to the turn being answered that it has not taken
+   * yet: each `publish` answers them to a turn that takes steered messages,
+   * as the companion's does.
+   */
+  steering: { id: string; text: string }[] = [];
+  /** The ids of each `taken` the turns sent, in order. */
+  readonly taken: string[][] = [];
 }
 
 /** The following of each object's state. */
@@ -68,14 +76,32 @@ export function sqlAttempt(
   },
 ) {
   const following = followingOf(options.map);
-  const base = baseAttempt(options);
+  // A transaction's sends to the companion (`taken`), made from its outbox as it commits, reach the companion here.
+  const base = baseAttempt({
+    ...options,
+    send: (sent) => {
+      if (sent.service === 'signals') void route(sent);
+      options.send?.(sent);
+    },
+  });
   // The `signals` object, as the agents call it.
   const signals: Record<string, (input: never) => unknown> = {
     publish: async () => {
       await options.published?.();
-      return { revision: ++following.revision };
+      const revision = ++following.revision;
+      const steering = following.answering?.steers ? following.steering : [];
+      return steering.length > 0 ? { revision, steering: [...steering] } : { revision };
     },
-    start: (turn: { invocationId: string; since: string; settles?: boolean }) => {
+    // A transaction's send: its parameter as it was stored, JSON.
+    taken: (parameter: Uint8Array | string[]) => {
+      const ids = (
+        parameter instanceof Uint8Array ? JSON.parse(new TextDecoder().decode(parameter)) : parameter
+      ) as string[];
+      following.taken.push(ids);
+      following.steering = following.steering.filter((m) => !ids.includes(m.id));
+      following.revision++;
+    },
+    start: (turn: { invocationId: string; since: string; settles?: boolean; steers?: boolean }) => {
       if (following.answering?.invocationId === turn.invocationId) return;
       if (following.answering) closed(following.answering.invocationId, true);
       following.answering = turn;
@@ -501,6 +527,79 @@ export async function followedWhileWorking(
     parts: withoutIds(page.messages.map((m) => m.parts)),
     published: followingOf(map).revision,
     outputs,
+  };
+}
+
+/**
+ * `chat` (with a `transfer` and an `audit` tool) on an object of its own,
+ * asked to move 5 from 1 to 2: while the transfer runs, `audit the books`
+ * is steered to the turn, which takes it at its next step. The model's next
+ * request then ends with it, and the model audits: the turn's answer is the
+ * audit's. With `failAudit`, the audit fails its first attempt (once the
+ * message is stored, and the model asked again with it), and a retried
+ * attempt goes on. The answer, the messages, the audits run, and the ids of
+ * each `taken` the companion got.
+ */
+export async function steeredAtAStep(
+  chat: (tools: Tool[]) => PromptHandler,
+  messages: (
+    ctx: restate.ViewContext,
+    request: object,
+  ) => Promise<{ messages: { role: string; parts: { type: string; text?: string; name?: string }[] }[] }>,
+  { failAudit = false, object }: { failAudit?: boolean; object?: { readonly name: string } } = {},
+) {
+  const map = new Map<string, Uint8Array>();
+  const following = followingOf(map);
+  let failing = failAudit;
+  let audits = 0;
+  const tools = [
+    tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: () => {
+        // Sent to the turn while the tool runs: the companion lists it from the next publish on.
+        if (!following.taken.flat().includes('steer-1')) {
+          following.steering = [{ id: 'steer-1', text: 'audit the books' }];
+        }
+        return 'moved 5 from account 1 to account 2';
+      },
+    }),
+    tool({
+      name: 'audit',
+      description: 'Check the books.',
+      input: z.object({}),
+      run: () => {
+        audits += 1;
+        if (failing) {
+          failing = false;
+          throw new Error('the books are busy');
+        }
+        return 'the books are fine';
+      },
+    }),
+  ];
+  const handler = handlerOf(chat(tools));
+  const attempt = () => {
+    const turn = sqlAttempt({ map, key: 'steer', id: 'inv1', object });
+    return turn.end(() => handler(turn.ctx, 'Please move 5 from 1 to 2'));
+  };
+  const first = await attempt().then(
+    (answer) => ({ answer }),
+    (error: unknown) => ({ error }),
+  );
+  const answer = 'answer' in first ? first.answer : await attempt();
+  const read = sqlAttempt({ map, key: 'steer', id: 'read', shared: true, object });
+  const page = await read.end(() => messages(read.view, {}));
+  return {
+    answer,
+    failed: 'error' in first ? first.error : undefined,
+    audits,
+    taken: [...new Set(following.taken.flat())],
+    said: page.messages.map(({ role, parts }) => [
+      role,
+      parts.map((p) => (p.type === 'text' ? p.text : p.name)).join(' + '),
+    ]),
   };
 }
 

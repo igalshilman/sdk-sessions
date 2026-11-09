@@ -16,7 +16,7 @@ import * as clients from '@restatedev/restate-sdk-clients';
 import type { VirtualObjectDefinition } from '@restatedev/restate-sdk-core';
 import type { Answering, ChatMessage, Messages, MessagesRequest, Part } from './common.ts';
 import type { Status, Stopped, Synced, SyncRequest } from './object.ts';
-import type { Notifications, Resolved, Signal, Waiting, Watch } from './signals.ts';
+import type { Notifications, Resolved, Signal, Steered, Steering, Waiting, Watch } from './signals.ts';
 
 export type {
   Answering,
@@ -28,6 +28,8 @@ export type {
   Resolved,
   Signal,
   Status,
+  Steered,
+  Steering,
   Stopped,
   Synced,
   SyncRequest,
@@ -39,6 +41,15 @@ export type {
 export interface Agent {
   /** Answer `message`. */
   chat(ctx: unknown, message: string): Promise<string>;
+  /**
+   * Send `message` while the agent answers another: the turn being answered
+   * takes it at its next step (once its model's tool calls have their
+   * results), and its answer covers it; else it is answered as a turn of its
+   * own, after the messages before it. Either way it is answered once: send
+   * it with an idempotency key, made once per message, so that sending it
+   * again is the same message.
+   */
+  steer(ctx: unknown, message: string): Promise<Steered>;
   /** The conversation, a page at a time, or what is new or changed since a cursor, also while a message is answered. */
   messages(ctx: unknown, request?: MessagesRequest): Promise<Messages>;
   /** The conversation since a cursor, the status and the revision; with `revision`, once there is a newer one. */

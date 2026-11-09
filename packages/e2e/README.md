@@ -29,6 +29,10 @@ server, are in its `test/` directory (`pnpm test` at the root runs them all).
   (`pnpm --filter e2e concurrency`).
 - [`restate-tools.ts`](restate-tools.ts): Restate's own agent tools, on a
   scripted model (`pnpm --filter e2e tools`).
+- [`steering.ts`](steering.ts): a message steered to a turn (the `steer`
+  view): taken by the turn at its next step, or answered as a turn of its
+  own, in order, by an agent whose turns take none, with no turn running,
+  and after a stopped turn (`pnpm --filter e2e steering`).
 - [`bench.ts`](bench.ts): SQL in sessions: latency, throughput and stored
   bytes, for databases up to 100 MB (`pnpm --filter e2e bench [out.json]`).
 - [`packaging.ts`](packaging.ts): the packages as a user installs them,

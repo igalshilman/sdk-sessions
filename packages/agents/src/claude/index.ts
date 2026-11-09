@@ -53,6 +53,7 @@ import {
   NO_ANSWER,
 } from '../common.ts';
 import { answerOnce, type Items, type Parsed, type Run } from '../conversation.ts';
+import { takeSteers } from '../steering.ts';
 import { conversationView } from '../messages.ts';
 import { type Answer, withChecked } from '../output.ts';
 import type { z } from 'zod';
@@ -193,7 +194,10 @@ interface Agent {
  * The run of `agent` on the conversation: from the stored turn on, each
  * reply stored before its tools run, and their results after; each round of
  * tool calls published as it starts and ends (for the clients that follow
- * the conversation).
+ * the conversation). At each step (before a request that follows the
+ * prompt or the tools' results), it takes the messages steered to the turn
+ * (`takeSteers`): the request then goes out from the conversation's
+ * history, which has them after the tools' results.
  */
 const runOf =
   (ctx: restate.SessionContext, agent: Agent): Run<MessageParam> =>
@@ -204,6 +208,8 @@ const runOf =
       // A stored final reply is the answer: the model is not asked for it again.
       const final = turn.finalReply();
       if (final !== undefined) return final;
+      // A paused reply goes back as the last message, which a steered one would not leave it.
+      if (turn.entries.at(-1)!.parsed?.said?.[0] !== 'assistant') await takeSteers(ctx, conversation);
       const { tools, check } = failing(ctx, agent.tools);
       const runner = client.beta.messages.toolRunner(
         {
@@ -216,6 +222,12 @@ const runOf =
         },
         { signal: stopSignalOf(ctx) },
       );
+      /** A step: the messages steered to the turn go into the next request, after the tools' results. */
+      const step = async () => {
+        if ((await takeSteers(ctx, conversation)).length === 0) return;
+        // The runner leaves the history to its caller, who changed it: the reply, its results and the messages.
+        runner.setMessagesParams((params) => ({ ...params, messages: sendable(conversation.history()) }));
+      };
       // A reply whose tools did not finish (a crash): run them, with the same
       // ids, once the calls whose results are stored are settled, as for any
       // reply: else one of its calls could take the id of an identical call
@@ -229,6 +241,7 @@ const runOf =
           runner.pushMessages(results);
         }
         await toolCallEnded(ctx);
+        await step();
       }
       let paused = false;
       for await (const message of runner) {
@@ -250,6 +263,7 @@ const runOf =
         check();
         if (results) await turn.append(results);
         await toolCallEnded(ctx);
+        await step();
       }
       if (!paused) throw new Error('the tool runner ended without a reply');
     }
@@ -387,7 +401,7 @@ export const prompt = async <O extends z.ZodObject | undefined = undefined>(
  */
 export const chat = <O extends z.ZodObject | undefined = undefined>(options: Configure<Options<O>> = {}) => {
   if (typeof options === 'object') modelIdOf(modelOf(options.model, CLAUDE_MODEL), 'anthropic');
-  return chatHandler(async (ctx, message) => prompt(ctx, message, await configured(options, ctx)));
+  return chatHandler(async (ctx, message) => prompt(ctx, message, await configured(options, ctx)), { steers: true });
 };
 
 /**

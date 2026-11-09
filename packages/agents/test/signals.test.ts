@@ -4,6 +4,7 @@
 // state and records what they send to the companion itself.
 import * as restate from '@restatedev/restate-sdk';
 import { signals } from '@restatedev/agents';
+import { STEERS } from '../src/signals.ts';
 import { describe, expect, it, vi } from 'vitest';
 
 // The fake context's promises are plain ones: race them as such.
@@ -47,8 +48,8 @@ function companion(ends: Record<string, Promise<unknown>> = {}, { watched = fals
   const state = new Map<string, unknown>();
   const own: { method: string; input: unknown }[] = [];
   const rejected: string[] = [];
-  /** What it sent to others (an agent's `settle`). */
-  const sent: { service: string; method: string; key?: string; parameter: unknown }[] = [];
+  /** What it sent to others (an agent's `settle`, or `steered`). */
+  const sent: { service: string; method: string; key?: string; parameter: unknown; idempotencyKey?: string }[] = [];
   const ctx = {
     key: 'assistant:alice',
     get: async (name: string) => structuredClone(state.get(name)),
@@ -60,22 +61,25 @@ function companion(ends: Record<string, Promise<unknown>> = {}, { watched = fals
       new Proxy({}, { get: (_, method: string) => (input: unknown) => void own.push({ method, input }) }),
     invocation: (id: string) => ({ attach: () => restatePromise(ends[id] ?? never()) }),
     sleep: () => restatePromise(watched ? Promise.resolve() : never()),
+    date: { now: async () => Date.parse('2026-11-09T00:00:00.000Z') },
     genericSend: ({
       service,
       method,
       key,
       parameter,
+      idempotencyKey,
     }: {
       service: string;
       method: string;
       key?: string;
       parameter: unknown;
-    }) => void sent.push({ service, method, key, parameter }),
+      idempotencyKey?: string;
+    }) => void sent.push({ service, method, key, parameter, idempotencyKey }),
   };
   const handlers = (signals as unknown as { object: Record<string, (ctx: unknown, input?: unknown) => unknown> })
     .object;
   const run = <T>(name: string, input?: unknown) => handlers[name]!(ctx, input) as Promise<T>;
-  return { run, own, rejected, sent };
+  return { run, own, rejected, sent, state };
 }
 
 const wait = (id: string, awakeable: string) => ({ id, name: 'approval', since: '', awakeable });
@@ -200,5 +204,124 @@ describe("an agent's companion", () => {
     await c.run('start', turn(B));
     expect(await c.run('pending')).toEqual([]);
     expect(c.rejected).toEqual(['awk_a']);
+  });
+});
+
+/** What `publish` answers a turn: the revision, and the messages steered to it that it has not taken yet. */
+const published = (c: ReturnType<typeof companion>) =>
+  c.run<{ revision: number; steering?: { id: string; text: string }[] }>('publish');
+
+/** The ids of what `status` lists as steered to the turn being answered, not taken yet. */
+const steering = async (c: ReturnType<typeof companion>) =>
+  ((await c.run<{ steering?: { id: string }[] }>('status')).steering ?? []).map((m) => m.id);
+
+describe("an agent's companion, steering", () => {
+  it('queues each steered message as a turn of its own, and holds it for a turn that takes steered messages', async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    expect(await c.run('steer', { id: 's1', text: 'use Celsius' })).toEqual({ id: 's1', turn: A });
+    // Queued at once, keyed by its id: it keeps its place in the key's queue, and is sent once.
+    expect(c.sent).toEqual([
+      {
+        service: 'assistant',
+        method: 'steered',
+        key: 'alice',
+        parameter: { id: 's1', text: 'use Celsius' },
+        idempotencyKey: 'steer:s1',
+      },
+    ]);
+    // The turn learns of it from its next publish; a client, from the status.
+    expect((await published(c)).steering).toEqual([{ id: 's1', text: 'use Celsius' }]);
+    expect(await steering(c)).toEqual(['s1']);
+    // Sent again (a retried request): the same message, held once.
+    expect(await c.run('steer', { id: 's1', text: 'use Celsius' })).toEqual({ id: 's1', turn: A });
+    expect((await published(c)).steering).toHaveLength(1);
+  });
+
+  it('holds nothing for a turn that takes no steered messages, nor with no turn: each is a turn of its own', async () => {
+    const c = companion();
+    expect(await c.run('steer', { id: 's1', text: 'hi' })).toEqual({ id: 's1', turn: null });
+    // Of another SDK, or of a framework that takes none: it does not say it steers.
+    await c.run('start', turn(A));
+    expect(await c.run('steer', { id: 's2', text: 'hi' })).toEqual({ id: 's2', turn: null });
+    expect((await published(c)).steering).toBeUndefined();
+    expect((await c.run<object>('status')).hasOwnProperty('steering')).toBe(false);
+    expect(c.sent.map((m) => m.idempotencyKey)).toEqual(['steer:s1', 'steer:s2']);
+  });
+
+  it('marks a taken message, which the turn no longer finds, once, and publishes the change', async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    await c.run('steer', { id: 's1', text: 'one' });
+    await c.run('steer', { id: 's2', text: 'two' });
+    const before = await revision(c);
+    await c.run('taken', ['s1']);
+    expect(await revision(c)).toBe(before + 1);
+    expect((await published(c)).steering).toEqual([{ id: 's2', text: 'two' }]);
+    expect(await steering(c)).toEqual(['s2']);
+    // Taken again (the outbox's send made again): nothing changes, and nothing is published.
+    const now = await revision(c);
+    await c.run('taken', ['s1']);
+    expect(await revision(c)).toBe(now);
+  });
+
+  it("forgets a closed turn's messages, taken or not: those it did not take are answered as turns of their own", async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    await c.run('steer', { id: 's1', text: 'one' });
+    await c.run('taken', ['s1']);
+    await c.run('steer', { id: 's2', text: 'two' });
+    await c.run('close', A);
+    // Nothing is kept of them: s2 was queued as a turn of its own as it was sent.
+    expect(c.state.has('inbox')).toBe(false);
+    await c.run('start', { ...turn(B), steers: true });
+    expect((await published(c)).steering).toBeUndefined();
+    expect(await steering(c)).toEqual([]);
+    // A turn that never closed (killed) loses them as the next starts.
+    await c.run('steer', { id: 's3', text: 'three' });
+    await c.run('start', { ...turn(A + 'x'), steers: true });
+    expect(await steering(c)).toEqual([]);
+    expect(c.state.has('inbox')).toBe(false);
+  });
+
+  it("forgets only the closed turn's messages", async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    await c.run('steer', { id: 's1', text: 'one' });
+    await c.run('taken', ['s1']);
+    // The turn closed already (a close after its own): its messages go, which publishes.
+    await c.run('close', A);
+    await c.run('start', { ...turn(B), steers: true });
+    await c.run('steer', { id: 's2', text: 'two' });
+    await c.run('ended', A);
+    expect(await steering(c)).toEqual(['s2']);
+  });
+
+  it('holds at most STEERS messages for a turn, taken or not: past them, each is a turn of its own', async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    for (let i = 0; i < STEERS; i++) {
+      expect(await c.run('steer', { id: `s${i}`, text: `${i}` })).toEqual({ id: `s${i}`, turn: A });
+      if (i % 2 === 0) await c.run('taken', [`s${i}`]);
+    }
+    expect(await c.run('steer', { id: 'over', text: 'one more' })).toEqual({ id: 'over', turn: null });
+    // Queued still, as every steered message is.
+    expect(c.sent.at(-1)?.idempotencyKey).toBe('steer:over');
+    expect(await steering(c)).toHaveLength(STEERS / 2);
+  });
+
+  it('forgets every steered message on a reset (`clear`)', async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    await c.run('steer', { id: 's1', text: 'one' });
+    await c.run('reset');
+    expect(await steering(c)).toEqual([]);
+    expect((await published(c)).steering).toBeUndefined();
+  });
+
+  it("shows the turn's status without a field of steering's own while nothing waits", async () => {
+    const c = companion();
+    await c.run('start', { ...turn(A), steers: true });
+    expect(await c.run('status')).toEqual({ answering: turn(A), waiting: [] });
   });
 });

@@ -42,7 +42,7 @@
 // gives its `Items` (how its items say what they are) and a `Run` (its own
 // loop, from the conversation to the answer, storing each step as it goes).
 import * as restate from '@restatedev/sessions';
-import type { Database, DatabaseReader, DatabaseWriter } from '@restatedev/sessions';
+import type { Database, DatabaseReader, DatabaseWriter, Transaction } from '@restatedev/sessions';
 import { definitionOf, Schema } from '@restatedev/sessions/internal';
 import { forPrompt, outcomes } from './calls.ts';
 import {
@@ -74,6 +74,12 @@ export const STEPS = 'restate_agent_items';
 export const START = 'restate_agent_conversation_start';
 /** The Python SDK's snapshots, which this package does not take (docs/plan.md, D3): created, never written. */
 export const SNAPSHOTS = 'restate_agent_snapshots';
+/**
+ * The messages steered to a turn that it took ({@link Turn.steer}): which
+ * items of the trajectories they are, by position, and their ids, each
+ * stored once.
+ */
+export const STEERED = 'restate_agent_steers';
 
 /** The conversation's tables: the Python SDK's, step for step, so that both SDKs read each other's. */
 export const SCHEMA = new Schema('restate_agents.turns', [
@@ -113,6 +119,12 @@ export const SCHEMA = new Schema('restate_agents.turns', [
     covers INTEGER NOT NULL,
     turn INTEGER,
     items TEXT NOT NULL
+  )`,
+  // Appended: a new table, which costs a view that applies it to its own session nothing.
+  `CREATE TABLE ${STEERED} (
+    n INTEGER PRIMARY KEY,
+    turn INTEGER NOT NULL,
+    id TEXT NOT NULL UNIQUE
   )`,
 ]);
 
@@ -167,6 +179,12 @@ export interface Items<I> {
   read(item: I): Parsed;
   /** The summary of the earliest turns in the framework's own form; by default a user's message and "Understood." */
   summary?(text: string): I[];
+  /**
+   * The item of the message `steerId` steered to a turn, with `text`, to
+   * tell it apart from a prompt in the framework's runs (LangGraph's has
+   * the id `steer:<steerId>`); by default, a prompt's item.
+   */
+  steered?(text: string, steerId: string): I;
 }
 
 /** What the user's message with the summary of the earliest turns starts with. */
@@ -175,6 +193,10 @@ export const SUMMARY = 'A summary of our conversation so far:\n\n';
 /** The items that give the model `summary`, of the earliest turns: `items.summary`'s, if it has one. */
 export const summaryItems = <I>(items: Items<I>, summary: string): I[] =>
   items.summary ? items.summary(summary) : [items.prompt(SUMMARY + summary), items.reply('Understood.')];
+
+/** The item of the message `steerId` steered to a turn, with `text`: `items.steered`'s, if it has one. */
+export const steeredItem = <I>(items: Items<I>, text: string, steerId: string): I =>
+  items.steered ? items.steered(text, steerId) : items.prompt(text);
 
 /** An item of the conversation, with what it is part of. */
 export interface Entry<I> {
@@ -203,10 +225,27 @@ export interface Entry<I> {
   answeredSeq?: number;
   /** On a prompt: when its turn's row was stored, in Unix milliseconds. */
   askedAt?: number;
+  /** The id of the steered message it is, if it is one: a message of the user that its turn took at a step. */
+  steer?: string;
+  /**
+   * On a prompt of the transcript: the messages steered to its turn that it
+   * took, in order, which the model sees between its message and its answer
+   * once the turn is before the window.
+   */
+  steers?: Entry<I>[];
 }
 
 /** What `entry` says, read once. */
 const parsedOf = <I>(items: Items<I>, entry: Entry<I>) => (entry.parsed ??= items.read(entry.item));
+
+/**
+ * The size of `turn` (a prompt of the transcript) as the model sees it before
+ * the window, in characters: its message, the messages steered to it, and
+ * its answer.
+ */
+const turnSize = <I>(items: Items<I>, turn: Entry<I>) =>
+  [turn, ...(turn.steers ?? [])].reduce((sum, e) => sum + (parsedOf(items, e).said?.[1] ?? '').length, 0) +
+  (turn.answer ?? '').length;
 
 /** Where a conversation starts: its first position, the last `seq` given, and the summary of the earliest turns. */
 export interface Start {
@@ -516,12 +555,19 @@ export class Turn<I> {
   }
 
   /**
-   * The turn's latest message of the user: its prompt, or the message that
-   * asked again ({@link askAgain}). A framework that runs from a message of
-   * its own runs from this one.
+   * The turn's latest message of the user that asks for its answer: its
+   * prompt, or the message that asked again ({@link askAgain}). A framework
+   * that runs from a message of its own runs from this one. A steered
+   * message ({@link steer}) is not one: the model reads it within the run,
+   * which goes on from the same ask.
    */
   latestAsk(): Entry<I> {
-    return this.items.findLast((e) => e.parsed?.said?.[0] === 'user') ?? this.prompt;
+    return this.items.findLast((e) => e.steer === undefined && e.parsed?.said?.[0] === 'user') ?? this.prompt;
+  }
+
+  /** The messages steered to the turn that it took, in order. */
+  steered(): Entry<I>[] {
+    return this.items.filter((e) => e.steer !== undefined);
   }
 
   /** Whether the turn's tool call `callId` has a result. */
@@ -557,6 +603,63 @@ export class Turn<I> {
   }
 
   /**
+   * Store the steered `messages` that the turn has not taken yet as steps of
+   * the turn, and return their items. Each is stored once, by its id, as a
+   * message of the user (as `Items.steered` makes it) after the turn's steps
+   * before: the model reads it in its next request, and in every turn's
+   * history after, between the turn's message and its answer. `taken` adds
+   * what goes out with the transaction that stores them (the companion's
+   * `taken`), which commits once.
+   *
+   * `going` tells whether the turn still goes on: once it has the ledger, a
+   * turn that stopped meanwhile takes none, which are then answered as turns
+   * of their own. A store under way finishes even if the turn stops: the
+   * turn then closes after it, at the positions after its messages, and the
+   * messages are its own (stopped with it).
+   */
+  async steer(
+    messages: readonly { id: string; text: string }[],
+    taken: (tx: Transaction, ids: string[]) => void,
+    going: () => boolean,
+  ): Promise<I[]> {
+    const held = new Set(this.steered().map((e) => e.steer));
+    const wanted = [...new Map(messages.filter((m) => !held.has(m.id)).map((m) => [m.id, m])).values()];
+    if (wanted.length === 0) return [];
+    const ledger = this.#ledger;
+    return ledger.lock.run(async () => {
+      if (!going()) return [];
+      this.#checkWritable();
+      // The database, not the turn: an id is stored once in the conversation, by whichever turn took it.
+      const stored = await steersStored(
+        ledger.db,
+        wanted.map((m) => m.id),
+      );
+      const fresh = wanted.filter((m) => !stored.has(m.id));
+      if (fresh.length === 0) return [];
+      let added: Entry<I>[] = [];
+      // The positions and seqs taken as the write runs, as `#insert` takes them.
+      await ledger.db.transaction(async (tx) => {
+        const n = ledger.next;
+        added = fresh.map((m, i) => ({ n: n + i, item: steeredItem(ledger.items, m.text, m.id), steer: m.id }));
+        for (const [i, e] of added.entries()) {
+          await tx.execute(INSERT_STEP, [e.n, this.n, ledger.seq + i + 1, ledger.items.dump(e.item), null, null]);
+          await tx.execute(INSERT_STEERED, [e.n, this.n, e.steer!]);
+        }
+        taken(
+          tx,
+          fresh.map((m) => m.id),
+        );
+        ledger.seq += added.length;
+        ledger.next = n + added.length;
+      });
+      this.#add(added);
+      // The transcript's entry of the turn has them too, as the next turn loads it: for its size, say.
+      (this.prompt.steers ??= []).push(...added);
+      return added.map((e) => e.item);
+    });
+  }
+
+  /**
    * Keep what the turn carries to the turns after it, stored with its
    * answer: `agent`, the agent the conversation is with (by default, its
    * latest reply's, else the previous turn's); `state`, the framework's own,
@@ -571,7 +674,9 @@ export class Turn<I> {
    * Drop the turn's reply `reply`, and what came after it, to ask the model
    * again: one range delete. The positions are given again, so the new
    * reply's messages take the dropped ones' ids; the `seq` is kept, so that
-   * a client's cursor still sees them.
+   * a client's cursor still sees them. A steered message after the reply is
+   * dropped too: it is no longer the turn's, so the agent's `steered`
+   * answers it as a turn of its own.
    */
   async drop(reply: number) {
     this.#checkWritable();
@@ -582,10 +687,12 @@ export class Turn<I> {
       const start = { ...ledger.start, seq: ledger.seq };
       await ledger.db.transaction(async (tx) => {
         await tx.execute(`DELETE FROM ${STEPS} WHERE n >= ?`, [reply]);
+        await tx.execute(`DELETE FROM ${STEERED} WHERE n >= ?`, [reply]);
         await restart(tx, start);
       });
       ledger.start = start;
       ledger.next = Math.min(ledger.next, reply);
+      if (this.prompt.steers) this.prompt.steers = this.prompt.steers.filter((e) => e.n < reply);
       const cut = bisect(this.#entries, reply);
       const kept = this.#entries.slice(0, cut);
       // The dropped calls are not made: their ids may be made again, by the reply that replaces them.
@@ -711,28 +818,35 @@ export class Turn<I> {
    * Copy a framework's own messages into the turn, in `tx`, a transaction of
    * the framework's own store (its write of these messages): the rows commit
    * with it, so the copy is made once, however often the attempt crashes.
-   * Each of `items` is a reply of the model (`reply`, from `agent`) or
-   * another item (a tool's result). For a framework that keeps its own
-   * history. It cannot wait for the turn's other writes inside `tx`, which
+   * Each of `items` is a reply of the model (`reply`, from `agent`), a
+   * message steered to the turn that its framework placed (`steer`, its id:
+   * stored once, in the steered messages' table too), or another item (a
+   * tool's result). For a framework that keeps its own history. It cannot wait for the turn's other writes inside `tx`, which
    * holds the database: it takes its positions, and adds its entries, at
    * once, so that a close after it sees them and writes after them. A turn
    * being closed (or closed) takes no copy: its close says how it ended.
    * Whether it copied.
    */
-  async copyIn(tx: DatabaseWriter, items: { item: I; reply?: boolean; agent?: string }[]): Promise<boolean> {
+  async copyIn(
+    tx: DatabaseWriter,
+    items: { item: I; reply?: boolean; agent?: string; steer?: string }[],
+  ): Promise<boolean> {
     if (!this.writable) return false;
     const ledger = this.#ledger;
     const n = ledger.next;
     const seq = ledger.seq;
-    const added: Entry<I>[] = items.map(({ item, reply, agent }, i) => ({
+    const added: Entry<I>[] = items.map(({ item, reply, agent, steer }, i) => ({
       n: n + i,
       item,
       ...(reply ? { reply: n + i, agent } : {}),
+      ...(steer === undefined ? {} : { steer }),
     }));
     // A rolled back transaction fails its attempt, whose state goes with it.
     ledger.next = n + added.length;
     ledger.seq += added.length;
     this.#add(added);
+    const steered = added.filter((e) => e.steer !== undefined);
+    if (steered.length > 0) (this.prompt.steers ??= []).push(...steered);
     for (const [i, e] of added.entries()) {
       await tx.execute(INSERT_STEP, [
         e.n,
@@ -742,6 +856,7 @@ export class Turn<I> {
         e.reply ?? null,
         e.agent ?? null,
       ]);
+      if (e.steer !== undefined) await tx.execute(INSERT_STEERED, [e.n, this.n, e.steer]);
     }
     return true;
   }
@@ -815,10 +930,11 @@ export function loadItem<I>(items: Items<I>, stored: string): I {
 /** The columns of the transcript a load reads. */
 const TRANSCRIPT = `SELECT n, prompt, item, status, answer, agent, carried, answered_at, answered_seq, asked_at FROM ${TURNS}`;
 
-/** A row of {@link TRANSCRIPT} as a prompt's entry. */
-function promptEntry<I>(items: Items<I>, row: unknown[]): Entry<I> {
+/** A row of {@link TRANSCRIPT} as a prompt's entry, with the messages steered to its turn (`steered`, by turn). */
+function promptEntry<I>(items: Items<I>, row: unknown[], steered: ReadonlyMap<number, Entry<I>[]>): Entry<I> {
   const [n, prompt, item, status, answer, agent, carried, answeredAt, answeredSeq, askedAt] = row;
   const at = Number(n);
+  const steers = steered.get(at);
   return {
     n: at,
     item: loadItem(items, String(item)),
@@ -831,7 +947,57 @@ function promptEntry<I>(items: Items<I>, row: unknown[]): Entry<I> {
     answeredAt: int(answeredAt),
     answeredSeq: int(answeredSeq),
     askedAt: int(askedAt),
+    ...(steers ? { steers } : {}),
   };
+}
+
+/**
+ * The messages steered to the turns at positions `first` (included) to `end`,
+ * by their turn's position. It reads only the steered messages: one range of
+ * their table's primary key, joined to their items.
+ */
+async function steeredIn<I>(
+  db: DatabaseReader,
+  items: Items<I>,
+  first: number,
+  end: number,
+): Promise<Map<number, Entry<I>[]>> {
+  const rows = await db.values(
+    `SELECT st.n, st.turn, st.id, s.item FROM ${STEERED} st JOIN ${STEPS} s ON s.n = st.n ` +
+      'WHERE st.n >= ? AND st.n < ? ORDER BY st.n',
+    [first, end],
+  );
+  const steered = new Map<number, Entry<I>[]>();
+  for (const [n, turn, id, item] of rows) {
+    const entry: Entry<I> = {
+      n: Number(n),
+      item: loadItem(items, String(item)),
+      steer: String(id),
+      turn: Number(turn),
+    };
+    parsedOf(items, entry);
+    const of = steered.get(entry.turn!);
+    if (of) of.push(entry);
+    else steered.set(entry.turn!, [entry]);
+  }
+  return steered;
+}
+
+/**
+ * Whether a turn took the steered message `steerId`, in a database that may
+ * not have the conversation yet (the agent's `steered` asks, which may be
+ * the key's first handler).
+ */
+export async function steerStored(db: DatabaseReader, steerId: string): Promise<boolean> {
+  await SCHEMA.ensure(db);
+  return (await steersStored(db, [steerId])).has(steerId);
+}
+
+/** Which of the steered messages `steerIds` a turn took: one read, of their unique ids. */
+async function steersStored(db: DatabaseReader, steerIds: readonly string[]): Promise<Set<string>> {
+  const marks = steerIds.map(() => '?').join(', ');
+  const rows = await db.values(`SELECT id FROM ${STEERED} WHERE id IN (${marks})`, [...steerIds]);
+  return new Set(rows.map(([id]) => String(id)));
 }
 
 /**
@@ -848,7 +1014,8 @@ async function transcriptOf<I>(
 ): Promise<Entry<I>[]> {
   if (bounded === undefined) {
     const rows = await db.values(`${TRANSCRIPT} WHERE n >= ? ORDER BY n`, [first]);
-    return rows.map((row) => promptEntry(items, row));
+    const steered = await steeredIn(db, items, first, Number.MAX_SAFE_INTEGER);
+    return rows.map((row) => promptEntry(items, row, steered));
   }
   const read: Entry<I>[] = [];
   let before = Number.MAX_SAFE_INTEGER;
@@ -858,13 +1025,15 @@ async function transcriptOf<I>(
   const page = left > 0 ? PAGE : 4;
   for (;;) {
     const rows = await db.values(`${TRANSCRIPT} WHERE n >= ? AND n < ? ORDER BY n DESC LIMIT ?`, [first, before, page]);
+    // The messages steered to the page's turns: positions from its earliest turn's to the turn after it.
+    const steered = rows.length > 0 ? await steeredIn(db, items, Number(rows.at(-1)![0]), before) : new Map();
     for (const row of rows) {
-      const entry = promptEntry(items, row);
+      const entry = promptEntry(items, row, steered);
       read.push(entry);
       if (walk.holds(entry.status)) continue;
       if (entry.answer !== undefined) {
-        // A turn before the window: the model sees its message and answer, while the budget holds them.
-        left -= (parsedOf(items, entry).said?.[1] ?? '').length + entry.answer.length;
+        // A turn before the window: the model sees its messages and answer, while the budget holds them.
+        left -= turnSize(items, entry);
         // Without a budget, the first turn before the window is the last read (the model is told how it ended).
         if (left < 0 || bounded[1] === 0) return read.toReversed();
       }
@@ -877,18 +1046,24 @@ async function transcriptOf<I>(
 /** Store a step of a turn: its position, its turn's, its `seq`, its item, and the reply and agent it is of. */
 const INSERT_STEP = `INSERT INTO ${STEPS} (n, turn, seq, item, reply, agent) VALUES (?, ?, ?, ?, ?, ?)`;
 
+/** Mark the step at a position a message steered to its turn: the position, its turn's, and the message's id. */
+const INSERT_STEERED = `INSERT INTO ${STEERED} (n, turn, id) VALUES (?, ?, ?)`;
+
 /** Store a turn's answer on its row: how it ended, the answer, what it carries, its message's position, its `seq`. */
 const ANSWER = `UPDATE ${TURNS} SET status = ?, answer = ?, agent = ?, carried = ?, answered_at = ?, answered_seq = ? WHERE n = ?`;
 
-/** The rows of the trajectories after position `after`, in order, as entries. */
+/** The rows of the trajectories after position `after`, in order, as entries, each steered message marked as one. */
 async function stepsAfter<I>(db: DatabaseReader, items: Items<I>, after: number): Promise<Entry<I>[]> {
-  const rows = await db.values(`SELECT n, item, reply, agent FROM ${STEPS} WHERE n > ? ORDER BY n`, [after]);
-  return rows.map(([n, item, reply, agent]) => ({
-    n: Number(n),
-    item: loadItem(items, String(item)),
-    reply: int(reply),
-    agent: str(agent),
-  }));
+  const rows = await db.values(
+    `SELECT s.n, s.item, s.reply, s.agent, st.id FROM ${STEPS} s LEFT JOIN ${STEERED} st ON st.n = s.n ` +
+      'WHERE s.n > ? ORDER BY s.n',
+    [after],
+  );
+  return rows.map(([n, item, reply, agent, steer]) => {
+    const entry: Entry<I> = { n: Number(n), item: loadItem(items, String(item)), reply: int(reply), agent: str(agent) };
+    if (steer !== null && steer !== undefined) entry.steer = String(steer);
+    return entry;
+  });
 }
 
 /**
@@ -1045,9 +1220,9 @@ export class Conversation<I> {
     return this.#turns[0]?.n ?? this.#ledger.next;
   }
 
-  /** The size of `turn` as the transcript has it, in characters: its message and its answer. */
+  /** The size of `turn` as the transcript has it, in characters: its messages and its answer. */
   #size(turn: Entry<I>) {
-    return (parsedOf(this.items, turn).said?.[1] ?? '').length + (turn.answer ?? '').length;
+    return turnSize(this.items, turn);
   }
 
   /** The latest of `turns` that `characters` holds, in order. */
@@ -1099,14 +1274,17 @@ export class Conversation<I> {
   /**
    * The items the model gets, in order, the one place where turns are made
    * one flat list: the summary of the earliest turns, if they have one; the
-   * turns before the window, as their prompts and answers, as many of the
-   * latest as `budget` holds; then the window's turns, whole.
+   * turns before the window, as their prompts, the messages steered to them
+   * and their answers, as many of the latest as `budget` holds; then the
+   * window's turns, whole.
    */
   history(): I[] {
     const out: I[] = [];
     const summary = this.summary;
     if (summary !== undefined) out.push(...summaryItems(this.items, summary));
-    for (const turn of this.earlier()) out.push(turn.item, this.items.reply(turn.answer ?? '', turn.agent));
+    for (const turn of this.earlier()) {
+      out.push(turn.item, ...(turn.steers ?? []).map((e) => e.item), this.items.reply(turn.answer ?? '', turn.agent));
+    }
     for (const turn of this.#turns) {
       for (const entry of turn.entries) {
         // The prompt as the model gets it: with the turn's reminder, which is not stored.
@@ -1316,7 +1494,8 @@ function transcribed<I>(conversation: Conversation<I>, turns: Entry<I>[]) {
   const lines = conversation.summary ? [`Summary of the conversation before:\n${conversation.summary}\n`] : [];
   for (const turn of turns) {
     const said = parsedOf(conversation.items, turn).said?.[1] ?? '';
-    lines.push(`User: ${said}\nAssistant: ${turn.answer ?? ''}\n`);
+    const steered = (turn.steers ?? []).map((e) => `User: ${parsedOf(conversation.items, e).said?.[1] ?? ''}\n`);
+    lines.push(`User: ${said}\n${steered.join('')}Assistant: ${turn.answer ?? ''}\n`);
   }
   return lines.join('\n');
 }

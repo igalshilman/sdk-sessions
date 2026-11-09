@@ -46,10 +46,14 @@ still ends its turn (both in [The frameworks](frameworks.md)).
 - **The companion** (the `signals` object) is the control plane: the turn
   being answered, the tools' waits, and a revision clients follow. Nothing in
   it is needed to complete a turn.
+- **A message may steer the turn being answered** (the `steer` view): the
+  turn takes it at its next step, after a reply's tool results, or else it
+  is answered as a turn of its own, in the order it was sent; once either
+  way ([Steering a turn](turns.md#steering-a-turn)).
 
 ```mermaid
 flowchart LR
-  C[Client] -- "chat, stop, signal" --> A
+  C[Client] -- "chat, steer, stop, signal" --> A
   C -- "status, messages, sync, watch" --> A
   subgraph A["Agent (session object), key alice"]
     H["chat: a turn (answerOnce)"] --> F["Framework run: model, tools"]
@@ -57,7 +61,7 @@ flowchart LR
     H -- "prompt, answer" --> T
     T[("Key's database: turns, items, call records")]
     V["views: messages, sync"] -- read --> T
-    X["private: settle, compact, erase"] --> T
+    X["private: settle, compact, erase, steered"] --> T
   end
   H -- "start, close, publish" --> S[("Companion signals, key assistant:alice: turn, waits, revision")]
   F -- "wait, for a tool" --> S

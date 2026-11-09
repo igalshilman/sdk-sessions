@@ -129,6 +129,43 @@ own test: `langgraph-`, `deepseek-` and `pi-tool-calls-say-nothing`,
 `deepseek-reads-whole-history` and `langgraph-reask-stored-reply` beside the
 rows': 59 mutants in all.
 
+### Steering
+
+Steering ([Steering a turn](turns.md#steering-a-turn)) came with 21
+durability mutants of its own, of no fix: the rules of a steered message's
+life, each with the test that fails for it. Run on its branch, with Node
+22.23 and, for the two e2e ones, Restate 1.8.0 (`pnpm --filter e2e
+steering`): all 21 are killed.
+
+| Mutant                             | Bug brought back                                                                                   | Verdict            |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------ |
+| `steer-not-queued`                 | a message the turn holds is not queued as a turn of its own: a turn that ends first loses it       | killed, and 1 more |
+| `steer-closed-turn-keeps-inbox`    | a closed turn's messages are kept: what the companion holds grows with every steered message       | killed             |
+| `steer-unbounded`                  | a turn steered on and on takes every message                                                       | killed             |
+| `steer-taken-not-told`             | the companion is not told a stored message is taken: the turn and the status list it until it ends | killed, and 9 more |
+| `steered-answers-taken`            | a message a turn took is answered again as a turn of its own                                       | killed by e2e, too |
+| `steer-stored-by-two-turns`        | a message another turn took is taken again                                                         | killed             |
+| `steer-taken-once-stopped`         | a turn that stopped as it got the ledger takes the message, which no one answers then              | killed             |
+| `steer-between-call-and-result`    | a message is taken while a tool call has no result                                                 | killed             |
+| `steer-is-an-ask`                  | a steered message is the turn's ask: the output check does not ask again after one                 | killed, and 1 more |
+| `steer-outlives-its-dropped-reply` | a dropped reply leaves the message steered after it marked taken                                   | killed             |
+| `steer-left-out-of-history`        | an earlier turn reaches the model without the messages steered to it                               | killed             |
+| `steer-free-of-the-budget`         | the budget counts a turn's prompt and answer only                                                  | killed             |
+| `steer-left-out-of-summary`        | the summary view misses a steered message                                                          | killed             |
+| `claude-steer-not-before-first`    | Claude takes no message before the turn's first request                                            | killed             |
+| `claude-steer-after-pause`         | Claude takes a message after a paused reply, which then is not the last message                    | killed             |
+| `claude-steer-not-sent`            | Claude stores the message, but its next request is the runner's own, without it                    | killed             |
+| `langgraph-steer-not-asked`        | LangGraph's model node stores the message, but asks without it                                     | killed             |
+| `pi-steer-in-ending-round`         | pi submits a message as a round that ends the run ends, which pi answers in a run of its own       | killed             |
+| `langgraph-fn-graph-steers`        | `langgraph.chat(fn)` says its turns take steered messages, also a graph's                          | killed             |
+| `pi-steer-not-copied`              | pi places the message, but the turn's copy leaves it out                                           | killed             |
+| `deepseek-steer-not-copied`        | the harness places the message, but the turn's copy leaves it out                                  | killed             |
+
+`steer-closed-turn-keeps-inbox` survived its first run: a closed turn's
+messages are listed to no turn (the companion lists the turn being
+answered's), so only what the companion holds shows it; the test now checks
+that.
+
 What it says:
 
 - **All 59 are killed, 47 by their own tests only.** As in the Python

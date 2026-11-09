@@ -6,7 +6,7 @@
 import * as restate from '@restatedev/sessions';
 import { cancelCalls, cancelled, definitionOf, Link, ScopeKey } from '@restatedev/sessions/internal';
 import { settleCalls } from './calls.ts';
-import { signals, signalsOf } from './signals.ts';
+import { type Published, type Steer, signals, signalsOf } from './signals.ts';
 
 /**
  * A value, or a function of the invocation's context that gives it: the
@@ -277,6 +277,46 @@ const unfollowed = (ctx: restate.SessionContext) => agentOf(ctx)?.background ===
 const signalsOfAgent = (ctx: restate.SessionContext) => ctx.rpc(signals, signalsOf(ctx));
 
 /**
+ * The messages steered to a `chat` turn that it has not taken yet, as the
+ * companion last published them. The companion answers them to every
+ * `publish`, which a turn makes at each tool call's start and end: so the
+ * turn knows of them without a call of its own, and finds them at its next
+ * step (`takeSteers`). The newest revision wins, as tool calls that run at
+ * once publish at once.
+ */
+export class Inbox {
+  revision = -1;
+  messages: Steer[] = [];
+  readonly #listeners = new Set<() => void>();
+
+  /** Keep what `publish` answered, if it is newer than what is kept, and tell the listeners if it lists messages. */
+  saw(published: Published | undefined) {
+    if (typeof published !== 'object' || published === null) return;
+    const revision = published.revision ?? -1;
+    if (revision <= this.revision) return;
+    this.revision = revision;
+    this.messages = [...(published.steering ?? [])];
+    if (this.messages.length > 0) for (const listener of this.#listeners) listener();
+  }
+
+  /**
+   * Call `listener` after each publish that lists messages, until the
+   * returned function is called: for a framework that takes steered
+   * messages through an inbox of its own (pi's, DeepSeek's), handed to it as
+   * they come.
+   */
+  listen(listener: () => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+}
+
+const INBOX = new ScopeKey<Inbox>('inbox');
+
+/** The inbox of the `chat` turn running on `ctx`, if it takes steered messages: none outside one. */
+export const inboxOf = (ctx: restate.SessionContext) => INBOX.get(ctx);
+
+/**
  * The conversation of `ctx` changed (see `watch` in object.ts): its revision
  * increases, and the clients that follow it read it again; while a framework
  * answers ({@link answering}), the calls whose results it stored are
@@ -286,7 +326,8 @@ const signalsOfAgent = (ctx: restate.SessionContext) => ctx.rpc(signals, signals
 export const publish = async (ctx: restate.SessionContext) => {
   const stored = ANSWERING.get(ctx);
   if (stored) await settled(ctx, stored);
-  await signalsOfAgent(ctx).publish();
+  const published = await signalsOfAgent(ctx).publish();
+  INBOX.get(ctx)?.saw(published);
 };
 
 /** A step of a turn of `ctx`: {@link publish} it, unless the agent runs in the background, which publishes the turn's end only. */
@@ -361,6 +402,22 @@ export const aborted = (signal: AbortSignal) =>
     else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
   });
 
+/** A `chat` handler's answer to a message: a framework's prompt, say. */
+export type Chat<A = unknown> = (ctx: restate.SessionContext, message: string) => Promise<A>;
+
+/**
+ * Whether a `chat` handler's turns take steered messages: for every message,
+ * or for each, as the invocation's context says (a framework's options that
+ * a function gives, say).
+ */
+export type Steers = boolean | ((ctx: restate.SessionContext) => boolean | Promise<boolean>);
+
+/** What makes a `chat` handler (`chatHandler`): its answer, and whether it takes steered messages. */
+const CHAT = new Link<{ answer: Chat; steers: Steers }>('restate-agents.chat');
+
+/** The answer of `entry`, a handler that `chatHandler` made, and whether it takes steered messages. */
+export const chatOf = (entry: object) => CHAT.of(entry);
+
 /**
  * `answer` as a chat handler, which takes its message as plain text or as a
  * JSON string, so that both of these work:
@@ -379,63 +436,91 @@ export const aborted = (signal: AbortSignal) =>
  *
  * It publishes when it starts and ends ({@link publish}), for the clients
  * that follow the conversation.
+ *
+ * As the `chat` handler of an agent, it also answers each message sent to
+ * the agent's `steer` view that no turn took, as a turn of its own (the
+ * private `steered` handler). With `steers` (a framework's integration says
+ * so), its turns take steered messages at their steps (`takeSteers`).
  */
-export const chatHandler = <A = string>(answer: (ctx: restate.SessionContext, message: string) => Promise<A>) => ({
-  input: messageSerde,
-  accept: '*/*',
-  explicitCancellation: true,
-  handler: async (ctx: restate.SessionContext, text: string): Promise<A> => {
-    const invocationId = ctx.request.id;
-    // The companion knows the turn from here to its close: `status` and `stop` ask it.
-    // An agent on the conversation of turns has `settle`: the companion sends it
-    // this turn, should its invocation be gone without closing it.
-    const settles = agentOf(ctx)?.items !== undefined;
-    await ctx
-      .rpc(signals, signalsOf(ctx))
-      .start({ invocationId, since: new Date().toISOString(), ...(settles ? { settles } : {}) });
-    await stepped(ctx);
-    // The log takes the turn's last change, then the companion closes the
-    // turn, which publishes it: one revision. The close is a call the turn
-    // waits for, so that it is done before the turn ends (see `awaitTurn`).
-    const end = async () => {
-      const stored = ANSWERING.get(ctx);
-      if (stored) await settled(ctx, stored);
-      await signalsOfAgent(ctx).close(invocationId);
-    };
-    const turn = new AbortController();
-    TURN.set(ctx, turn.signal);
-    void (async () => {
-      await cancelled(ctx);
-      turn.abort(new restate.CancelledError());
-      await cancelCalls(ctx);
-    })().catch(() => {});
-    // The attempt ends before the turn does: its work stops (a model's
-    // request, say), rather than run on for an attempt that can store nothing.
-    const attempt = ctx.request.attemptCompletedSignal;
-    const attemptEnded = () => turn.abort(new AttemptEnded());
-    attempt.addEventListener('abort', attemptEnded, { once: true });
-    let answered: A;
-    try {
-      answered = await answer(ctx, text);
-      // Cancelled once answered: the answer stands.
-    } catch (error) {
-      if (error instanceof restate.TerminalError) {
-        await end();
-        throw error;
-      }
-      // Any other error fails the attempt, and Restate retries the turn.
-      const terminal = refusalOf(ctx, error);
-      if (!terminal) throw error;
+export const chatHandler = <A = string>(answer: Chat<A>, { steers = false }: { steers?: Steers } = {}) =>
+  CHAT.on(
+    {
+      input: messageSerde,
+      accept: '*/*',
+      explicitCancellation: true,
+      handler: (ctx: restate.SessionContext, text: string): Promise<A> => chatTurn(ctx, text, answer, steers),
+    },
+    { answer, steers },
+  );
+
+/**
+ * Answer `text` as a turn of the agent of `ctx`, with `answer`: the body of a
+ * `chat` handler ({@link chatHandler}), and of `steered`. With `steers`, the
+ * turn takes the messages steered to it at its steps (unless the agent runs
+ * in the background).
+ */
+export async function chatTurn<A>(
+  ctx: restate.SessionContext,
+  text: string,
+  answer: Chat<A>,
+  steers: Steers = false,
+): Promise<A> {
+  const invocationId = ctx.request.id;
+  // The companion knows the turn from here to its close: `status` and `stop` ask it.
+  // An agent on the conversation of turns has `settle`: the companion sends it
+  // this turn, should its invocation be gone without closing it.
+  const settles = agentOf(ctx)?.items !== undefined;
+  const steering = !unfollowed(ctx) && (typeof steers === 'function' ? await steers(ctx) : steers);
+  // Before the first publish, which may answer messages steered to the turn already (a retried attempt's).
+  if (steering) INBOX.set(ctx, new Inbox());
+  await ctx.rpc(signals, signalsOf(ctx)).start({
+    invocationId,
+    since: new Date().toISOString(),
+    ...(settles ? { settles } : {}),
+    ...(steering ? { steers: steering } : {}),
+  });
+  await stepped(ctx);
+  // The log takes the turn's last change, then the companion closes the
+  // turn, which publishes it: one revision. The close is a call the turn
+  // waits for, so that it is done before the turn ends (see `awaitTurn`).
+  const end = async () => {
+    const stored = ANSWERING.get(ctx);
+    if (stored) await settled(ctx, stored);
+    await signalsOfAgent(ctx).close(invocationId);
+  };
+  const turn = new AbortController();
+  TURN.set(ctx, turn.signal);
+  void (async () => {
+    await cancelled(ctx);
+    turn.abort(new restate.CancelledError());
+    await cancelCalls(ctx);
+  })().catch(() => {});
+  // The attempt ends before the turn does: its work stops (a model's
+  // request, say), rather than run on for an attempt that can store nothing.
+  const attempt = ctx.request.attemptCompletedSignal;
+  const attemptEnded = () => turn.abort(new AttemptEnded());
+  attempt.addEventListener('abort', attemptEnded, { once: true });
+  let answered: A;
+  try {
+    answered = await answer(ctx, text);
+    // Cancelled once answered: the answer stands.
+  } catch (error) {
+    if (error instanceof restate.TerminalError) {
       await end();
-      throw terminal;
-    } finally {
-      // An attempt's signal aborts at every attempt's end, the turn's too.
-      attempt.removeEventListener('abort', attemptEnded);
+      throw error;
     }
+    // Any other error fails the attempt, and Restate retries the turn.
+    const terminal = refusalOf(ctx, error);
+    if (!terminal) throw error;
     await end();
-    return answered;
-  },
-});
+    throw terminal;
+  } finally {
+    // An attempt's signal aborts at every attempt's end, the turn's too.
+    attempt.removeEventListener('abort', attemptEnded);
+  }
+  await end();
+  return answered;
+}
 
 /** A tool's error, which fails the attempt (Restate retries it): the error `cause` of tool `tool`. */
 export class ToolError extends Error {

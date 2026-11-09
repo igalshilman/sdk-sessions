@@ -31,7 +31,7 @@ import {
   type SessionPersistenceCreateOptions,
   type SessionPersistenceSnapshot,
 } from '@deepseek-ai/dsh-session-persistence';
-import type { Database, DatabaseWriter } from '@restatedev/sessions';
+import type { Database, Transaction } from '@restatedev/sessions';
 import { Schema } from '@restatedev/sessions/internal';
 
 const SCHEMA = new Schema('restate-agents.deepseek', [
@@ -63,7 +63,7 @@ export class SqlSessionPersistence extends SessionPersistence {
    * transaction: the conversation of turns (index.ts), so that the copy and
    * the log commit together.
    */
-  copy: ((tx: DatabaseWriter, events: readonly SessionEvent[]) => Promise<void>) | undefined;
+  copy: ((tx: Transaction, events: readonly SessionEvent[]) => Promise<void>) | undefined;
   /** What runs once each flush is stored, outside its transaction: to tell others what it stored, say. */
   flushed: (() => Promise<void>) | undefined;
 

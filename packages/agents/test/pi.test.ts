@@ -21,7 +21,9 @@ import {
   type Made,
   type Entry,
   handlerOf,
+  followingOf,
   sqlAttempt,
+  steeredAtAStep,
 } from './support.ts';
 
 /** How many more requests the provider fails, unavailable, before it answers again. */
@@ -52,6 +54,7 @@ vi.mock('@earendil-works/pi-ai/providers/all', () => ({
       }
       if (textOf(last.content) === 'Break it') return callTools([['boom', {}]]);
       if (textOf(last.content) === 'Look it up') return callTools([['lookup', {}]]);
+      if (textOf(last.content) === 'audit the books') return callTools([['audit', {}]]);
       if (textOf(last.content) === 'Please move 5 from 1 to 2') {
         return callTools([['transfer', { from: 1, to: 2, amount: 5 }]], 'On it.');
       }
@@ -401,5 +404,65 @@ describe('subagent', () => {
     // One idempotency key per tool call, made from the invocation id.
     expect(new Set(alice.calls.map((c) => c.idempotencyKey)).size).toBe(2);
     expect(alice.calls.every((c) => c.idempotencyKey?.startsWith('inv1:'))).toBe(true);
+  });
+});
+
+describe('pi, steered', () => {
+  /** The steered message, placed by pi as the transfer's round ends, after its result: the model audits. */
+  const SAID_STEERED = [
+    ['user', 'Please move 5 from 1 to 2'],
+    ['assistant', 'On it. + transfer'],
+    ['user', 'audit the books'],
+    ['assistant', 'audit'],
+    ['assistant', 'moved 5 from account 1 to account 2\nthe books are fine'],
+  ];
+
+  it('submits a message steered while a tool runs to its inbox as the round ends: the next request has it', async () => {
+    const { answer, said: shown, audits, taken } = await steeredAtAStep((tools) => pi.chat({ tools }), pi.messages());
+    expect(shown).toEqual(SAID_STEERED);
+    expect(answer).toBe('moved 5 from account 1 to account 2\nthe books are fine');
+    expect(audits).toBe(1);
+    expect(taken).toEqual(['steer-1']);
+  });
+
+  it('submits no message as a round that ends the run ends: pi would answer it in a run of its own', async () => {
+    const map = new Map<string, Uint8Array>();
+    const following = followingOf(map);
+    // A tool of pi's own that ends the run, while a message waits.
+    const transfer = defineTool({
+      name: 'transfer',
+      description: 'Move money, and end the run.',
+      parameters: Type.Object({ from: Type.Number(), to: Type.Number(), amount: Type.Number() }),
+      execute: async () => {
+        following.steering = [{ id: 'steer-1', text: 'audit the books' }];
+        return { output: [{ type: 'text' as const, text: 'moved' }], control: { terminate: true } };
+      },
+    });
+    const sql = sqlAttempt({ map, key: 'ending', id: 'inv1' });
+    const answer = await sql.end(() => handlerOf(pi.chat({ tools: [transfer] }))(sql.ctx, 'Please move 5 from 1 to 2'));
+    expect(answer).toBe('On it.');
+    // Not taken: the message waits for the turn's end, then its own turn (`steered`) answers it.
+    expect(following.taken).toEqual([]);
+    const read = sqlAttempt({ map, key: 'ending', id: 'read', shared: true });
+    const { messages } = await read.end(() => pi.messages()(read.view, {}));
+    const texts = messages.flatMap((m) => m.parts.flatMap((p) => (p.type === 'text' ? [p.text] : [])));
+    expect(texts).not.toContain('audit the books');
+  });
+
+  it('retries a turn that failed after it placed the message with the message, once', async () => {
+    const {
+      answer,
+      failed,
+      said: shown,
+      audits,
+      taken,
+    } = await steeredAtAStep((tools) => pi.chat({ tools }), pi.messages(), {
+      failAudit: true,
+    });
+    expect(failed).toBeInstanceOf(Error);
+    expect(shown).toEqual(SAID_STEERED);
+    expect(answer).toBe('moved 5 from account 1 to account 2\nthe books are fine');
+    expect(audits).toBe(2);
+    expect(taken).toEqual(['steer-1']);
   });
 });

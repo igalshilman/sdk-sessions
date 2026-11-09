@@ -58,11 +58,12 @@ import {
   toolCallStarted,
   NO_ANSWER,
 } from '../common.ts';
-import { answerOnce, type Items, type Run, type Turn } from '../conversation.ts';
+import { answerOnce, type Conversation, type Items, type Run, type Turn } from '../conversation.ts';
 import { conversationView } from '../messages.ts';
 import { type Answer, withChecked } from '../output.ts';
 import type { z } from 'zod';
 import { type Definition, sessionObject } from '../object.ts';
+import { takeSteers } from '../steering.ts';
 import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
 
 import { SqlCheckpointSaver } from './checkpointer.ts';
@@ -84,6 +85,8 @@ export const items: Items<BaseMessage> = {
   dump: (message) => JSON.stringify(message.toDict()),
   load: (stored) => mapStoredMessagesToChatMessages([JSON.parse(stored) as StoredMessage])[0]!,
   prompt: (text) => new HumanMessage(text),
+  // A steered message, told apart from a prompt in the run's state by its id, which is stored with it.
+  steered: (text, steerId) => new HumanMessage({ content: text, id: `steer:${steerId}` }),
   // A provider may refuse an empty message: an empty answer, as the model sees it later, says so.
   reply: (text) => new AIMessage(text.trim() ? text : NO_ANSWER),
   results: (results) =>
@@ -228,24 +231,30 @@ async function integration<T>(name: string, load: () => Promise<T>): Promise<T> 
 }
 
 /**
- * The agent's graph, for `turn`: `model`, calling `tools`, from the tools if
- * the turn has calls without results (a crash cut them off). The model node
- * stores each reply before it returns.
+ * The agent's graph, for the latest turn of `conversation`: `model`, calling
+ * `tools`, from the tools if the turn has calls without results (a crash cut
+ * them off). The model node takes the messages steered to the turn first
+ * (`takeSteers`: it runs after the prompt or the tools' results), which go
+ * into its request and stay in the run's state, and stores each reply before
+ * it returns.
  */
 function toolLoop(
   ctx: restate.SessionContext,
-  turn: Turn<BaseMessage>,
+  conversation: Conversation<BaseMessage>,
   model: BaseChatModel,
   tools: StructuredToolInterface[],
   system?: string,
 ) {
   if (!model.bindTools) throw new Error(`${model.getName()} does not call tools`);
   const withTools = model.bindTools(tools);
+  const turn = conversation.turn;
   return new StateGraph(MessagesAnnotation)
     .addNode('model', async ({ messages }) => {
-      const reply = await withTools.invoke(system ? [new SystemMessage(system), ...messages] : messages);
+      const steered = await takeSteers(ctx, conversation);
+      const asked = [...messages, ...steered];
+      const reply = await withTools.invoke(system ? [new SystemMessage(system), ...asked] : asked);
       await turn.appendReply([reply]);
-      return { messages: [reply] };
+      return { messages: [...steered, reply] };
     })
     .addNode('tools', toolsNode(ctx, turn, tools))
     .addConditionalEdges(START, () => (turn.openCalls().length > 0 ? 'tools' : 'model'), {
@@ -273,7 +282,7 @@ const runOf =
     // A stored final reply is the answer: the model is not asked for it again.
     const final = turn.finalReply();
     if (final !== undefined) return final;
-    const app = toolLoop(ctx, turn, model, tools, system).compile();
+    const app = toolLoop(ctx, conversation, model, tools, system).compile();
     try {
       const { messages } = await app.invoke(
         { messages: sendable(conversation.history()) },
@@ -425,7 +434,21 @@ export const chat = <O extends z.ZodObject | undefined = undefined>(options: Con
     checkOptions(options);
     if (options.graph === undefined && typeof options.model !== 'object') providerOfModel(modelOf(options.model));
   }
-  return chatHandler(async (ctx, message) => prompt(ctx, message, await configured(options, ctx)));
+  // The built-in loop takes steered messages at its steps; a graph of your own takes none (each is a turn of its
+  // own). Options a function gives are its message's: given once per attempt, to the turn's start and its prompt.
+  if (typeof options !== 'function') {
+    const steers = options.graph === undefined;
+    return chatHandler(async (ctx, message) => prompt(ctx, message, options), { steers });
+  }
+  const given = new WeakMap<restate.SessionContext, Promise<Options<O>>>();
+  const optionsOf = (ctx: restate.SessionContext) => {
+    let of = given.get(ctx);
+    if (!of) given.set(ctx, (of = configured(options, ctx)));
+    return of;
+  };
+  return chatHandler(async (ctx, message) => prompt(ctx, message, await optionsOf(ctx)), {
+    steers: async (ctx) => (await optionsOf(ctx)).graph === undefined,
+  });
 };
 
 /**

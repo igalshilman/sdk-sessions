@@ -4,9 +4,11 @@
  *   node advanced/pairing/pair.ts fizzbuzz
  *
  * What you type goes to the pair, as a message it answers after the one it
- * works on, if any (`/stop` stops that one). Its messages and its tool calls
- * show as it makes them, and so do its waits for your approval. Commands:
+ * works on, if any (`/steer` adds to that one, `/stop` stops it). Its
+ * messages and its tool calls show as it makes them, and so do its waits for
+ * your approval. Commands:
  *
+ *   /steer <message>            add to the message it works on: it takes it at its next step
  *   /approve [what to change]   answer its wait for your approval
  *   /tasks                      the plan
  *   /stop                       stop the message it works on
@@ -79,6 +81,12 @@ async function say(line: string) {
     case '/tasks':
       for (const { n, task, done } of await conversation.tasks()) console.log(`  [${done ? 'x' : ' '}] ${n}. ${task}`);
       return;
+    case '/steer': {
+      // Keyed once per message: sent again (a lost connection), it is the same message.
+      const { turn } = await conversation.steer(rest, clients.rpc.opts({ idempotencyKey: crypto.randomUUID() }));
+      console.log(turn ? 'It takes it at its next step.' : 'It answers it next, as a message of its own.');
+      return;
+    }
     case '/stop':
       await conversation.stop();
       return;

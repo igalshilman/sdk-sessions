@@ -15,7 +15,17 @@ export {
   type Configure,
 } from './common.ts';
 export { sessionObject, type Status, type Stopped } from './object.ts';
-export { companionOf, deliver, signals, type Companion, type Resolved, type Signal, type Waiting } from './signals.ts';
+export {
+  companionOf,
+  deliver,
+  signals,
+  type Companion,
+  type Resolved,
+  type Signal,
+  type Steered,
+  type Steering,
+  type Waiting,
+} from './signals.ts';
 export { call, send, signal, subagent, tool, workflow, type Tool, type ToolCall, type ToolContext } from './tools.ts';
 export { webhook, webhookMessage, type WebhookAuth, type WebhookEvent, type WebhookOptions } from './webhook.ts';
 

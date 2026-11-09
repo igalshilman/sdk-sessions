@@ -71,6 +71,7 @@ jobs:
       - run: pnpm --filter e2e concurrency
       - run: pnpm --filter e2e versions
       - run: pnpm --filter e2e tools
+      - run: pnpm --filter e2e steering
       - run: pnpm --filter e2e crash
       - if: failure()
         uses: actions/upload-artifact@v4

@@ -1,6 +1,7 @@
 // Signals to agents: a virtual object per agent, keyed `<agent>:<key>` (such
 // as `assistant:alice`), whose `wait` returns once `resolve` gives the wait
-// its value; the message the agent answers; and the revision of the agent's
+// its value; the message the agent answers; the messages steered to it that
+// it has not taken yet (`steer`); and the revision of the agent's
 // conversation, which its `watch` waits on.
 //
 // An agent's own handler cannot wait on an awakeable (it has no journal to
@@ -130,6 +131,49 @@ export interface Notifications {
   revision: number;
 }
 
+/** A message steered to the turn being answered (`steer`): its id (the `steer` request's) and its text. */
+export interface Steer {
+  id: string;
+  text: string;
+}
+
+/**
+ * What `publish` answers the turn that published: the new revision, and the
+ * messages steered to the turn being answered that it has not taken yet, if
+ * any, oldest first.
+ */
+export interface Published extends Notifications {
+  steering?: Steer[];
+}
+
+/** A message steered to the turn being answered that it has not taken yet, as `status` shows it. */
+export interface Steering {
+  id: string;
+  /** When it was sent, as an ISO date. */
+  since: string;
+}
+
+/**
+ * What the `steer` view answers: the message's id (the request's), and the
+ * invocation of the turn being answered, which takes the message at its next
+ * step if it reaches one; null if no turn takes it. Either way the message is
+ * answered once: in that turn, or else as a turn of its own, in the order it
+ * was sent.
+ */
+export interface Steered {
+  id: string;
+  turn: string | null;
+}
+
+/**
+ * How many messages a turn takes by `steer`, at most: past them, each is
+ * answered as a turn of its own. The companion counts each message it holds
+ * for the turn, taken or not, until the turn ends: so a turn that someone
+ * steers on and on stays within bounds, and so does what the companion holds
+ * for it.
+ */
+export const STEERS = 16;
+
 /** What `watch` waits for: a revision newer than `revision`, for at most `timeoutSeconds` (default 50, at most 60). */
 export interface Watch {
   revision: number;
@@ -145,7 +189,29 @@ export interface Watch {
  */
 export interface Started extends Answering {
   settles?: boolean;
+  /**
+   * Whether the turn takes steered messages at its steps (`steer`). A turn
+   * that does not say so (of another SDK, or of an agent whose framework
+   * cannot take them) gets none: each is answered as a turn of its own.
+   */
+  steers?: boolean;
 }
+
+/**
+ * A message steered to the turn `turn` (an invocation id), as the companion
+ * holds it until the turn ends: with its text until the turn takes it
+ * (`taken`), and then only as one of the turn's {@link STEERS}.
+ */
+interface Inboxed {
+  id: string;
+  since: string;
+  turn: string;
+  text?: string;
+}
+
+/** The messages of `inbox` steered to the turn being answered (`answering`) that it has not taken yet, oldest first. */
+const waitingIn = (inbox: readonly Inboxed[], answering: Started | null | undefined) =>
+  answering ? inbox.filter((m) => m.turn === answering.invocationId && m.text !== undefined) : [];
 
 /** `turn` as `status` shows it: without what only the companion reads. */
 const shown = (turn: Started | null | undefined): Answering | null =>
@@ -167,6 +233,8 @@ interface State {
   turn: Started;
   waiting: (Waiting & { awakeable: string })[];
   kept: Record<string, unknown[]>;
+  /** The messages steered to the turns not closed yet (the one being answered), taken or not, oldest first. */
+  inbox: Inboxed[];
   revision: number;
   watching: { revision: number; awakeable: string }[];
 }
@@ -179,6 +247,10 @@ async function publish(ctx: restate.ObjectContext<State>): Promise<Notifications
   ctx.clear('watching');
   return { revision };
 }
+
+/** Keep `inbox`, or forget it once it is empty. */
+const setInbox = (ctx: restate.ObjectContext<State>, inbox: Inboxed[]) =>
+  inbox.length > 0 ? ctx.set('inbox', inbox) : ctx.clear('inbox');
 
 /** How long one `awaitTurn` waits for its turn to end, before a new one takes over. */
 const WATCH = { hours: 1 };
@@ -194,6 +266,10 @@ const WATCH = { hours: 1 };
  * If the turn's invocation is `gone` and the turn did not close itself, its
  * agent is sent `settle`, which closes the turn in its conversation too, if
  * it said, as it started the turn, that it `settles`.
+ *
+ * The messages steered to the turn are forgotten here: each that it did not
+ * take was queued as a turn of its own as it was sent (`steer`), and is
+ * answered as one.
  */
 async function closed(ctx: restate.ObjectContext<State>, turn: string, gone = false) {
   const started = await ctx.get('turn');
@@ -211,6 +287,13 @@ async function closed(ctx: restate.ObjectContext<State>, turn: string, gone = fa
       });
     }
   }
+  const inbox = (await ctx.get('inbox')) ?? [];
+  const dropped = inbox.some((m) => m.turn === turn);
+  if (dropped)
+    setInbox(
+      ctx,
+      inbox.filter((m) => m.turn !== turn),
+    );
   const waiting = (await ctx.get('waiting')) ?? [];
   // A wait's id starts with the invocation id of the turn whose tool waits.
   const ofTurn = (id: string) => id.startsWith(`${turn}:`);
@@ -218,7 +301,7 @@ async function closed(ctx: restate.ObjectContext<State>, turn: string, gone = fa
   const left = waiting.filter((w) => !ofTurn(w.id));
   for (const w of over) ctx.rejectAwakeable(w.awakeable, 'its turn is over');
   if (over.length > 0) ctx.set('waiting', left);
-  if (answering || over.length > 0) await publish(ctx);
+  if (answering || over.length > 0 || dropped) await publish(ctx);
 }
 
 /** A handler that the agents' own handlers call, which clients cannot (through Restate's ingress). */
@@ -334,11 +417,19 @@ export const signals = restate.object({
       },
     ),
 
-    /** What the agent does: the message it answers, if any, and the waits of its tools. */
-    status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext<State>): Promise<Status> => ({
-      answering: shown(await ctx.get('turn')),
-      waiting: ((await ctx.get('waiting')) ?? []).map(({ id, name, input, since }) => ({ id, name, input, since })),
-    })),
+    /**
+     * What the agent does: the message it answers, if any, the waits of its
+     * tools, and the messages steered to it that it has not taken yet.
+     */
+    status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext<State>): Promise<Status> => {
+      const answering = await ctx.get('turn');
+      const status: Status = {
+        answering: shown(answering),
+        waiting: ((await ctx.get('waiting')) ?? []).map(({ id, name, input, since }) => ({ id, name, input, since })),
+      };
+      const steering = waitingIn((await ctx.get('inbox')) ?? [], answering).map(({ id, since }) => ({ id, since }));
+      return steering.length > 0 ? { ...status, steering } : status;
+    }),
 
     /**
      * The revision, once there is one newer than `revision`, or at the
@@ -372,11 +463,14 @@ export const signals = restate.object({
 
     /**
      * @internal The agent forgot its conversation (`clear`): forget its
-     * waits and kept signals, and publish the change.
+     * waits, kept signals and steered messages, and publish the change. Each
+     * steered message was queued as a turn of its own as it was sent, before
+     * the `clear`.
      */
     reset: restate.handlers.object.exclusive({ ingressPrivate: true }, async (ctx: restate.ObjectContext<State>) => {
       ctx.clear('waiting');
       ctx.clear('kept');
+      ctx.clear('inbox');
       await publish(ctx);
     }),
 
@@ -390,8 +484,82 @@ export const signals = restate.object({
       await publish(ctx);
     }),
 
-    /** @internal The conversation changed: increase its revision, and answer the `watch`es. */
-    publish: restate.handlers.object.exclusive({ ingressPrivate: true }, publish),
+    /**
+     * @internal The conversation changed: increase its revision, and answer
+     * the `watch`es. It answers the new revision, and the messages steered
+     * to the turn being answered that it has not taken yet, if any: a turn
+     * publishes at each tool call's start and end, so it learns of them at
+     * no cost of its own.
+     */
+    publish: restate.handlers.object.exclusive(
+      { ingressPrivate: true },
+      async (ctx: restate.ObjectContext<State>): Promise<Published> => {
+        const published: Published = await publish(ctx);
+        const inbox = (await ctx.get('inbox')) ?? [];
+        // Only then is the turn read: a turn that nobody steers costs one read more, of the empty inbox.
+        if (inbox.some((m) => m.text !== undefined)) {
+          const steering = waitingIn(inbox, await ctx.get('turn')).map(({ id, text }) => ({ id, text: text! }));
+          if (steering.length > 0) published.steering = steering;
+        }
+        return published;
+      },
+    ),
+
+    /**
+     * @internal Take a message steered to the agent (its `steer` view): for
+     * the turn being answered, or as a turn of its own.
+     *
+     * The message is always sent to the agent's private `steered` handler at
+     * once, which keeps its place in the key's queue, in order with the
+     * messages sent after it: once the turn being answered ends, `steered`
+     * answers the message as a turn of its own, unless that turn took it. A
+     * turn that takes steered messages (`Started.steers`) also finds it
+     * here, at its next step, through `publish`, until it takes it (`taken`)
+     * or ends.
+     */
+    steer: internal(async (ctx: restate.ObjectContext<State>, { id, text }: Steer): Promise<Steered> => {
+      const at = ctx.key.indexOf(':');
+      ctx.genericSend({
+        service: ctx.key.slice(0, at),
+        method: 'steered',
+        key: ctx.key.slice(at + 1),
+        parameter: { id, text },
+        inputSerde: restate.serde.json,
+        idempotencyKey: `steer:${id}`,
+      });
+      const answering = await ctx.get('turn');
+      if (!answering?.steers) return { id, turn: null };
+      const turn = answering.invocationId;
+      const inbox = (await ctx.get('inbox')) ?? [];
+      if (inbox.some((m) => m.id === id)) return { id, turn };
+      // Taken or not: the turn has room for so many in all.
+      if (inbox.filter((m) => m.turn === turn).length >= STEERS) return { id, turn: null };
+      const since = new Date(await ctx.date.now()).toISOString();
+      ctx.set('inbox', [...inbox, { id, since, turn, text }]);
+      await publish(ctx);
+      return { id, turn };
+    }),
+
+    /**
+     * @internal Mark the steered messages `ids` taken, which their turn has
+     * stored, and publish the change, if any. The turn sends it with the
+     * transaction that stores them, so it comes once they are stored, and
+     * once only. Each is kept without its text until the turn ends, as one
+     * of its {@link STEERS}; one already forgotten (its turn closed first)
+     * is left so.
+     */
+    taken: internal(async (ctx: restate.ObjectContext<State>, ids: string[]) => {
+      const inbox = (await ctx.get('inbox')) ?? [];
+      let changed = false;
+      const marked = inbox.map((m) => {
+        if (m.text === undefined || !ids.includes(m.id)) return m;
+        changed = true;
+        return { id: m.id, since: m.since, turn: m.turn };
+      });
+      if (!changed) return;
+      setInbox(ctx, marked);
+      await publish(ctx);
+    }),
 
     /** The conversation's revision. */
     notifications: restate.handlers.object.shared(

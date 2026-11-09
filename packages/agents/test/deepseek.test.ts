@@ -22,6 +22,7 @@ import {
   conversation,
   crashedAnywhere,
   SAID_IN_TURNS as SAID,
+  steeredAtAStep,
 } from './support.ts';
 import { teller } from './fakes/deepseek.ts';
 import * as deepseek from '@restatedev/agents/deepseek';
@@ -582,5 +583,46 @@ describe("the DeepSeek Harness agent's approvals", () => {
     const { messages } = await read.end(() => deepseek.messages()(read.view, {}));
     // Its approval returned, but the call did not: it is closed as cancelled.
     expect(messages[1]!.parts[0]).toMatchObject({ type: 'tool', name: 'transfer', output: CANCELLED, error: true });
+  });
+});
+
+describe('the DeepSeek agent, steered', () => {
+  /**
+   * The turn hears of the message as the transfer's result is stored, which
+   * the harness does as its next model request goes out: its step inbox
+   * places it at the step after that request's, in the same turn.
+   */
+  const SAID_STEERED = [
+    ['user', 'Please move 5 from 1 to 2'],
+    ['assistant', 'transfer'],
+    ['assistant', 'Done: moved 5 from account 1 to account 2'],
+    ['user', 'audit the books'],
+    ['assistant', 'audit'],
+    ['assistant', 'Done: the books are fine'],
+  ];
+
+  it('hands a message steered while a tool runs to its step inbox: the turn answers it', async () => {
+    const { answer, said, audits, taken } = await steeredAtAStep(
+      (tools) => deepseek.chat({ tools }),
+      deepseek.messages(),
+    );
+    expect(answer).toBe('Done: the books are fine');
+    expect(said).toEqual(SAID_STEERED);
+    expect(audits).toBe(1);
+    expect(taken).toEqual(['steer-1']);
+  });
+
+  it('retries a turn that failed after it placed the message with the message, once', async () => {
+    const { answer, failed, said, audits, taken } = await steeredAtAStep(
+      (tools) => deepseek.chat({ tools }),
+      deepseek.messages(),
+      { failAudit: true },
+    );
+    expect(failed).toBeInstanceOf(Error);
+    // The audit cut off by the failure is made again (its outcome unknown), after the message, once.
+    expect(said).toEqual([...SAID_STEERED.slice(0, 5), ['assistant', 'audit'], SAID_STEERED[5]]);
+    expect(answer).toBe('Done: the books are fine');
+    expect(audits).toBe(2);
+    expect(taken).toEqual(['steer-1']);
   });
 });

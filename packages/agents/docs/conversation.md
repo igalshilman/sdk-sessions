@@ -123,6 +123,12 @@ const SCHEMA = new Schema('restate_agents.turns', [
     turn INTEGER,
     items TEXT NOT NULL
   )`,
+  // Appended: the messages steered to a turn that it took.
+  `CREATE TABLE restate_agent_steers (
+    n INTEGER PRIMARY KEY,
+    turn INTEGER NOT NULL,
+    id TEXT NOT NULL UNIQUE
+  )`,
 ]);
 ```
 
@@ -159,19 +165,47 @@ const SCHEMA = new Schema('restate_agents.turns', [
   ([What a turn carries](#what-a-turn-carries)): no framework of this
   package fills them yet.
 
+### Steered messages
+
+A message steered to a turn that the turn took
+([Steering a turn](turns.md#steering-a-turn)) is an item of the turn's
+trajectory, a message of the user, as the framework makes it
+(`Items.steered(text, id)`, or else `Items.prompt`): LangGraph's has the id
+`steer:<id>`. `restate_agent_steers` marks it, by its position, with its
+turn's and its id, which is unique: a message is stored once in the
+conversation, by whichever turn took it, and the agent's `steered` finds it
+there with one read of that index (`steerStored`).
+
+- **Stored with its take.** `Turn.steer` stores the messages a turn takes,
+  their rows in both tables, in one transaction, whose outbox sends the
+  companion `taken`; a framework that keeps its own history stores them as
+  it copies its own entries into the turn (`copyIn`, an item with `steer`),
+  in its own commit, with `taken` too (`tookSteers`).
+- **Loaded with their turn.** A turn of the window has them among its
+  items, marked (`Entry.steer`: `Turn.steered()`); a turn before it has them
+  on its prompt's entry (`Entry.steers`), read with each page of the
+  transcript (one range of their table, joined to their items), for
+  `history()`, the budget and summaries.
+- **Dropped with a reply.** A reply dropped to ask the model again drops
+  the messages steered after it from both tables: they are no longer the
+  turn's, and `steered` answers them.
+- **In the views.** The full view shows each as a message of the user under
+  its position; the summary view, beside its turn's prompt and answer, also
+  from a cursor.
+
 ### Around the conversation
 
-| Where                                                                                                                               | What                                                                                                                                                                                                                            | Written by                                                                                                  |
-| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `restate_agent_calls` (schema `restate-agents.calls`, as today), in the key's database                                              | one row: the invocation's Restate calls made by tools, as JSON ([Tool calls, once](#tool-calls-once-the-call-records))                                                                                                          | the tools built on Restate (`call`, `send`, `workflow`, `subagent`, `signal`) and `waitFor`                 |
-| the companion's state: the `signals` object, keyed `<agent>:<key>`                                                                  | `turn`: the turn being answered (`Started`: its invocation, since when, whether the agent `settles`); `waiting`: the tools' waits, each with its awakeable; `kept`: signals that came before their wait; `revision`; `watching` | the companion's handlers (`start`, `close`, `ended`, `listen`, `resolve`, `forget`, `publish`, `subscribe`) |
-| `restate_langgraph_checkpoints`, `restate_langgraph_channel_values`, `restate_langgraph_writes` (schema `restate-agents.langgraph`) | a LangGraph graph's checkpoints, channel values by version, and pending writes, per thread and namespace                                                                                                                        | `SqlCheckpointSaver`, for a graph of your own; the built-in agent uses none                                 |
-| pi-durable's `restate_pi_*` tables (its own migrations, `restate_pi_durable_schema`)                                                | pi's conversation, tasks and documents ([The frameworks](frameworks.md#pi))                                                                                                                                                     | pi, through [`src/pi/storage.ts`](../src/pi/storage.ts)                                                     |
-| `restate_deepseek_sessions`, `restate_deepseek_events` (schema `restate-agents.deepseek`)                                           | the DeepSeek Harness's event log ([The frameworks](frameworks.md#deepseek-harness))                                                                                                                                             | the harness, through [`src/deepseek/persistence.ts`](../src/deepseek/persistence.ts)                        |
+| Where                                                                                                                               | What                                                                                                                                                                                                                                                                                                                                                   | Written by                                                                                                                    |
+| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `restate_agent_calls` (schema `restate-agents.calls`, as today), in the key's database                                              | one row: the invocation's Restate calls made by tools, as JSON ([Tool calls, once](#tool-calls-once-the-call-records))                                                                                                                                                                                                                                 | the tools built on Restate (`call`, `send`, `workflow`, `subagent`, `signal`) and `waitFor`                                   |
+| the companion's state: the `signals` object, keyed `<agent>:<key>`                                                                  | `turn`: the turn being answered (`Started`: its invocation, since when, whether the agent `settles`, whether it `steers`); `waiting`: the tools' waits, each with its awakeable; `kept`: signals that came before their wait; `inbox`: the messages steered to turns not closed yet, each with its text until its turn took it; `revision`; `watching` | the companion's handlers (`start`, `close`, `ended`, `listen`, `resolve`, `forget`, `publish`, `subscribe`, `steer`, `taken`) |
+| `restate_langgraph_checkpoints`, `restate_langgraph_channel_values`, `restate_langgraph_writes` (schema `restate-agents.langgraph`) | a LangGraph graph's checkpoints, channel values by version, and pending writes, per thread and namespace                                                                                                                                                                                                                                               | `SqlCheckpointSaver`, for a graph of your own; the built-in agent uses none                                                   |
+| pi-durable's `restate_pi_*` tables (its own migrations, `restate_pi_durable_schema`)                                                | pi's conversation, tasks and documents ([The frameworks](frameworks.md#pi))                                                                                                                                                                                                                                                                            | pi, through [`src/pi/storage.ts`](../src/pi/storage.ts)                                                                       |
+| `restate_deepseek_sessions`, `restate_deepseek_events` (schema `restate-agents.deepseek`)                                           | the DeepSeek Harness's event log ([The frameworks](frameworks.md#deepseek-harness))                                                                                                                                                                                                                                                                    | the harness, through [`src/deepseek/persistence.ts`](../src/deepseek/persistence.ts)                                          |
 
 `clear` empties the key's database (every table above),
-the companion's waits and kept signals, and keeps where the ids and cursors
-got to.
+the companion's waits, kept signals and steered messages, and keeps where
+the ids and cursors got to.
 
 Gone with the store: `restate_agent_log` and `restate_agent_log_start`
 (schema `restate-agents.log`), and Claude's `restate_claude_messages` and

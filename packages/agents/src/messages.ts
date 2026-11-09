@@ -16,10 +16,11 @@
 // order, and a page reads only the rows it needs.
 //
 // The summary view is each turn's message of the user and its answer, from
-// the turns' rows alone, under the ids they have in the full view.
+// the turns' rows, and the messages steered to the turn that it took, under
+// the ids they have in the full view.
 import type { DatabaseReader, ViewContext } from '@restatedev/sessions';
 import { type ChatMessage, ITEMS, type Messages, type MessagesRequest, type Part } from './common.ts';
-import { failed, type Items, lastOf, loadItem, SCHEMA, startOf, STEPS, TURNS } from './conversation.ts';
+import { failed, type Items, lastOf, loadItem, SCHEMA, startOf, STEERED, STEPS, TURNS } from './conversation.ts';
 
 /** A message as rendered, with when it last changed. */
 interface Rendered {
@@ -165,21 +166,24 @@ async function latest<I>(
 /** The columns of a turn the summary view reads. */
 const TURN = `SELECT n, seq, item, answer, answered_at, answered_seq FROM ${TURNS}`;
 
+/** The messages steered to turns that took them (`n`, `seq`, `item`): messages of the user, which the summary shows too. */
+const STEERS = `SELECT st.n, s.seq, s.item FROM ${STEERED} st JOIN ${STEPS} s ON s.n = st.n`;
+
 /**
  * Turns' rows ({@link TURN}'s columns) as their user's messages and answers,
+ * with the messages steered to them (`steered`, {@link STEERS}'s columns),
  * in order: the answer's message has the id it has in the full view (the
- * turn's last message of the assistant), and the `seq` it was stored with.
+ * turn's last message of the assistant), and the `seq` it was stored with;
+ * so does a steered message.
  */
-function summarized<I>(items: Items<I>, rows: unknown[][]): Rendered[] {
+function summarized<I>(items: Items<I>, rows: unknown[][], steered: unknown[][] = []): Rendered[] {
   const messages: Rendered[] = [];
-  for (const [n, seq, stored, answer, answeredAt, answeredSeq] of rows) {
+  const user = (n: unknown, seq: unknown, stored: unknown): Rendered => {
     const text = items.read(loadItem(items, String(stored))).said?.[1] ?? '';
-    messages.push({
-      id: Number(n),
-      role: 'user',
-      parts: text.trim() ? [{ type: 'text', text }] : [],
-      seq: Number(seq),
-    });
+    return { id: Number(n), role: 'user', parts: text.trim() ? [{ type: 'text', text }] : [], seq: Number(seq) };
+  };
+  for (const [n, seq, stored, answer, answeredAt, answeredSeq] of rows) {
+    messages.push(user(n, seq, stored));
     if (answer !== null && answer !== undefined && answeredAt !== null && answeredAt !== undefined) {
       const answered = typeof answer === 'string' ? answer : JSON.stringify(answer);
       messages.push({
@@ -190,15 +194,17 @@ function summarized<I>(items: Items<I>, rows: unknown[][]): Rendered[] {
       });
     }
   }
-  return messages.filter((message) => message.parts.length > 0);
+  for (const [n, seq, stored] of steered) messages.push(user(n, seq, stored));
+  return messages.filter((message) => message.parts.length > 0).toSorted((a, b) => a.id - b.id);
 }
 
 /** The user's messages and answers stored since `cursor`, in the order they were. */
 async function summarySince<I>(db: DatabaseReader, items: Items<I>, cursor: number, limit: number): Promise<Messages> {
   const asked = await db.values(`${TURN} WHERE seq > ?`, [cursor]);
   const answered = await db.values(`${TURN} WHERE answered_seq > ?`, [cursor]);
+  const steered = await db.values(`${STEERS} WHERE s.seq > ?`, [cursor]);
   const rows = new Map([...asked, ...answered].map((row) => [Number(row[0]), row]));
-  const messages = summarized(items, [...rows.values()])
+  const messages = summarized(items, [...rows.values()], steered)
     .filter((m) => m.seq > cursor)
     .toSorted((a, b) => a.seq - b.seq);
   const shown = messages.slice(0, limit);
@@ -215,8 +221,9 @@ async function summaryLatest<I>(
   const end = before ?? Number.MAX_SAFE_INTEGER;
   const rows = await db.values(`${TURN} WHERE n < ? ORDER BY n DESC LIMIT ?`, [end, limit]);
   const cursor = await now(db);
-  const messages = summarized(items, rows.toReversed()).filter((m) => m.id < end);
   const first = rows.length > 0 ? Number(rows.at(-1)![0]) : end;
+  const steered = await db.values(`${STEERS} WHERE st.n >= ? AND st.n < ? ORDER BY st.n`, [first, end]);
+  const messages = summarized(items, rows.toReversed(), steered).filter((m) => m.id < end);
   const earlier = await one(db, EARLIER, [first]);
   return {
     messages: latestOf(messages, limit).map(chat),

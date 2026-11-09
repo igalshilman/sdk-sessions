@@ -49,16 +49,19 @@ import {
   createRegistry,
   defineExtension,
   defineTool,
+  GenerationTask,
   Harness,
+  hook,
   section,
   type Conversation,
+  type ConversationId,
   type ConversationRetryPolicy,
   type ConversationStreamOptions,
   type ToolRegistration,
 } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { CodingTools } from '@earendil-works/pi-durable/tools';
-import type { DatabaseWriter } from '@restatedev/sessions';
+import type { Transaction } from '@restatedev/sessions';
 import {
   AttemptEnded,
   chatHandler,
@@ -68,6 +71,7 @@ import {
   type Configure,
   configured,
   fromTool,
+  inboxOf,
   ModelError,
   modelOf,
   providerOf,
@@ -79,6 +83,7 @@ import {
   toolCallStarted,
 } from '../common.ts';
 import { answerOnce, invocationOf, type Items, type Parsed, type Turn } from '../conversation.ts';
+import { tookSteers } from '../steering.ts';
 import { conversationView } from '../messages.ts';
 import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
@@ -179,17 +184,28 @@ export const items: Items<Item> = {
   },
 };
 
+/** The kind of the entry of a message steered to a turn, as pi places it: its data is the message's id. */
+const STEER_ENTRY = 'restate.steer';
+
 /**
  * What each pi commit copies into `turn`, in its transaction: the entries of
  * the run of the turn's request `requestId` after its user entry (pi's
  * submission names it),
- * its replies and its tools' results; nothing once `stopped()`, or once the
- * turn is closed. Each entry once: after the last one copied. `resulted`
- * gets the calls whose results it copied.
+ * its replies, its tools' results, and the messages steered to the turn that
+ * pi placed at a step (whose companion is told they are taken, in the
+ * commit); nothing once `stopped()`, or once the turn is closed. Each entry
+ * once: after the last one copied. `resulted` gets the calls whose results
+ * it copied.
  */
-function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean, resulted: (calls: string[]) => void) {
+function copying(
+  ctx: restate.SessionContext,
+  turn: Turn<Item>,
+  requestId: string,
+  stopped: () => boolean,
+  resulted: (calls: string[]) => void,
+) {
   let from: { conversation: number; last: number } | undefined;
-  return async (tx: DatabaseWriter) => {
+  return async (tx: Transaction) => {
     if (stopped() || !turn.writable) return;
     if (!from) {
       const submitted = await tx.get<{ entry: number | null; conversation: number }>(
@@ -204,10 +220,19 @@ function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean, re
       'SELECT id, record FROM restate_pi_entries WHERE conversation_id = ? AND id > ? ORDER BY id',
       [from.conversation, from.last],
     );
-    const copied: { item: Item; reply?: boolean }[] = [];
+    const copied: { item: Item; reply?: boolean; steer?: string }[] = [];
+    const held = new Set(turn.steered().map((e) => e.steer));
     for (const [id, record] of rows) {
-      const entry = JSON.parse(String(record)) as { kind: string; model?: Message[] };
+      const entry = JSON.parse(String(record)) as { kind: string; model?: Message[]; data?: { id?: unknown } };
       from.last = Number(id);
+      if (entry.kind === STEER_ENTRY) {
+        const steer = typeof entry.data?.id === 'string' ? entry.data.id : undefined;
+        const [message] = entry.model ?? [];
+        if (steer !== undefined && message && !held.has(steer)) {
+          copied.push({ item: { entry: Number(id), message }, steer });
+        }
+        continue;
+      }
       if (entry.kind !== 'pi.assistant' && entry.kind !== 'pi.tool-result') continue;
       for (const message of entry.model ?? []) {
         copied.push({ item: { entry: Number(id), message }, reply: message.role === 'assistant' });
@@ -215,6 +240,11 @@ function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean, re
     }
     if (copied.length === 0) return;
     await turn.copyIn(tx, copied);
+    tookSteers(
+      ctx,
+      tx,
+      copied.flatMap(({ steer }) => (steer === undefined ? [] : [steer])),
+    );
     resulted(copied.flatMap(({ item: { message } }) => (message.role === 'toolResult' ? [message.toolCallId] : [])));
   };
 }
@@ -280,9 +310,21 @@ const native = (t: AnyTool, ctx: restate.SessionContext): ToolRegistration =>
  * `workspace`, pi's coding tools working there, with the environment they
  * run in.
  */
-async function extensions(tools: ToolRegistration[], system: string | undefined, workspace: string | undefined) {
+async function extensions(
+  tools: ToolRegistration[],
+  system: string | undefined,
+  workspace: string | undefined,
+  afterTools: (conversation: ConversationId) => Promise<void>,
+) {
   const registry = createRegistry();
   registry.install(defineExtension({ name: 'tools', tools }));
+  // Once a round's tools are done, before pi places what waits at its end: the messages steered to the turn.
+  registry.install(
+    defineExtension({
+      name: 'steering',
+      hooks: [hook(GenerationTask, { afterTools: (_assistant, _results, api) => afterTools(api.conversationId) })],
+    }),
+  );
   if (system) registry.install(defineExtension({ name: 'system', sections: [section('system', () => system)] }));
   if (!workspace) return { registry, env: undefined };
   await mkdir(workspace, { recursive: true });
@@ -384,12 +426,18 @@ export const withPi = async <T>(
   };
   // The tool calls that returned, whose ends are published once pi stored their results (`prompt`).
   const returned = new Set<string>();
+  // The messages steered to the turn of a prompt's run, submitted to pi as a publish lists them (`prompt`).
+  let steering: ((of: ConversationId) => Promise<void>) | undefined;
+  // Whether a tool of the round asks to end the run (`terminate`, a handoff): pi then ends the round at its final
+  // boundary, which would start a run of its own for a message submitted there, outside the turn.
+  let ending = false;
   const tracked = (t: ToolRegistration): ToolRegistration => ({
     ...t,
     execute: async (args, api, task) => {
       try {
         await toolCallStarted(ctx);
         const result = await t.execute(args, api, task);
+        if (result.control?.terminate === true || result.control?.handoff !== undefined) ending = true;
         returned.add(api.callId);
         return result;
       } catch (error) {
@@ -403,6 +451,12 @@ export const withPi = async <T>(
     tools.map((t) => tracked(isTool(t) ? native(t, ctx) : t)),
     system,
     workspace,
+    async (of) => {
+      // A round that may end the run takes no steered message: each waits for the turn's end, then is a turn of its own.
+      const ends = ending;
+      ending = false;
+      if (!ends) await steering?.(of);
+    },
   );
   const settings = {
     // A task that crashes is run again however often Restate retries the attempt (its retry policy decides):
@@ -411,6 +465,8 @@ export const withPi = async <T>(
     // A provider's outage never ends the turn: pi asks again until it answers (pi-durable would give up after 3
     // retries, ending the turn unanswered for good). Each retry is committed: a retried attempt waits as it would.
     retry: { maxRetries: Infinity, ...retry },
+    // Every message steered to a turn that waits at a step is placed there, not one a step.
+    steeringMode: 'all' as const,
     // pi-durable hands its stream settings to pi-ai's requests as they are: serviceTier is pi-ai's.
     ...(serviceTier ? { stream: { serviceTier } as ConversationStreamOptions } : {}),
   };
@@ -440,12 +496,13 @@ export const withPi = async <T>(
         // The turn's own request: its prompt, or the message that asked again within it.
         const again = current.latestAsk() !== current.prompt;
         const requestId = again ? `${id}:again` : id;
-        // A run an earlier prompt of this invocation left (its turn failed, say).
-        await abortLeft((r) => r === id || r === `${id}:again`);
+        // A run an earlier prompt of this invocation left (its turn failed, say). A steered message is its run's.
+        await abortLeft((r) => r === id || r === `${id}:again` || r.startsWith('steer:'));
         // Once stopped, the turn's close says how it ended: not pi's abort of its tools.
         // A tool call's end is published once its result is stored, for followers to read it there.
         let ended = false;
         database.onCommit = copying(
+          ctx,
           current,
           requestId,
           () => cancelled !== undefined || stopSignalOf(ctx)?.aborted === true,
@@ -461,6 +518,31 @@ export const withPi = async <T>(
             failed(error);
             cancel(error);
           });
+        };
+        // Each message steered to the turn, submitted to pi once (keyed by its id, also by a retried attempt)
+        // as a round of tool calls is done (`afterTools`): pi places it at the round's end, after its results,
+        // as an entry of its own kind, which `copying` stores.
+        const given = new Set<string>();
+        steering = async (of) => {
+          const inbox = inboxOf(ctx);
+          // The root conversation's rounds only: it is the turn's.
+          if (!inbox || of !== root.id || cancelled !== undefined) return;
+          if (stopSignalOf(ctx)?.aborted || !current.writable) return;
+          const held = new Set(current.steered().map((e) => e.steer));
+          for (const { id: steerId, text: said } of inbox.messages) {
+            if (given.has(steerId) || held.has(steerId)) continue;
+            given.add(steerId);
+            await root.submit(
+              {
+                type: 'input',
+                content: said,
+                whenBusy: 'steer',
+                requestId: `steer:${steerId}`,
+                entry: { kind: STEER_ENTRY, data: { id: steerId } },
+              },
+              context,
+            );
+          }
         };
         // The model is told how the turn before this one ended, if its run did not answer it.
         const before = store.transcript.at(-2);
@@ -498,7 +580,7 @@ export const withPi = async <T>(
   // what it has: a run another invocation left is aborted first. This
   // invocation's own (a retried attempt's) goes on.
   const working = async () => {
-    await abortLeft((r) => invocationOf(r) === ctx.request.id);
+    await abortLeft((r) => invocationOf(r) === ctx.request.id || r.startsWith('steer:'));
     return work({ harness, context, conversation, prompt });
   };
   try {
@@ -535,7 +617,7 @@ export const prompt = <O extends z.ZodObject | undefined = undefined>(
  */
 export const chat = <O extends z.ZodObject | undefined = undefined>(options: Configure<Options<O>> = {}) => {
   if (typeof options === 'object') checkModelName('pi', options.model);
-  return chatHandler(async (ctx, message) => prompt(ctx, message, await configured(options, ctx)));
+  return chatHandler(async (ctx, message) => prompt(ctx, message, await configured(options, ctx)), { steers: true });
 };
 
 /**

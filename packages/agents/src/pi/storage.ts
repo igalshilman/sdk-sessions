@@ -10,7 +10,7 @@
 //
 // pi-durable's tables and indexes are named `restate_pi_<name>` (its
 // storage's `prefix`), apart from the tables of yours in the same database.
-import type { DatabaseWriter, Database } from '@restatedev/sessions';
+import type { DatabaseWriter, Database, Transaction } from '@restatedev/sessions';
 import {
   SqliteStorage,
   type SqliteDatabase,
@@ -42,7 +42,7 @@ class Executor implements SqliteExecutor {
 }
 
 /** What runs at the end of each pi commit, in its transaction: the copy of its entries (index.ts). */
-export type OnCommit = (tx: DatabaseWriter) => Promise<void>;
+export type OnCommit = (tx: Transaction) => Promise<void>;
 
 /** The `SqliteDatabase` facade over the session `db`. */
 export class SqlKvDatabase extends Executor implements SqliteDatabase {

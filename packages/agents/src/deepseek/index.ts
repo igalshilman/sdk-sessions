@@ -67,6 +67,7 @@ import {
   type Configure,
   configured,
   fromTool,
+  inboxOf,
   ModelError,
   modelOf,
   providerOf,
@@ -76,6 +77,7 @@ import {
   toolCallStarted,
 } from '../common.ts';
 import { answerOnce, type Items, type Parsed, type Run, type Turn } from '../conversation.ts';
+import { tookSteers } from '../steering.ts';
 import { conversationView } from '../messages.ts';
 import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
@@ -439,14 +441,21 @@ function promptOf(turn: Turn<Message>, before: { status?: string; answer?: strin
   return message(promptId(turn.id), note + text + (turn.reminder ?? ''));
 }
 
+/** The id of the harness's message of the message `id` steered to a turn. */
+const steerMessageId = (id: string) => `steer:${id}`;
+
+/** The id of the steered message whose harness message has the id `messageId`, if it is one. */
+const steeredId = (messageId: string) => (messageId.startsWith('steer:') ? messageId.slice(6) : undefined);
+
 /**
  * Copy the events of `batch` that are `turn`'s (after its latest ask, at seq
- * `from()` of the log) into it, in `tx`: the model's replies, and the
- * tools' results. Not the requests to continue (a step of the run's own),
- * nor anything once the run stopped or `failed()` (the harness's result of a
- * tool that failed the attempt, or was cancelled, is not the call's): the
- * turn's close, or the retry, says how it ended. `resulted` gets the calls
- * whose results it copied.
+ * `from()` of the log) into it, in `tx`: the model's replies, the tools'
+ * results, and the messages steered to the turn that the harness placed at
+ * a step (whose companion is told they are taken, in `tx`). Not the requests
+ * to continue (a step of the run's own), nor anything once the run stopped
+ * or `failed()` (the harness's result of a tool that failed the attempt, or
+ * was cancelled, is not the call's): the turn's close, or the retry, says
+ * how it ended. `resulted` gets the calls whose results it copied.
  */
 const copying =
   (
@@ -459,14 +468,22 @@ const copying =
   async (tx: Parameters<NonNullable<SqlSessionPersistence['copy']>>[0], batch: readonly SessionEvent[]) => {
     const start = from();
     if (start === undefined || failed() || stopSignalOf(ctx)?.aborted || !turn.writable) return;
-    const copied = batch.flatMap((e): { item: Message; reply?: boolean }[] => {
+    const held = new Set(turn.steered().map((e) => e.steer));
+    const copied = batch.flatMap((e): { item: Message; reply?: boolean; steer?: string }[] => {
       if (e.seq <= start) return [];
       if (e.type === 'assistant/message') return [{ item: e.data.message, reply: true }];
       if (e.type === 'tool/result') return [{ item: e.data.message }];
-      return [];
+      if (e.type !== 'user/message') return [];
+      const steer = steeredId(e.data.id);
+      return steer === undefined || held.has(steer) ? [] : [{ item: e.data, steer }];
     });
     if (copied.length === 0) return;
     await turn.copyIn(tx, copied);
+    tookSteers(
+      ctx,
+      tx,
+      copied.flatMap(({ steer }) => (steer === undefined ? [] : [steer])),
+    );
     resulted(batch.flatMap((e) => (e.seq > start && e.type === 'tool/result' ? [e.data.message.toolCallId] : [])));
   };
 
@@ -496,6 +513,7 @@ const runOf =
     const onStop = () => fail(stop!.reason);
     stop?.addEventListener('abort', onStop, { once: true });
     let agent: Agent | undefined;
+    let unlisten: (() => void) | undefined;
     // The turn asked again (its output's check, say): the harness is asked that, and answers it.
     const asked = turn.latestAsk();
     const again = asked !== turn.prompt;
@@ -522,7 +540,15 @@ const runOf =
       from = agent.session.snapshotEvents().find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
       // A tool call's end is published once a flush stored its result, for followers to read it there.
       let ended = false;
+      // The harness messages of the steered messages in the log: those before this attempt, and each flush's.
+      const placed = new Set(
+        agent.session
+          .snapshotEvents()
+          .flatMap((e) => (e.type === 'user/message' && steeredId(e.data.id) !== undefined ? [String(e.data.id)] : [])),
+      );
       persistence.copy = async (tx, batch) => {
+        for (const e of batch)
+          if (e.type === 'user/message' && steeredId(e.data.id) !== undefined) placed.add(e.data.id);
         from ??= batch.find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
         await copying(
           ctx,
@@ -540,6 +566,20 @@ const runOf =
         // Failing, it fails the attempt, as a tool's error does: never the flush, which is done.
         await toolCallEnded(ctx).catch(fail);
       };
+      // The messages steered to the turn, handed to the harness's step inbox as a publish lists them: only
+      // while a tool call runs or its result is stored, so that a step after them places them, in this turn.
+      const harnessAgent = agent;
+      const given = new Set<string>();
+      unlisten = inboxOf(ctx)?.listen(() => {
+        if (stop?.aborted || broken) return;
+        const pending = new Set(harnessAgent.inbox.nextStep.map((m) => String(m.id)));
+        for (const { id: steerId, text } of inboxOf(ctx)!.messages) {
+          const messageId = steerMessageId(steerId);
+          if (given.has(steerId) || pending.has(messageId) || placed.has(messageId)) continue;
+          given.add(steerId);
+          harnessAgent.steer(message(messageId, text));
+        }
+      });
       // The turn before this one, as the conversation has it.
       const before = conversation.transcript.at(-2);
       for (;;) {
@@ -562,6 +602,7 @@ const runOf =
       else persistence.abandon();
       throw e;
     } finally {
+      unlisten?.();
       stop?.removeEventListener('abort', onStop);
       await harness.fiber.dispose();
     }
@@ -629,7 +670,7 @@ export const chat = <O extends z.ZodObject | undefined = undefined>(options: Con
     checkModelName('deepseek', options.model);
     routeOf(modelOf(options.model, DEEPSEEK_MODEL));
   }
-  return chatHandler(async (ctx, text) => prompt(ctx, text, await configured(options, ctx)));
+  return chatHandler(async (ctx, text) => prompt(ctx, text, await configured(options, ctx)), { steers: true });
 };
 
 /** `json` parsed, or as it is if it is not JSON. */

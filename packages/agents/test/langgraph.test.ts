@@ -18,6 +18,9 @@ import {
   conversation,
   crashedAnywhere,
   SAID_IN_TURNS as SAID,
+  steeredAtAStep,
+  followingOf,
+  sqlAttempt,
 } from './support.ts';
 import { Teller } from './fakes/langgraph.ts';
 import * as langgraph from '@restatedev/agents/langgraph';
@@ -297,5 +300,79 @@ describe('the LangGraph agent', () => {
       await expect(c.attempt('inv1', 'Hello')).rejects.toThrow(why);
       expect(runs).toBe(1);
     }
+  });
+});
+
+/** Whether the turn of `chat` (on an object of its own) says, as it starts, that it takes steered messages. */
+async function steersOf(chat: ReturnType<typeof langgraph.chat>, key: string) {
+  const map = new Map<string, Uint8Array>();
+  const said: (boolean | undefined)[] = [];
+  const published = async () => void said.push(followingOf(map).answering?.steers);
+  const sql = sqlAttempt({ map, key, id: 'inv1', published });
+  await sql.end(() => chat.handler(sql.ctx, 'Hello'));
+  return said[0];
+}
+
+describe('the LangGraph agent, steered', () => {
+  it('takes a message steered while a tool runs at its next step: the next request ends with it', async () => {
+    const { answer, said, audits, taken } = await steeredAtAStep(
+      (tools) => langgraph.chat({ tools, model: new Teller({}) }),
+      langgraph.messages(),
+    );
+    expect(answer).toBe('Done: the books are fine');
+    expect(said).toEqual([
+      ['user', 'Please move 5 from 1 to 2'],
+      ['assistant', 'On it. + transfer'],
+      ['user', 'audit the books'],
+      ['assistant', 'audit'],
+      ['assistant', 'Done: the books are fine'],
+    ]);
+    expect(audits).toBe(1);
+    expect(taken).toEqual(['steer-1']);
+  });
+
+  it('retries a turn that failed after it took the message with the message, once', async () => {
+    const { answer, failed, said, audits, taken } = await steeredAtAStep(
+      (tools) => langgraph.chat({ tools, model: new Teller({}) }),
+      langgraph.messages(),
+      {
+        failAudit: true,
+      },
+    );
+    expect(failed).toBeInstanceOf(Error);
+    expect(answer).toBe('Done: the books are fine');
+    expect(said).toEqual([
+      ['user', 'Please move 5 from 1 to 2'],
+      ['assistant', 'On it. + transfer'],
+      ['user', 'audit the books'],
+      ['assistant', 'audit'],
+      ['assistant', 'Done: the books are fine'],
+    ]);
+    expect(audits).toBe(2);
+    expect(taken).toEqual(['steer-1']);
+  });
+
+  it('takes none in a graph of your own: each steered message is a turn of its own', async () => {
+    const { chatOf } = await import('../src/common.ts');
+    const graph = new (await import('@langchain/langgraph')).StateGraph(
+      (await import('@langchain/langgraph')).MessagesAnnotation,
+    )
+      .addNode('echo', () => ({ messages: [new AIMessage('echo')] }))
+      .addEdge('__start__', 'echo');
+    expect(chatOf(langgraph.chat({ graph }))?.steers).toBe(false);
+    expect(chatOf(langgraph.chat({}))?.steers).toBe(true);
+    // Options a function gives: each turn says, as it starts, what its options' graph takes.
+    expect(
+      await steersOf(
+        langgraph.chat(async () => ({ graph })),
+        'graph',
+      ),
+    ).toBeUndefined();
+    expect(
+      await steersOf(
+        langgraph.chat(async () => ({ model: new Teller({}) })),
+        'loop',
+      ),
+    ).toBe(true);
   });
 });

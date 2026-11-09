@@ -10,6 +10,7 @@
     "concurrency": "node concurrency.ts",
     "versions": "node versions.ts",
     "tools": "node restate-tools.ts",
+    "steering": "node steering.ts",
     "bench": "node bench.ts",
     "serve": "node serve.ts",
     "packaging": "node packaging.ts"
