@@ -46,6 +46,21 @@ function rendered() {
       const sql = sqlAttempt({ map, key: 'k', id: 'read', shared: true });
       return sql.end(() => page(sql.view.db, ITEMS, request));
     },
+    /** `read`, with how many rows its queries gave. */
+    counted: async (request: MessagesRequest) => {
+      const sql = sqlAttempt({ map, key: 'k', id: 'read', shared: true });
+      const { db } = sql.view;
+      let rows = 0;
+      const values = async (...args: Parameters<typeof db.values>) => {
+        const found = await db.values(...args);
+        rows += found.length;
+        return found;
+      };
+      // The view's database is frozen: one on top of it, but for `values`.
+      const counting = Object.create(db, { values: { value: values } }) as typeof db;
+      const read = await sql.end(() => page(counting, ITEMS, request));
+      return { read, rows };
+    },
   };
 }
 
@@ -114,6 +129,21 @@ describe('messages', () => {
       const none = await chat.read({ limit: 0, view });
       expect([view, none.messages, none.more, none.cursor]).toEqual([view, [], true, all.cursor]);
     }
+  });
+
+  it('reads a page back from its own turns, not from every turn after it', async () => {
+    const chat = rendered();
+    for (let n = 0; n < 30; n++) {
+      await chat.ask(`question ${n}`);
+      await chat.reply({ role: 'assistant', text: `answer ${n}` });
+    }
+    const { read, rows } = await chat.counted({ limit: 2, before: 4 });
+    expect(texts(read)).toEqual([
+      [2, 'question 1'],
+      [3, 'answer 1'],
+    ]);
+    // The rows of its two turns, and a row of each lookup: not the 60 rows of the conversation.
+    expect(rows).toBeLessThan(15);
   });
 
   it("marks an error output, which is a call's result only if it is its own error", async () => {

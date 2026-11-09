@@ -286,7 +286,10 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   what a `DeltaChannel` is rebuilt from, the latest checkpoint's ancestors
   back to each delta channel's snapshot (Python's `_kept` in
   [`_checkpointer.py`](https://github.com/restatedev/sdk-python/blob/434bb6fe05ab17f3384709b48f060a47e68f5fb7/python/restate/agents/langgraph/_checkpointer.py)),
-  counting only the channels the checkpoint holds.
+  counting only the channels the checkpoint holds. After the merge, a `put`
+  finds them from those its parent needed, as the `put` before kept them in
+  memory: a child needs some of its parent's, so a thread's steps read none
+  back (Python's reads them at each `put`).
 - **Later, not in this port**: `agent({ graph })`, a graph of your own on
   framework-owned history (the Python SDK's `_graph.py`: the messages after
   the run's input copied by id, the prompt's id `prompt:<turn>`, a window of
@@ -401,6 +404,14 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
 - **Tests** (`test/deepseek.test.ts`): invert `:228-236`; the copy across
   crashes (`crashedAnywhere`); `CONTINUE` not in the views; a dead turn closed
   with its calls' outcomes; compaction mounted; an overflow classified.
+- **Compaction, mounted (after the merge)**: `boot` mounts
+  `dsh-token-meter`, `dsh-compaction-tool-result-pruner` and
+  `dsh-compaction-basic`, whose settings are the `compaction` option. Its
+  summary is no `assistant/message` event, so the copy leaves it out; its
+  request is the teller's in the tests, on a small window: the model's input
+  holds the summary in place of the oldest messages, the views every
+  message, and a crash at any state request of the turn that condenses is
+  answered once.
 
 ## pi
 
@@ -507,9 +518,19 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 0.133.0).
   conversation's entries after the turn's user entry (its submission's
   `entry`) and after the last copied: `pi.assistant` and `pi.tool-result`,
   each item keeping its entry id.
-- **Not done**: a provider's outage still ends the turn (pi settles the
-  submission `unanswered`, and a retry finds it settled): retrying it would
-  take a new request id per attempt.
+- **A tool's end is published once its result is stored**: pi commits a
+  tool's result after the tool returns, so publishing as the tool returned
+  had a follower read the call without its output until the next publish.
+  The storage facade's `afterCommit` publishes it once the commit that copied
+  the result is done (DeepSeek's persistence does the same after a flush,
+  `flushed`).
+- **A provider's outage** no longer ends the turn: pi-durable retried a
+  failed request 3 times, then settled the submission `unanswered` for good.
+  A new request id per attempt would have asked again, but with the prompt
+  twice in pi's context. pi retries without limit instead (`retry`'s
+  `maxRetries`, by default `Infinity`), each retry committed with when it is
+  due, 2 s and then twice as long each time, a minute apart at most; a
+  refusal is never retried, and ends the turn.
 
 ## OpenCode
 

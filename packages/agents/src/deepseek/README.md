@@ -21,12 +21,13 @@ const assistant = deepseek.agent({ name: 'assistant', system: 'Answer briefly.',
 await serve(assistant);
 ```
 
-| Option   | What                                                                                                                                                           |
-| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`  | `provider/model-id`; or else `MODEL`, or else `deepseek/deepseek-flash` (see below)                                                                            |
-| `system` | The system prompt                                                                                                                                              |
-| `tools`  | `tool()`s and Restate's tools of `@restatedev/agents`, or the harness's `defineTool`s                                                                          |
-| `output` | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
+| Option       | What                                                                                                                                                           |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`      | `provider/model-id`; or else `MODEL`, or else `deepseek/deepseek-flash` (see below)                                                                            |
+| `system`     | The system prompt                                                                                                                                              |
+| `tools`      | `tool()`s and Restate's tools of `@restatedev/agents`, or the harness's `defineTool`s                                                                          |
+| `output`     | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
+| `compaction` | When the model's input is condensed: `@deepseek-ai/dsh-compaction-basic`'s settings, such as `thresholdRatio` (by default 0.8 of the model's context window)   |
 
 ## Models
 
@@ -88,8 +89,13 @@ The harness keeps its own event log, and its model's input is the harness's;
 each flush of the log copies the turn's new messages (the model's replies,
 the tools' results) into the agent's conversation of turns, in the same
 transaction: what `messages` shows
-([docs/conversation.md](../../docs/conversation.md)). No compaction is
-mounted yet: the harness's input grows with the conversation.
+([docs/conversation.md](../../docs/conversation.md)). The harness's input
+stays within the model's context window: as it nears the window (or
+overflows it), the harness condenses the oldest history into a summary, one
+more model request, after trimming tool results that are too long
+(`@deepseek-ai/dsh-compaction-basic`, with the token meter and the tool
+result pruner). The log keeps every event, and `messages` every message; a
+crash while condensing is condensed again by the retry.
 
 ## Run
 

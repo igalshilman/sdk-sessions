@@ -48,10 +48,12 @@ describe('the LangGraph agent', () => {
   });
 
   it('publishes the conversation as a turn and its tool calls start and end', async () => {
-    const { answer, published } = await followedWhileWorking(
+    const { answer, published, outputs } = await followedWhileWorking(
       (tools) => langgraph.chat({ tools }),
       langgraph.messages(),
     );
+    // A follower reads the call as it starts, and its output as it ends.
+    expect(outputs).toEqual([undefined, 'moved 5 from account 1 to account 2']);
     expect(answer).toBe('Done: moved 5 from account 1 to account 2');
     // Published at its start, as its tool call starts and ends, and at its end.
     expect(published).toBe(4);

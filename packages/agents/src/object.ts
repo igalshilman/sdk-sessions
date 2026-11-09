@@ -5,7 +5,6 @@ import {
   type Answering,
   BUDGET,
   checkWindow,
-  cleared,
   isAgent,
   ITEMS,
   type Messages,
@@ -189,7 +188,6 @@ const internal = (items: Items<unknown> | undefined) => ({
         await reset(tx);
         await restart(tx, start);
       });
-      await cleared(ctx);
       await ctx.rpc(signals, signalsOf(ctx), { idempotencyKey: `${ctx.request.id}:reset` }).reset();
     },
   },
@@ -372,7 +370,7 @@ export const sessionObject = <
         metadata,
         options: { ...OPTIONS, ...options },
       }),
-      { background, messages, items, window, budget, summarize },
+      { background, items, window, budget, summarize },
     ),
   );
 };

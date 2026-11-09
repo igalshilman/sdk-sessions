@@ -7,6 +7,7 @@ import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 import * as restate from '@restatedev/restate-sdk';
 import { CANCELLED, REFUSED, UNANSWERED } from '@restatedev/agents';
 import { AttemptEnded, ENDED } from '../src/common.ts';
+import { Conversation } from '../src/conversation.ts';
 import {
   afterCancel,
   cancelledTransfer,
@@ -36,6 +37,49 @@ async function counting(body: (calls: { model: number }) => Promise<void>) {
   try {
     await body(calls);
   } finally {
+    teller.reply = reply;
+  }
+}
+
+/** The teller's answer to a message that asks for nothing it does. */
+const ANSWER = 'Ask me to "move 5 from 1 to 2", or to "audit" the books.';
+
+/** A message of about 750 tokens, numbered `n`. */
+const long = (n: number) => `${n}: ${'lorem ipsum '.repeat(250)}`;
+
+/** The text of a model request's messages. */
+const saidIn = (messages: RequestMessage[]) =>
+  messages.flatMap((m) => m.content.flatMap((c) => (c.type === 'text' ? [c.text] : []))).join('\n');
+
+/** An agent that condenses from half the model's window on, a tenth of it kept as it is. */
+const condensing = deepseek.chat({ compaction: { thresholdRatio: 0.5, retainRatio: 0.1, headroomTokens: 100 } });
+
+/** The first two characters of each of the conversation's user messages, as clients read it. */
+const prompts = async (c: ReturnType<typeof conversation>) =>
+  (await c.read(deepseek.messages())).messages
+    .filter((m) => m.role === 'user')
+    .map((m) => (m.parts[0]?.type === 'text' ? m.parts[0].text.slice(0, 2) : ''));
+
+/** Run `body` with the teller as a small model (a window of 4000 tokens, answers of 100 at most), its requests kept. */
+async function onSmallModel(body: (seen: { requests: RequestMessage[][] }) => Promise<void>) {
+  const { reply } = teller;
+  const requests: RequestMessage[][] = [];
+  teller.resolveModel = async (provider, model) => ({
+    provider,
+    id: model,
+    name: model,
+    context: { contextWindow: 4000 },
+    defaultMaxTokens: 100,
+  });
+  teller.reply = (messages) => {
+    requests.push(messages);
+    return reply(messages);
+  };
+  try {
+    await body({ requests });
+  } finally {
+    // The adapter's own again.
+    Reflect.deleteProperty(teller, 'resolveModel');
     teller.reply = reply;
   }
 }
@@ -103,10 +147,12 @@ describe('the DeepSeek Harness agent', () => {
   });
 
   it('publishes the conversation as a turn and its tool calls start and end', async () => {
-    const { answer, parts, published } = await followedWhileWorking(
+    const { answer, parts, published, outputs } = await followedWhileWorking(
       (tools) => deepseek.chat({ tools }),
       deepseek.messages(),
     );
+    // A follower reads the call as it starts, and its output as it ends.
+    expect(outputs).toEqual([undefined, 'moved 5 from account 1 to account 2']);
     expect(answer).toBe('Done: moved 5 from account 1 to account 2');
     expect(parts).toEqual([
       [{ type: 'text', text: 'Please move 5 from 1 to 2' }],
@@ -274,6 +320,20 @@ describe('the DeepSeek Harness agent', () => {
     expect(JSON.stringify(seen[0]!.at(-1))).toContain(UNANSWERED);
   });
 
+  it("reads only the latest turns of a long conversation, as the harness keeps the model's history", async () => {
+    const c = conversation(prompt, 'long');
+    for (let n = 0; n < 8; n++) await c.attempt(`inv${n}`, `message ${n}`);
+    const load = vi.spyOn(Conversation, 'load');
+    try {
+      await c.attempt('inv8', 'message 8');
+      const loaded = (await load.mock.results[0]!.value) as Conversation<unknown>;
+      // The turn before (the model is told how it ended) and the one it answers: not the 7 before them.
+      expect(loaded.transcript).toHaveLength(2);
+    } finally {
+      load.mockRestore();
+    }
+  });
+
   it('keeps the requests to continue out of the conversation', async () => {
     const c = conversation(prompt, 'continued');
     await c.crash('inv1', 'Please move 3 from 1 to 2');
@@ -282,6 +342,35 @@ describe('the DeepSeek Harness agent', () => {
     expect(JSON.stringify(messages)).not.toContain('Continue: your last turn was interrupted');
     expect(messages.filter((m) => m.role === 'user')).toHaveLength(1);
   });
+
+  it("condenses the model's input as it nears the context window, and the conversation keeps every message", async () => {
+    await onSmallModel(async ({ requests }) => {
+      const c = conversation(condensing, 'condensed');
+      for (let n = 0; n < 6; n++) await c.attempt(`inv${n}`, long(n));
+      const last = saidIn(requests.at(-1)!);
+      expect(last).toContain('<compacted-summary>');
+      expect(last).not.toContain('0: lorem');
+      expect(await prompts(c)).toEqual(['0:', '1:', '2:', '3:', '4:', '5:']);
+    });
+  });
+
+  it('condenses through a crash at any of its state requests, and answers once', async () => {
+    await onSmallModel(async ({ requests }) => {
+      const before = conversation(condensing, 'condensing');
+      for (let n = 0; n < 3; n++) await before.attempt(`inv${n}`, long(n));
+      let crashes = 0;
+      for (let at = 1; ; at++) {
+        const c = conversation(condensing, 'condensing', before);
+        if ((await c.attempt('inv3', long(3), at)) !== 'crashed') break;
+        crashes++;
+        expect([at, await c.attempt('inv3', long(3))]).toEqual([at, ANSWER]);
+        const last = saidIn(requests.at(-1)!);
+        expect([at, last.includes('<compacted-summary>'), last.includes('0: lorem')]).toEqual([at, true, false]);
+        expect([at, await prompts(c)]).toEqual([at, ['0:', '1:', '2:', '3:']]);
+      }
+      expect(crashes).toBeGreaterThan(0);
+    });
+  }, 600_000);
 
   it("ends a turn past the model's context window for good, rather than retry it", async () => {
     const c = conversation(prompt, 'overflow');

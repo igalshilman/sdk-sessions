@@ -63,13 +63,18 @@ export function sqlAttempt(
     route?: (call: Made) => Promise<unknown>;
     /** What the companion's `wait` answers a wait with: by default, it waits forever. */
     signal?: (wait: { id: string; name: string; input?: unknown }) => unknown;
+    /** Run at each publish, before it answers: a follower reading the conversation, say. */
+    published?: () => Promise<void>;
   },
 ) {
   const following = followingOf(options.map);
   const base = baseAttempt(options);
   // The `signals` object, as the agents call it.
   const signals: Record<string, (input: never) => unknown> = {
-    publish: () => ({ revision: ++following.revision }),
+    publish: async () => {
+      await options.published?.();
+      return { revision: ++following.revision };
+    },
     start: (turn: { invocationId: string; since: string; settles?: boolean }) => {
       if (following.answering?.invocationId === turn.invocationId) return;
       if (following.answering) closed(following.answering.invocationId, true);
@@ -457,15 +462,26 @@ export async function followedWhileWorking(
     input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
     run: () => 'moved 5 from account 1 to account 2',
   });
-  const attempt = (id: string, shared = false) => {
-    const sql = sqlAttempt({ map, key: 'follow', id, shared, object });
-    return { sql, ctx: sql.ctx, view: sql.view };
+  // What a follower reads at each publish: the transfer's output, once the page has its call.
+  const outputs: unknown[] = [];
+  const read = async () => {
+    const reading = sqlAttempt({ map, key: 'follow', id: `read${outputs.length}`, shared: true, object });
+    return reading.end(() => messages(reading.view, {}));
   };
-  const turn = attempt('inv1');
-  const answer = await turn.sql.end(() => handlerOf(chat([transfer]))(turn.ctx, 'Please move 5 from 1 to 2'));
-  const read = attempt('read', true);
-  const page = await read.sql.end(() => messages(read.view, {}));
-  return { answer, parts: withoutIds(page.messages.map((m) => m.parts)), published: followingOf(map).revision };
+  const published = async () => {
+    const parts = (await read()).messages.flatMap((m) => m.parts) as { type: string; output?: unknown }[];
+    const call = parts.find((p) => p.type === 'tool');
+    if (call) outputs.push(call.output);
+  };
+  const turn = sqlAttempt({ map, key: 'follow', id: 'inv1', object, published });
+  const answer = await turn.end(() => handlerOf(chat([transfer]))(turn.ctx, 'Please move 5 from 1 to 2'));
+  const page = await read();
+  return {
+    answer,
+    parts: withoutIds(page.messages.map((m) => m.parts)),
+    published: followingOf(map).revision,
+    outputs,
+  };
 }
 
 /** `parts` without their tool calls' ids, which differ from run to run. */

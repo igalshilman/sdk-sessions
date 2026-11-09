@@ -465,7 +465,10 @@ the reply to it. `output` asks so for an answer that does not fit its schema
 ("Your reply is not the answer asked for: … Reply again, with the JSON
 only."). It is not a turn: the summary shows the person's message and the
 answer, and the full view shows the ask as a step of the turn. A retried
-attempt that finds the ask stored does not ask again. Today `output` asks
+attempt that finds the ask stored does not ask again. The check reads the
+reply to the ask too (`last`): a terminal error it throws fails the turn,
+which is closed `failed` with it, as `output` does for a reply that still
+does not fit. Today `output` asks
 again with a second prompt (`<id>:2`), which would be a second turn.
 
 ## Several prompts in one handler
@@ -494,7 +497,10 @@ messages by id does not notice.
 The revision increases at:
 
 - a turn's start, and each of its tool calls' start and end (not in the
-  background);
+  background): its end once its result is stored, so that a follower reads
+  it there. pi and DeepSeek store a tool's result after the tool returns (pi
+  in its next commit, DeepSeek in its next flush): they publish the end once
+  that commit has copied the result into the turn;
 - a turn's close: its own, its watch's, or the next turn's `start` closing
   it;
 - `settle`, once it closed a dead turn in the conversation;

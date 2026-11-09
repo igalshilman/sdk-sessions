@@ -64,6 +64,8 @@ export class SqlSessionPersistence extends SessionPersistence {
    * the log commit together.
    */
   copy: ((tx: DatabaseWriter, events: readonly SessionEvent[]) => Promise<void>) | undefined;
+  /** What runs once each flush is stored, outside its transaction: to tell others what it stored, say. */
+  flushed: (() => Promise<void>) | undefined;
 
   /** `config.db`: the object's database (`ctx.db`). */
   constructor(ctx: Context, config: { db: Database }) {
@@ -273,6 +275,7 @@ class SqlSessionHandle implements SessionHandle {
     if (created) this.#store.created.delete(this.id);
     this.#pending.splice(0, batch.length);
     this.#stored += batch.length;
+    if (this.#store.flushed) await this.#store.flushed();
   }
 
   async close(): Promise<void> {

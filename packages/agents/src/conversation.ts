@@ -405,6 +405,14 @@ export class Turn<I> {
   /** The turn's row: its prompt, and once it has them, its status, answer and what it carried. */
   readonly prompt: Entry<I>;
 
+  /**
+   * What the model is told after the turn's prompt, where it reads it last
+   * (`output`'s ask for JSON), and never stored: the conversation keeps the
+   * prompt as it was asked. `history()` adds it to the prompt; a framework
+   * that keeps its own history adds it to the prompt it is given.
+   */
+  reminder: string | undefined;
+
   constructor(ledger: Ledger<I>, prompt: Entry<I>, items: Entry<I>[] = []) {
     this.#ledger = ledger;
     this.prompt = prompt;
@@ -610,10 +618,7 @@ export class Turn<I> {
       // Its seq taken as the write runs, as `#insert` takes its own.
       await ledger.db.transaction(async (tx) => {
         seq = ledger.seq + 1;
-        await tx.execute(
-          `UPDATE ${TURNS} SET status = ?, answer = ?, agent = ?, carried = ?, answered_at = ?, answered_seq = ? WHERE n = ?`,
-          [status, answer, agent ?? null, carried ?? null, at ?? null, seq, this.n],
-        );
+        await tx.execute(ANSWER, [status, answer, agent ?? null, carried ?? null, at ?? null, seq, this.n]);
         ledger.seq = seq;
       });
       Object.assign(this.prompt, { status, answer, agent, carried, answeredAt: at, answeredSeq: seq });
@@ -684,17 +689,9 @@ export class Turn<I> {
       const carried = 'carried' in this.#carried ? this.#carried.carried : ledger.carried()[1];
       await ledger.db.transaction(async (tx) => {
         for (const [i, e] of added.entries()) {
-          await tx.execute(`INSERT INTO ${STEPS} (n, turn, seq, item, reply, agent) VALUES (?, ?, ?, ?, NULL, NULL)`, [
-            e.n,
-            this.n,
-            seq + i + 1,
-            items.dump(e.item),
-          ]);
+          await tx.execute(INSERT_STEP, [e.n, this.n, seq + i + 1, items.dump(e.item), null, null]);
         }
-        await tx.execute(
-          `UPDATE ${TURNS} SET status = ?, answer = ?, agent = ?, carried = ?, answered_at = ?, answered_seq = ? WHERE n = ?`,
-          [status, note, agent ?? null, carried ?? null, at, answeredSeq, this.n],
-        );
+        await tx.execute(ANSWER, [status, note, agent ?? null, carried ?? null, at, answeredSeq, this.n]);
       });
       ledger.next = n + added.length;
       ledger.seq = answeredSeq;
@@ -735,7 +732,7 @@ export class Turn<I> {
     ledger.seq += added.length;
     this.#add(added);
     for (const [i, e] of added.entries()) {
-      await tx.execute(`INSERT INTO ${STEPS} (n, turn, seq, item, reply, agent) VALUES (?, ?, ?, ?, ?, ?)`, [
+      await tx.execute(INSERT_STEP, [
         e.n,
         this.n,
         seq + i + 1,
@@ -765,7 +762,6 @@ export class Turn<I> {
     const ledger = this.#ledger;
     return ledger.lock.run(async () => {
       this.#checkWritable();
-      const sql = `INSERT INTO ${STEPS} (n, turn, seq, item, reply, agent) VALUES (?, ?, ?, ?, ?, ?)`;
       let n = ledger.next;
       let added: Entry<I>[] = [];
       // The positions and seqs taken as the write runs: a framework's copy
@@ -776,7 +772,7 @@ export class Turn<I> {
         n = ledger.next;
         added = made(n);
         for (const [i, e] of added.entries()) {
-          await tx.execute(sql, [
+          await tx.execute(INSERT_STEP, [
             e.n,
             this.n,
             ledger.seq + i + 1,
@@ -839,8 +835,10 @@ async function transcriptOf<I>(
   let before = Number.MAX_SAFE_INTEGER;
   const walk = new Walk(bounded[0]);
   let left = bounded[1] * 4;
+  // Without a budget, the window and the turn before it are a few turns: a page of a few.
+  const page = left > 0 ? PAGE : 4;
   for (;;) {
-    const rows = await db.values(`${TRANSCRIPT} WHERE n >= ? AND n < ? ORDER BY n DESC LIMIT ?`, [first, before, PAGE]);
+    const rows = await db.values(`${TRANSCRIPT} WHERE n >= ? AND n < ? ORDER BY n DESC LIMIT ?`, [first, before, page]);
     for (const row of rows) {
       const entry = promptEntry(items, row);
       read.push(entry);
@@ -848,13 +846,20 @@ async function transcriptOf<I>(
       if (entry.answer !== undefined) {
         // A turn before the window: the model sees its message and answer, while the budget holds them.
         left -= (parsedOf(items, entry).said?.[1] ?? '').length + entry.answer.length;
-        if (left < 0) return read.toReversed();
+        // Without a budget, the first turn before the window is the last read (the model is told how it ended).
+        if (left < 0 || bounded[1] === 0) return read.toReversed();
       }
     }
-    if (rows.length < PAGE) return read.toReversed();
+    if (rows.length < page) return read.toReversed();
     before = read.at(-1)!.n;
   }
 }
+
+/** Store a step of a turn: its position, its turn's, its `seq`, its item, and the reply and agent it is of. */
+const INSERT_STEP = `INSERT INTO ${STEPS} (n, turn, seq, item, reply, agent) VALUES (?, ?, ?, ?, ?, ?)`;
+
+/** Store a turn's answer on its row: how it ended, the answer, what it carries, its message's position, its `seq`. */
+const ANSWER = `UPDATE ${TURNS} SET status = ?, answer = ?, agent = ?, carried = ?, answered_at = ?, answered_seq = ? WHERE n = ?`;
 
 /** The rows of the trajectories after position `after`, in order, as entries. */
 async function stepsAfter<I>(db: DatabaseReader, items: Items<I>, after: number): Promise<Entry<I>[]> {
@@ -1083,7 +1088,14 @@ export class Conversation<I> {
     const summary = this.summary;
     if (summary !== undefined) out.push(...summaryItems(this.items, summary));
     for (const turn of this.earlier()) out.push(turn.item, this.items.reply(turn.answer ?? '', turn.agent));
-    for (const turn of this.#turns) for (const entry of turn.entries) out.push(entry.item);
+    for (const turn of this.#turns) {
+      for (const entry of turn.entries) {
+        // The prompt as the model gets it: with the turn's reminder, which is not stored.
+        const reminded = entry === turn.prompt && turn.reminder !== undefined;
+        const said = reminded ? parsedOf(this.items, entry).said?.[1] : undefined;
+        out.push(said === undefined ? entry.item : this.items.prompt(said + turn.reminder));
+      }
+    }
     return out;
   }
 
@@ -1147,17 +1159,20 @@ export const invocationOf = (promptId: string) => promptId.split(':', 1)[0]!;
  * invocation is gone. `items` must be the agent's `messages` view's, if it
  * has one: one framework per agent.
  *
- * `window` and `budget` are the agent's unless given. With `check`, the
+ * `window` and `budget` are the agent's unless given; with `ownHistory`
+ * (the framework keeps the model's history itself), none: only the latest
+ * turns are read, and the agent's `summarize` is not for it. With `check`, the
  * answer is checked: a message it returns asks the model again with it,
  * once, as a step of the turn ({@link Turn.askAgain}), and the turn's answer
- * is the reply to that.
+ * is the reply to that. With `reminder`, the model is told it after the
+ * prompt ({@link Turn.reminder}), which is stored as it was asked.
  */
 export async function answerOnce<I>(
   ctx: restate.SessionContext,
   text: string,
   items: Items<I>,
   run: Run<I>,
-  options: { window?: Window; budget?: number; check?: Check } = {},
+  options: { window?: Window; budget?: number; check?: Check; reminder?: string; ownHistory?: boolean } = {},
 ): Promise<string> {
   const settings = settingsOf(ctx);
   // One framework per agent (D7): its conversation holds its `messages` view's items, which another can't read.
@@ -1166,8 +1181,12 @@ export async function answerOnce<I>(
       "this agent's `messages` view is another framework's: an agent's conversation holds one framework's items",
     );
   }
-  const window = checkWindow(options.window ?? settings.window);
-  const budget = options.budget ?? settings.budget;
+  // A framework that keeps the model's history itself (pi, DeepSeek) reads
+  // only the latest turns: the one it answers, and the one before, to tell
+  // the model how that ended. Summaries are of `history()`, which it never reads.
+  const own = options.ownHistory === true;
+  const window = own ? 0 : checkWindow(options.window ?? settings.window);
+  const budget = own ? 0 : (options.budget ?? settings.budget);
   const promptId = nextPromptId(ctx);
   await SCHEMA.ensure(ctx.db);
   const stored = await answerIn(ctx.db, promptId);
@@ -1183,11 +1202,11 @@ export async function answerOnce<I>(
         const turn = conversation.turns.at(-1);
         return turn !== undefined && turn.id === promptId && turn.stored(callId, failedWith);
       },
-      () => answerTurn(ctx, conversation, promptId, text, run, options.check),
+      () => answerTurn(ctx, conversation, promptId, text, run, options.check, options.reminder),
     ),
   );
   const definition = definitionOf(ctx) as { name: string } | undefined;
-  if (settings.summarize && conversation.overflowing() && definition) {
+  if (!own && settings.summarize && conversation.overflowing() && definition) {
     // Compacted in an invocation of its own, which the key runs before its next message.
     ctx.send({ service: definition.name, handler: 'compact', key: ctx.key, idempotencyKey: `${promptId}:compact` });
   }
@@ -1202,6 +1221,7 @@ async function answerTurn<I>(
   text: string,
   run: Run<I>,
   check: Check | undefined,
+  reminder: string | undefined,
 ): Promise<string> {
   let running = conversation.running();
   if (running && running.id !== promptId) {
@@ -1210,12 +1230,16 @@ async function answerTurn<I>(
     running = undefined;
   }
   const turn = running ?? (await conversation.ask(promptId, text));
+  turn.reminder = reminder;
   const going = (async () => {
     let answered = await run(conversation);
-    // Once at most: a turn that asked again (in an earlier attempt, say) answers with the reply to that.
-    for (let again = check?.(answered); again !== undefined && turn.latestAsk() === turn.prompt; again = undefined) {
+    // Once at most: a turn that asked again (in an earlier attempt, say) answers with the reply to that,
+    // or its check fails it (a terminal error, which closes it failed, below).
+    const again = check?.(answered, turn.latestAsk() !== turn.prompt);
+    if (again !== undefined && turn.latestAsk() === turn.prompt) {
       await turn.askAgain(again);
       answered = await run(conversation);
+      check?.(answered, true);
     }
     return answered;
   })();

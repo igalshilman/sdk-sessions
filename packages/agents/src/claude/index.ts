@@ -45,6 +45,7 @@ import {
   type Summarize,
   toolCallEnded,
   toolCallStarted,
+  NO_ANSWER,
 } from '../common.ts';
 import { answerOnce, type Items, type Parsed, type Run } from '../conversation.ts';
 import { conversationView } from '../messages.ts';
@@ -60,9 +61,6 @@ export const callId = (context?: BetaToolRunContext) => {
   if (!context) throw new Error('a tool call without its context');
   return context.toolUse.id;
 };
-
-/** What an empty answer says, as the model sees it later: the API refuses an empty text. */
-const NO_ANSWER = '(no answer)';
 
 /**
  * `messages` as the API takes them: it refuses an empty text, and an
@@ -325,8 +323,8 @@ export const prompt = <O extends z.ZodObject | undefined = undefined>(
   text: string,
   options: Options<O> = {},
 ): Promise<Answer<O>> =>
-  withChecked(text, options, (t, o, check) =>
-    answerOnce(ctx, t, items, runOf(ctx, agentOf(ctx, o)), { check }),
+  withChecked(text, options, (t, o, check, reminder) =>
+    answerOnce(ctx, t, items, runOf(ctx, agentOf(ctx, o)), { check, reminder }),
   ) as Promise<Answer<O>>;
 
 /**

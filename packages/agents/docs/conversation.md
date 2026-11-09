@@ -390,6 +390,11 @@ framework's:
   by its id, as for any framework: it stores the prompt as the turn's row,
   and the turn's answer and status at its end. Retries, refusals, stops and
   failures end the turn as for any framework.
+- **Only the latest turns are read.** The model's history is the
+  framework's, so a prompt reads no window nor budget of earlier turns
+  (`answerOnce`'s `ownHistory`): only the turn it answers, and the turn
+  before it, whose end the model is told of. The agent's `summarize` is not
+  for it: a summary is of `history()`, which the framework never reads.
 - **The turn's items are copies.** The run copies each message the framework
   stores (its replies, tool calls and results) into the turn as items
   (`Turn.copyIn`), in the same transaction as the framework's own write of

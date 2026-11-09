@@ -456,9 +456,10 @@ The waits are kept by the `signals` object, keyed `<agent>:<key>`, which
 
 With `output`, a zod object, an agent answers with data rather than text:
 its reply is its answer, as JSON of the schema (which its system prompt
-asks for, with the schema), and `chat` answers with the value, checked
-against the schema: the answer is the call's return value, as with any
-handler. Every framework takes it.
+asks for, with the schema, and the model is reminded of after each prompt,
+though `messages` shows the prompt as it was asked), and `chat` answers
+with the value, checked against the schema: the answer is the call's
+return value, as with any handler. Every framework takes it.
 
 ```ts
 const Plan = z.object({ summary: z.string(), parts: z.array(z.string()) });
@@ -469,7 +470,8 @@ const plan = await ctx.rpc(planner, 'ENG-1').chat('Plan the work on ENG-1'); // 
 
 A reply that is not such JSON (a code fence around it is fine) is answered
 with what is wrong with it, once, for the model to reply again; then the
-invocation fails, with a terminal error. A retried attempt resumes the
+invocation fails, with a terminal error, and the conversation shows its turn
+failed, with that error. A retried attempt resumes the
 conversation, and reads the same reply. In a handler of your own, `prompt(ctx, text, {
 output })` answers with it too. As a subagent's, the parent's model gets it
 as JSON.

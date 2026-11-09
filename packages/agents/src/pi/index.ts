@@ -52,6 +52,7 @@ import {
   Harness,
   section,
   type Conversation,
+  type ConversationRetryPolicy,
   type ConversationStreamOptions,
   type ToolRegistration,
 } from '@earendil-works/pi-durable';
@@ -93,9 +94,10 @@ export interface Pi {
    * Answer `text`, once, with the answer's text: a turn of the object's
    * conversation (each prompt of an invocation has an id of its own, the
    * same on every attempt). With `check`, a reply it returns a message for
-   * is asked again within the turn, once.
+   * is asked again within the turn, once. With `reminder`, the model is told
+   * it after the prompt, which the conversation keeps as it was asked.
    */
-  prompt: (text: string, check?: Check) => Promise<string>;
+  prompt: (text: string, check?: Check, reminder?: string) => Promise<string>;
   /** The object's conversation, on the model: for `reset`, `compact`, `entries` and the like. */
   conversation: () => Promise<Conversation>;
 }
@@ -173,9 +175,10 @@ export const items: Items<Item> = {
  * the run of the turn's request `requestId` after its user entry (pi's
  * submission names it),
  * its replies and its tools' results; nothing once `stopped()`, or once the
- * turn is closed. Each entry once: after the last one copied.
+ * turn is closed. Each entry once: after the last one copied. `resulted`
+ * gets the calls whose results it copied.
  */
-function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean) {
+function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean, resulted: (calls: string[]) => void) {
   let from: { conversation: number; last: number } | undefined;
   return async (tx: DatabaseWriter) => {
     if (stopped() || !turn.writable) return;
@@ -201,7 +204,9 @@ function copying(turn: Turn<Item>, requestId: string, stopped: () => boolean) {
         copied.push({ item: { entry: Number(id), message }, reply: message.role === 'assistant' });
       }
     }
-    if (copied.length > 0) await turn.copyIn(tx, copied);
+    if (copied.length === 0) return;
+    await turn.copyIn(tx, copied);
+    resulted(copied.flatMap(({ item: { message } }) => (message.role === 'toolResult' ? [message.toolCallId] : [])));
   };
 }
 
@@ -219,6 +224,15 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   workspace?: string;
   /** OpenAI's service tier for each request: `fast` for its fast mode (priced higher), `flex`, and so on. */
   serviceTier?: ServiceTier;
+  /**
+   * How pi asks the model again after a request failed for a reason that
+   * passes (an overloaded or unreachable provider, a rate limit): by
+   * default without limit, 2 s after the first failure, then twice as long
+   * each time, a minute apart at most. With `maxRetries`, a failure after
+   * that many retries ends the turn. A request refused for good (a wrong API
+   * key, an unknown model) is never asked again.
+   */
+  retry?: Partial<ConversationRetryPolicy>;
   /**
    * The answer as data: a zod object, whose JSON the agent replies with
    * (checked), and `chat` and `prompt` answer with (see output.ts).
@@ -308,7 +322,7 @@ function unanswered(id: string, why: string | null | undefined, detail: unknown,
  */
 export const withPi = async <T>(
   ctx: restate.SessionContext,
-  { model: named, models, system, tools = [], workspace, serviceTier }: Options,
+  { model: named, models, system, tools = [], workspace, serviceTier, retry }: Options,
   work: (pi: Pi) => Promise<T>,
 ): Promise<T> => {
   const model = modelOf(named);
@@ -359,13 +373,15 @@ export const withPi = async <T>(
     cancel(error);
     return awaitWithContext(new Promise<never>(() => {}), context);
   };
+  // The tool calls that returned, whose ends are published once pi stored their results (`prompt`).
+  const returned = new Set<string>();
   const tracked = (t: ToolRegistration): ToolRegistration => ({
     ...t,
     execute: async (args, api, task) => {
       try {
         await toolCallStarted(ctx);
         const result = await t.execute(args, api, task);
-        await toolCallEnded(ctx);
+        returned.add(api.callId);
         return result;
       } catch (error) {
         // The tool's error: never taken for the model's provider refusing (a tool may call a model API).
@@ -383,6 +399,9 @@ export const withPi = async <T>(
     // A task that crashes is run again however often Restate retries the attempt (its retry policy decides):
     // pi-durable would park it after 5 crashes in a row, and the prompt would never be answered.
     restartLimit: Infinity,
+    // A provider's outage never ends the turn: pi asks again until it answers (pi-durable would give up after 3
+    // retries, ending the turn unanswered for good). Each retry is committed: a retried attempt waits as it would.
+    retry: { maxRetries: Infinity, ...retry },
     // pi-durable hands its stream settings to pi-ai's requests as they are: serviceTier is pi-ai's.
     ...(serviceTier ? { stream: { serviceTier } as ConversationStreamOptions } : {}),
   };
@@ -393,8 +412,15 @@ export const withPi = async <T>(
     context,
   );
 
-  const prompt = (text: string, check?: Check) =>
-    answerOnce(
+  const prompt = (text: string, check?: Check, reminder?: string) => {
+    // 0.3.0's `prompt(text, id)` took a prompt's id: from JavaScript, it would
+    // fail as the check is called, again at every retry.
+    if (check !== undefined && typeof check !== 'function') {
+      throw new restate.TerminalError(
+        `pi's prompt(text, check) takes a check of the answer, not ${JSON.stringify(check)}: a prompt has an id of its own`,
+      );
+    }
+    return answerOnce(
       ctx,
       text,
       items,
@@ -408,15 +434,30 @@ export const withPi = async <T>(
         // A run an earlier prompt of this invocation left (its turn failed, say).
         await abortLeft((r) => r === id || r === `${id}:again`);
         // Once stopped, the turn's close says how it ended: not pi's abort of its tools.
+        // A tool call's end is published once its result is stored, for followers to read it there.
+        let ended = false;
         database.onCommit = copying(
           current,
           requestId,
           () => cancelled !== undefined || stopSignalOf(ctx)?.aborted === true,
+          (calls) => {
+            for (const call of calls) if (returned.delete(call)) ended = true;
+          },
         );
+        database.afterCommit = async () => {
+          if (!ended) return;
+          ended = false;
+          // Failing, it fails the attempt, as a tool's error does: never pi's commit, which is done.
+          await toolCallEnded(ctx).catch((error: unknown) => {
+            failed(error);
+            cancel(error);
+          });
+        };
         // The model is told how the turn before this one ended, if its run did not answer it.
         const before = store.transcript.at(-2);
         const note = !again && before && before.status !== 'answered' && before.answer ? `(${before.answer})\n\n` : '';
-        const asked = textOf(current.latestAsk().item.message.content);
+        // pi keeps the prompt as it is given, the turn's reminder too; the conversation as it was asked.
+        const asked = textOf(current.latestAsk().item.message.content) + (again ? '' : (current.reminder ?? ''));
         const submission = await root.submit({ type: 'input', content: note + asked, requestId }, context);
         const settled = await submission.wait(context);
         // A prompt the cancellation's abort ended fails with the cancellation.
@@ -428,8 +469,10 @@ export const withPi = async <T>(
         if (!reply) throw new restate.TerminalError(`prompt ${id}: no answer entry`);
         return textOf(reply.content);
       },
-      { check },
+      // pi keeps the model's history: the conversation reads only its latest turns.
+      { check, reminder, ownHistory: true },
     );
+  };
   // `failure`, once it comes. A cancellation aborts the conversation's work
   // instead: the work ends with it (a prompt closes its turn, cancelled).
   const abortOn = async (): Promise<never> => {
@@ -471,9 +514,9 @@ export const prompt = <O extends z.ZodObject | undefined = undefined>(
   text: string,
   options: Options<O> = {},
 ): Promise<Answer<O>> =>
-  withChecked(text, options, (t, o, check) => withPi(ctx, o, (session) => session.prompt(t, check))) as Promise<
-    Answer<O>
-  >;
+  withChecked(text, options, (t, o, check, reminder) =>
+    withPi(ctx, o, (session) => session.prompt(t, check, reminder)),
+  ) as Promise<Answer<O>>;
 
 /**
  * A chat handler: each message an invocation, the conversation in the

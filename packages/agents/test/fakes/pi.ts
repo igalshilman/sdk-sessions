@@ -55,6 +55,9 @@ export const lastText = (context: TranscriptContext) => textOf(context.messages.
 /** A reply in text. */
 export const say = (text: string) => fauxAssistantMessage(fauxText(text));
 
+/** A request that failed with `error` (`503 Service Unavailable`, say): the provider's error, as pi-ai gives it. */
+export const unavailable = (error: string) => fauxAssistantMessage([], { stopReason: 'error', errorMessage: error });
+
 /** A reply that calls tools: `calls` is a list of [name, arguments], after an optional text. */
 export const callTools = (calls: [name: string, args: ToolCall['arguments']][], text?: string) =>
   fauxAssistantMessage([...(text ? [fauxText(text)] : []), ...calls.map(([name, args]) => fauxToolCall(name, args))], {

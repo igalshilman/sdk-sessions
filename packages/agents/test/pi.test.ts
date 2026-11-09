@@ -7,8 +7,9 @@ import * as pi from '@restatedev/agents/pi';
 import { Type } from '@earendil-works/pi-ai';
 import { defineTool } from '@earendil-works/pi-durable';
 import { describe, expect, it, vi } from 'vitest';
-import { callTools, fakeProvider, say, textOf } from './fakes/pi.ts';
+import { callTools, fakeProvider, say, textOf, unavailable } from './fakes/pi.ts';
 import { AttemptEnded } from '../src/common.ts';
+import { Conversation } from '../src/conversation.ts';
 import {
   afterCancel,
   cancelledTransfer,
@@ -23,11 +24,18 @@ import {
   sqlAttempt,
 } from './support.ts';
 
+/** How many more requests the provider fails, unavailable, before it answers again. */
+const outage = vi.hoisted(() => ({ left: 0 }));
+
 // It repeats what it was told so far; asked to delegate, it hands out two
 // tasks, and then reports their results.
 vi.mock('@earendil-works/pi-ai/providers/all', () => ({
   builtinProviders: () => [
     fakeProvider('openai', 'gpt-6-sol', ({ messages }) => {
+      if (outage.left > 0) {
+        outage.left--;
+        return unavailable('503 Service Unavailable');
+      }
       const last = messages.at(-1)!;
       if (last.role === 'toolResult') {
         return say(
@@ -167,6 +175,10 @@ describe('pi.messages', () => {
 const reset = (ctx: restate.SessionContext) =>
   pi.withPi(ctx, {}, async ({ conversation, context }) => (await conversation()).reset(undefined, context));
 
+/** A handler that prompts as in 0.3.0, with an id: from JavaScript, as TypeScript refuses it. */
+const byItsId = (ctx: restate.SessionContext) =>
+  pi.withPi(ctx, {}, (session) => session.prompt('Hi', 'greeting' as unknown as undefined));
+
 /** A handler that prompts twice. */
 const twice = async (ctx: restate.SessionContext) => [
   await pi.prompt(ctx, 'One'),
@@ -174,6 +186,15 @@ const twice = async (ctx: restate.SessionContext) => [
 ];
 
 describe('pi.chat', () => {
+  it("answers through a provider's outage, however many times its requests fail", async () => {
+    // More failures than pi-durable's own 3 retries, which ended the turn unanswered.
+    outage.left = 6;
+    const alice = object('alice');
+    const chat = pi.chat({ retry: { baseDelayMs: 1, maxAgentDelayMs: 1 } });
+    const answer = await alice.invoke(chat, 'inv1', 'Hi, I am Alice');
+    expect([outage.left, answer]).toEqual([0, 'Hi, I am Alice']);
+  });
+
   it('ends a turn cancelled at any moment as one cancelled while a tool waits', async () => {
     const now = await cancelledWhileWorking((tools) => pi.chat({ tools }), pi.messages());
     const waiting = await afterCancel(pi.chat({ tools: [cancelledTransfer] }), pi.messages());
@@ -244,7 +265,10 @@ describe('pi.chat', () => {
   });
 
   it('publishes the conversation as a turn and its tool calls start and end', async () => {
-    const { answer, parts, published } = await followedWhileWorking((tools) => pi.chat({ tools }), pi.messages());
+    const { answer, parts, published, outputs } = await followedWhileWorking(
+      (tools) => pi.chat({ tools }),
+      pi.messages(),
+    );
     expect(answer).toBe('moved 5 from account 1 to account 2');
     expect(parts).toEqual([
       [{ type: 'text', text: 'Please move 5 from 1 to 2' }],
@@ -261,6 +285,8 @@ describe('pi.chat', () => {
     ]);
     // Published at its start, as its tool call starts and ends, and at its end.
     expect(published).toBe(4);
+    // A follower reads the call as it starts, and its output as it ends.
+    expect(outputs).toEqual([undefined, answer]);
   });
 
   it('in the background, publishes only the end of a turn', async () => {
@@ -318,10 +344,31 @@ describe('pi.chat', () => {
     await expect(failed).rejects.not.toBeInstanceOf(restate.TerminalError);
   });
 
+  it("reads only the latest turns of a long conversation, as pi keeps the model's history", async () => {
+    const alice = object('alice');
+    for (let n = 0; n < 8; n++) await alice.invoke(pi.chat(), `inv${n}`, `message ${n}`);
+    const load = vi.spyOn(Conversation, 'load');
+    try {
+      await alice.invoke(pi.chat(), 'inv8', 'message 8');
+      const loaded = (await load.mock.results[0]!.value) as Conversation<unknown>;
+      // The turn before (the model is told how it ended) and the one it answers: not the 7 before them.
+      expect(loaded.transcript).toHaveLength(2);
+    } finally {
+      load.mockRestore();
+    }
+  });
+
   it('answers each prompt of an invocation, and each once', async () => {
     const alice = object('alice');
     expect(await alice.invoke(twice, 'inv1', undefined)).toEqual(['One', 'One / Two']);
     expect(await alice.invoke(twice, 'inv1', undefined)).toEqual(['One', 'One / Two']);
+  });
+
+  it("fails for good, saying why, given a prompt's id as 0.3.0's prompt(text, id) took", async () => {
+    const alice = object('alice');
+    const failed = await alice.invoke(byItsId, 'inv1', undefined).catch((error: unknown) => error);
+    expect(failed).toBeInstanceOf(restate.TerminalError);
+    expect(String(failed)).toMatch(/takes a check of the answer, not "greeting"/);
   });
 
   it('remembers the conversation across messages, and answers a retried message once', async () => {

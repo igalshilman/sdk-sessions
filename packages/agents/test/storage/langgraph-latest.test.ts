@@ -2,6 +2,7 @@
 // for an `OR` of their channels. `pnpm --filter @restatedev/agents test langgraph`.
 import { AIMessage, HumanMessage, type BaseMessage } from '@langchain/core/messages';
 import { Annotation, END, MessagesDeltaValue, START, StateGraph, StateSchema } from '@langchain/langgraph';
+import type { DatabaseWriter, SqlValue } from '@restatedev/sessions';
 import { asDatabase, open } from '@restatedev/sessions/internal';
 import { describe, expect, it } from 'vitest';
 import { memoryStore } from '@restatedev/sessions/test/support';
@@ -36,6 +37,41 @@ describe("history: 'latest'", () => {
       'c',
       'echo c (saw 5)',
     ]);
+    await connection.close();
+  });
+
+  it('reads the checkpoints a delta channel needs from the step before, not from the database at each step', async () => {
+    const { connection, db } = await database();
+    // Each read of a checkpoint back (its parent, its metadata) that a step's `put` makes.
+    let reads = 0;
+    const counting = (tx: DatabaseWriter) =>
+      Object.create(tx, {
+        values: {
+          value: (sql: string, params?: SqlValue[]) => {
+            if (sql.startsWith('SELECT parent_checkpoint_id, type, checkpoint, metadata')) reads++;
+            return tx.values(sql, params);
+          },
+        },
+      }) as DatabaseWriter;
+    const watched = Object.create(db, {
+      transaction: {
+        value: <T>(body: (tx: DatabaseWriter) => Promise<T>) => db.transaction((tx) => body(counting(tx))),
+      },
+    }) as typeof db;
+    const graph = new StateGraph(new StateSchema({ messages: MessagesDeltaValue }))
+      .addNode('reply', (state: { messages: BaseMessage[] }) => ({
+        messages: [new AIMessage(`echo ${state.messages.at(-1)?.text}`)],
+      }))
+      .addEdge(START, 'reply')
+      .addEdge('reply', END)
+      .compile({ checkpointer: new SqlCheckpointSaver(watched, { history: 'latest' }) });
+    const thread = { configurable: { thread_id: 't' }, durability: 'sync' as const };
+    for (const text of ['a', 'b', 'c', 'd']) await graph.invoke({ messages: [new HumanMessage(text)] }, thread);
+    const { values } = await graph.getState(thread);
+    expect((values as { messages: BaseMessage[] }).messages.map((m) => m.content)).toEqual(
+      ['a', 'b', 'c', 'd'].flatMap((text) => [text, `echo ${text}`]),
+    );
+    expect(reads).toBe(0);
     await connection.close();
   });
 

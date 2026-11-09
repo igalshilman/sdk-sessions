@@ -7,9 +7,7 @@ import { fakeContext, type Made, memoryDatabase } from '@restatedev/sessions/tes
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { settleCalls as settle } from '../src/calls.ts';
-import { alsoClearing } from '../src/common.ts';
 import { Conversation, type Entry } from '../src/conversation.ts';
-import { conversationView } from '../src/messages.ts';
 import { calling, type Item, ITEMS } from './fakes/items.ts';
 
 /** Whether a turn that called `call_1` and stored `output` (an error if `error`) as its result has the call's result. */
@@ -349,16 +347,5 @@ describe('object', () => {
       },
     ]);
     expect(await stop(null)).toMatchObject({ stopped: { stopped: null }, cancels: [] });
-  });
-
-  it('clears what its `messages` view keeps apart, whatever its handlers are', async () => {
-    const cleared: string[] = [];
-    const agent = sessionObject({
-      name: 'keeper',
-      handlers: { chat: async () => '' },
-      views: { messages: alsoClearing(conversationView(ITEMS), async (ctx) => void cleared.push(ctx.key)) },
-    });
-    await invoke(agent, 'erase', fakeContext({ map: new Map(), service: 'keeper', key: 'alice', answer: () => null }));
-    expect(cleared).toEqual(['alice']);
   });
 });

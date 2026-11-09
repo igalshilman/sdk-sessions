@@ -41,6 +41,9 @@ import { SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-ses
 import * as checkpoints from '@deepseek-ai/dsh-session-checkpoint-policy';
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection';
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
+import { TokenMeter } from '@deepseek-ai/dsh-token-meter';
+import { ToolResultPruner } from '@deepseek-ai/dsh-compaction-tool-result-pruner';
+import { BasicCompactionEngine, type BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic';
 import { builtinProviders } from '@earendil-works/pi-ai/providers/all';
 import {
   defineTool,
@@ -120,10 +123,15 @@ function routeOf(model: string): Route {
 
 /**
  * The harness, its session in `db`: the services
- * an agent loop needs, the persistence and its checkpoints, and the provider
- * of `route`.
+ * an agent loop needs, the persistence and its checkpoints, compaction (with
+ * `compaction`'s settings), and the provider of `route`.
  */
-async function boot(db: restate.Database, route: Route, system?: string): Promise<Context> {
+async function boot(
+  db: restate.Database,
+  route: Route,
+  system?: string,
+  compaction: BasicCompactionConfig = {},
+): Promise<Context> {
   const harness = new Context();
   await harness.plugin(LlmRuntime);
   await harness.plugin(SessionStore);
@@ -133,6 +141,13 @@ async function boot(db: restate.Database, route: Route, system?: string): Promis
   await harness.plugin(SessionProjectionRegistry);
   await harness.plugin(SqlSessionPersistence, { db });
   await harness.plugin(checkpoints);
+  // The model's input stays within its context window: as it nears the
+  // window (or overflows it), the oldest history is condensed into a summary,
+  // one more model request, after oversized tool results are trimmed. The
+  // log keeps every event, and the conversation of turns every message.
+  await harness.plugin(TokenMeter);
+  await harness.plugin(ToolResultPruner);
+  await harness.plugin(BasicCompactionEngine, compaction);
   // DeepSeek's with DEEPSEEK_API_KEY; another's with the key pi-ai finds for it (OPENAI_API_KEY...).
   if (route.provider === 'deepseek-official') await harness.plugin(deepseek, {});
   else await harness.plugin(piAi, { providers: { [route.provider]: {} } });
@@ -261,6 +276,13 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
   /** The agent's tools: `tool()`s, Restate's (`call`, `signal`...), or the harness's (`defineTool`). */
   tools?: (AnyTool | ToolDefinition)[];
   /**
+   * When the model's input is condensed: the settings of the harness's
+   * compaction (@deepseek-ai/dsh-compaction-basic), such as `thresholdRatio`
+   * (by default 0.8 of the model's context window) and `retainRatio` (the
+   * newest 0.16 kept as it is).
+   */
+  compaction?: BasicCompactionConfig;
+  /**
    * The answer as data: a zod object, whose JSON the agent replies with
    * (checked), and `chat` and `prompt` answer with (see output.ts).
    */
@@ -320,7 +342,8 @@ type Agent = Awaited<ReturnType<Context['agents']['create']>>['agent'];
 function promptOf(turn: Turn<Message>, before: { status?: string; answer?: string } | undefined) {
   const text = textOf(turn.prompt.item);
   const note = before && before.status !== 'answered' && before.answer ? `(${before.answer})\n\n` : '';
-  return message(promptId(turn.id), note + text);
+  // The harness keeps the prompt as it is given, the turn's reminder too; the conversation as it was asked.
+  return message(promptId(turn.id), note + text + (turn.reminder ?? ''));
 }
 
 /**
@@ -329,10 +352,17 @@ function promptOf(turn: Turn<Message>, before: { status?: string; answer?: strin
  * tools' results. Not the requests to continue (a step of the run's own),
  * nor anything once the run stopped or `failed()` (the harness's result of a
  * tool that failed the attempt, or was cancelled, is not the call's): the
- * turn's close, or the retry, says how it ended.
+ * turn's close, or the retry, says how it ended. `resulted` gets the calls
+ * whose results it copied.
  */
 const copying =
-  (ctx: restate.SessionContext, turn: Turn<Message>, from: () => number | undefined, failed: () => boolean) =>
+  (
+    ctx: restate.SessionContext,
+    turn: Turn<Message>,
+    from: () => number | undefined,
+    failed: () => boolean,
+    resulted: (calls: string[]) => void,
+  ) =>
   async (tx: Parameters<NonNullable<SqlSessionPersistence['copy']>>[0], batch: readonly SessionEvent[]) => {
     const start = from();
     if (start === undefined || failed() || stopSignalOf(ctx)?.aborted || !turn.writable) return;
@@ -342,7 +372,9 @@ const copying =
       if (e.type === 'tool/result') return [{ item: e.data.message }];
       return [];
     });
-    if (copied.length > 0) await turn.copyIn(tx, copied);
+    if (copied.length === 0) return;
+    await turn.copyIn(tx, copied);
+    resulted(batch.flatMap((e) => (e.seq > start && e.type === 'tool/result' ? [e.data.message.toolCallId] : [])));
   };
 
 /**
@@ -351,11 +383,11 @@ const copying =
  * continued after a crash.
  */
 const runOf =
-  (ctx: restate.SessionContext, { model: named, system, tools = [] }: Options): Run<Message> =>
+  (ctx: restate.SessionContext, { model: named, system, tools = [], compaction }: Options): Run<Message> =>
   async (conversation) => {
     const turn = conversation.turn;
     const route = routeOf(modelOf(named, DEEPSEEK_MODEL));
-    const harness = await boot(ctx.db, route, system);
+    const harness = await boot(ctx.db, route, system, compaction);
     const persistence = harness.sessionPersistence as SqlSessionPersistence;
     // A tool's error fails the attempt, which Restate retries: the harness
     // stores nothing more, so the retry finds the tool's call without a result.
@@ -377,12 +409,14 @@ const runOf =
     const id = again ? MessageId(`prompt:${turn.id}:again`) : promptId(turn.id);
     // Where the turn's latest ask is in the log, once it is.
     let from: number | undefined;
+    // The tool calls that returned, whose ends are published once a flush stored their results.
+    const returned = new Set<string>();
     try {
       const sessionId = SessionId(ctx.key);
       const options = {
         agentOptions: route,
         setup: (agentCtx: Context) => {
-          for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail));
+          for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail, returned));
         },
       };
       // Resuming closes a harness turn a crash, or a killed invocation, left open.
@@ -392,6 +426,8 @@ const runOf =
       agent = started.agent;
       const found = agent.session.snapshotEvents().length;
       from = agent.session.snapshotEvents().find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
+      // A tool call's end is published once a flush stored its result, for followers to read it there.
+      let ended = false;
       persistence.copy = async (tx, batch) => {
         from ??= batch.find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
         await copying(
@@ -399,7 +435,16 @@ const runOf =
           turn,
           () => from,
           () => broken,
+          (calls) => {
+            for (const call of calls) if (returned.delete(call)) ended = true;
+          },
         )(tx, batch);
+      };
+      persistence.flushed = async () => {
+        if (!ended) return;
+        ended = false;
+        // Failing, it fails the attempt, as a tool's error does: never the flush, which is done.
+        await toolCallEnded(ctx).catch(fail);
       };
       // The turn before this one, as the conversation has it.
       const before = conversation.transcript.at(-2);
@@ -436,20 +481,24 @@ async function cancelTurn(harness: Context, agent: Agent) {
 }
 
 /**
- * `definition`, its calls published as they start and end (for the clients
- * that follow the conversation), and its error failing the attempt.
+ * `definition`, its calls published as they start, and as they end once
+ * their results are stored (each call that returned is put in `returned`),
+ * for the clients that follow the conversation; its error failing the
+ * attempt.
  */
 const tracked = (
   definition: ToolDefinition,
   ctx: restate.SessionContext,
   fail: (error: unknown) => void,
+  returned: Set<string>,
 ): ToolDefinition => ({
   ...definition,
   execute: async (args, exec) => {
     try {
       await toolCallStarted(ctx);
       const result = await definition.execute(args, exec);
-      await toolCallEnded(ctx);
+      // Its end is published once the harness stored its result (`runOf`).
+      returned.add(exec.callId);
       return result;
     } catch (error) {
       fromTool(ctx, error);
@@ -470,9 +519,10 @@ export const prompt = <O extends z.ZodObject | undefined = undefined>(
   text: string,
   options: Options<O> = {},
 ): Promise<Answer<O>> =>
-  withChecked(text, options, (t, o, check) => answerOnce(ctx, t, items, runOf(ctx, o), { check })) as Promise<
-    Answer<O>
-  >;
+  withChecked(text, options, (t, o, check, reminder) =>
+    // The harness keeps the model's history: the conversation reads only its latest turns.
+    answerOnce(ctx, t, items, runOf(ctx, o), { check, reminder, ownHistory: true }),
+  ) as Promise<Answer<O>>;
 
 /**
  * A chat handler: each message an invocation, the session in the object's

@@ -111,6 +111,12 @@ export const messageSerde: restate.Serde<string> = {
 };
 
 /**
+ * What an empty answer says, as the model sees it later in the conversation:
+ * a provider's API may refuse an empty text (Anthropic's does).
+ */
+export const NO_ANSWER = '(no answer)';
+
+/**
  * What a cancelled turn answers, and each tool call it cut off: the model
  * sees it in the conversation that goes on.
  */
@@ -164,9 +170,11 @@ export const SUMMARIZE =
 /**
  * What a turn checks its answer with: nothing if the answer is what was
  * asked for, else the message that asks the model again, once, within the
- * turn (`answerOnce`'s `check`).
+ * turn (`answerOnce`'s `check`). With `last`, the model was asked again
+ * already: a check that throws a terminal error then fails the turn, which
+ * is closed with it.
  */
-export type Check = (answer: string) => string | undefined;
+export type Check = (answer: string, last?: boolean) => string | undefined;
 
 /** `window`, if it is one: a whole number of turns (0 or more), or `'all'`. */
 export function checkWindow(window: Window): Window {
@@ -210,19 +218,15 @@ export class AttemptEnded extends Error {
  */
 export const stopSignalOf = (ctx: restate.SessionContext): AbortSignal | undefined => TURN.get(ctx);
 
-/** What `clear` also empties, beside the agent's database. */
-type Clear = (ctx: restate.SessionContext) => Promise<void>;
-
 /**
  * An agent's settings: whether it runs in the background (`background:
- * true`: no one follows it as it works), what its `clear` also empties, and,
- * for an agent on the conversation of turns (conversation.ts), its
- * framework's items, how much of the conversation its model sees (`window`
- * and `budget`), and how it summarizes the earliest turns (`summarize`).
+ * true`: no one follows it as it works), and, for an agent on the
+ * conversation of turns (conversation.ts), its framework's items, how much
+ * of the conversation its model sees (`window` and `budget`), and how it
+ * summarizes the earliest turns (`summarize`).
  */
 export interface Settings {
   background: boolean;
-  clear?: Clear;
   /** The items of its framework, if it keeps the conversation of turns (its `messages` view is `conversationView`'s). */
   items?: object;
   window: Window;
@@ -233,31 +237,14 @@ export interface Settings {
 /** An agent's settings, on its definition. */
 const AGENT = new Link<Settings>('an agent');
 
-/** What a framework's `messages` view clears beside the agent's database: see {@link alsoClearing}. */
-const CLEARS = new Link<Clear>('alsoClearing');
-
 /** The items of a framework's `messages` view on the conversation of turns. */
 export const ITEMS = new Link<object>('restate-agents.items');
 
-/**
- * The `messages` view `view` of a framework that keeps a conversation apart
- * (in a database of its own, say): `clear` empties it too, as an agent
- * with this view is cleared.
- */
-export const alsoClearing = <V extends object>(view: V, clear: Clear) => {
-  return CLEARS.on(view, clear);
-};
-
-/**
- * `definition` is an agent's, with these settings: its `messages` view gives
- * what its `clear` also empties (`alsoClearing`), and its framework's items,
- * if it is on the conversation of turns.
- */
+/** `definition` is an agent's, with these settings: its framework's items, if it is on the conversation of turns. */
 export const isAgent = <D extends object>(
   definition: D,
   {
     background = false,
-    messages = undefined as object | undefined,
     items = undefined as object | undefined,
     window = WINDOW as Window,
     budget = BUDGET,
@@ -266,7 +253,6 @@ export const isAgent = <D extends object>(
 ) => {
   return AGENT.on(definition, {
     background,
-    clear: messages && CLEARS.of(messages),
     items,
     window,
     budget,
@@ -283,9 +269,6 @@ const agentOf = (ctx: restate.SessionContext) => {
 /** The settings of the agent of `ctx`: the defaults, for an object that is no agent. */
 export const settingsOf = (ctx: restate.SessionContext): Settings =>
   agentOf(ctx) ?? { background: false, window: WINDOW, budget: BUDGET };
-
-/** Clear what the agent of `ctx` keeps beside its database. */
-export const cleared = async (ctx: restate.SessionContext) => agentOf(ctx)?.clear?.(ctx);
 
 /** Whether the agent of `ctx` runs in the background. */
 const unfollowed = (ctx: restate.SessionContext) => agentOf(ctx)?.background === true;

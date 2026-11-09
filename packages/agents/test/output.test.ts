@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { teller } from './fakes/claude.ts';
 import { teller as deepseekTeller } from './fakes/deepseek.ts';
 import { fakeProvider, say, textOf } from './fakes/pi.ts';
+import type { Messages, MessagesRequest } from '../src/common.ts';
 import { conversation, type PromptHandler } from './support.ts';
 
 const PLAN = { summary: 'A calculator', parts: ['parser', 'history'] };
@@ -49,6 +50,17 @@ vi.mock('@anthropic-ai/sdk', () => import('./fakes/claude.ts'));
 vi.mock('@deepseek-ai/dsh-llm-deepseek-api-key', () => import('./fakes/deepseek.ts'));
 
 const Plan = z.object({ summary: z.string(), parts: z.array(z.string()) });
+
+/** The user's messages of a conversation, as clients read it with `view` (a framework's `messages()`). */
+async function promptsIn(
+  c: ReturnType<typeof conversation>,
+  view: (ctx: restate.ViewContext, request?: MessagesRequest) => Promise<Messages>,
+): Promise<string[]> {
+  const { messages } = await c.read(view);
+  return messages
+    .filter((m) => m.role === 'user')
+    .map((m) => m.parts.map((p) => (p.type === 'text' ? p.text : '')).join(''));
+}
 const chat = pi.chat({ output: Plan }) as unknown as PromptHandler;
 
 describe("an agent's output", () => {
@@ -73,6 +85,18 @@ describe("an agent's output", () => {
     await expect(refused).rejects.toBeInstanceOf(restate.TerminalError);
     await expect(refused).rejects.toThrow(/not the answer asked for: it is not JSON: "A plan, in prose"/);
     await expect(conversation(chat, 'd').attempt('inv1', 'Plan wrongly')).rejects.toThrow(/summary/);
+  });
+
+  it('closes its turn failed when the reply asked again is not it either, as the invocation fails', async () => {
+    const c = conversation(chat, 'never');
+    const notIt = /^The agent's reply is not the answer asked for: it is not JSON: "A plan, in prose"$/;
+    await expect(c.attempt('inv1', 'Refuse')).rejects.toThrow(notIt);
+    // The conversation says the turn failed, and why: not with the reply, as if it were the answer.
+    const { messages } = await c.read(pi.messages(), { view: 'summary' });
+    const [, answer] = messages;
+    expect(answer!.parts).toEqual([{ type: 'text', text: expect.stringMatching(/^Error: The agent's reply is not/) }]);
+    // Retried (a crash right after the close), it fails as it did.
+    await expect(c.attempt('inv1', 'Refuse')).rejects.toThrow(notIt);
   });
 
   it('survives a crash at any point: the retry answers with the same reply', async () => {
@@ -124,6 +148,50 @@ describe("an agent's output", () => {
       expect([crashAt, await c.attempt('inv1', 'Plan lazily')]).toEqual([crashAt, PLAN]);
     }
   }, 60_000);
+
+  it('is asked for after the prompt, which the conversation keeps as it was asked', async () => {
+    // pi: the model is reminded (it answers with JSON only if it is), the conversation is not.
+    const c = conversation(chat, 'kept');
+    expect(await c.attempt('inv1', 'Plan if reminded')).toEqual(PLAN);
+    expect(await promptsIn(c, pi.messages())).toEqual(['Plan if reminded']);
+    // Claude and DeepSeek: the model's request ends the prompt with the reminder.
+    const prompted: string[] = [];
+    const { reply } = teller;
+    teller.reply = (messages) => {
+      const { content } = messages.find((m) => m.role === 'user')!;
+      prompted.push(typeof content === 'string' ? content : content.map((b) => ('text' in b ? b.text : '')).join(''));
+      return {
+        id: `msg_${messages.length}`,
+        type: 'message',
+        role: 'assistant',
+        model: 'teller',
+        content: [{ type: 'text', text: JSON.stringify(PLAN) }],
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      } as unknown as ReturnType<typeof teller.reply>;
+    };
+    const { reply: deepseekReply } = deepseekTeller;
+    deepseekTeller.reply = (messages) => {
+      const user = messages.find((m) => m.role === 'user')!;
+      prompted.push(user.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join(''));
+      return { text: JSON.stringify(PLAN) };
+    };
+    try {
+      for (const [planner, view] of [
+        [claude.chat({ output: Plan }), claude.messages()],
+        [deepseek.chat({ output: Plan }), deepseek.messages()],
+      ] as const) {
+        const k = conversation(planner as unknown as PromptHandler, `kept-${prompted.length}`);
+        expect(await k.attempt('inv1', 'Plan it')).toEqual(PLAN);
+        expect(prompted.at(-1)).toMatch(/^Plan it\n\nWhen you are done, reply with your answer as JSON only/);
+        expect(await promptsIn(k, view)).toEqual(['Plan it']);
+      }
+    } finally {
+      teller.reply = reply;
+      deepseekTeller.reply = deepseekReply;
+    }
+  });
 
   it('types what prompt answers: the output, or else text', () => {
     expectTypeOf<Awaited<ReturnType<typeof pi.prompt<typeof Plan>>>>().toEqualTypeOf<z.infer<typeof Plan>>();

@@ -49,6 +49,8 @@ export class SqlKvDatabase extends Executor implements SqliteDatabase {
   readonly #session: Database;
   /** Runs at the end of each commit, in its transaction, so that what it writes commits with it. */
   onCommit: OnCommit | undefined;
+  /** Runs once each commit is done, outside its transaction: to tell others what it stored, say. */
+  afterCommit: (() => Promise<void>) | undefined;
 
   constructor(db: Database) {
     super(db);
@@ -56,12 +58,14 @@ export class SqlKvDatabase extends Executor implements SqliteDatabase {
   }
 
   /** Commits when the callback resolves; rolls back, and rejects with its error, when it rejects. */
-  transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
-    return this.#session.transaction(async (tx) => {
-      const result = await callback(new Executor(tx));
+  async transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
+    const result = await this.#session.transaction(async (tx) => {
+      const done = await callback(new Executor(tx));
       if (this.onCommit) await this.onCommit(tx);
-      return result;
+      return done;
     });
+    if (this.afterCommit) await this.afterCommit();
+    return result;
   }
 
   /** The session is the caller's to end, after the calls made before. */

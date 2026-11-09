@@ -311,7 +311,8 @@ invocation failed; `status` shows `invocationId` and `since` only.
 
 - a `messages` view on the store is the framework's, made with its `Items`
   (a function of this step, `conversationView(items)` say), and carries them,
-  so that `sessionObject` finds them, as it finds `alsoClearing`'s clear;
+  so that `sessionObject` finds them (after the merge, nothing else uses
+  `alsoClearing`, OpenCode's `clear` of its own database, which is gone);
 - the private handlers `settle(invocationId)` (close the turn, then publish)
   and `compact()` (from the agent's settings), for an agent on the store;
   `settle` and `compact` become reserved names;
@@ -400,8 +401,9 @@ transaction; `CONTINUE` only for this invocation's own prompt, a step of its
 turn, not copied; a dead turn closed in the store (`settle`, or the next
 message), never continued, and its note given to the harness's next turn;
 the CANCELLED and UNANSWERED notes given to it too; `dsh-compaction-basic`
-mounted (not done: it is not a dependency yet, so the harness's input still
-grows with the conversation); a context overflow terminal.
+mounted (done after the merge, with the token meter and the tool result
+pruner, and a `compaction` option for its settings); a context overflow
+terminal.
 
 **Tests**: invert `:228-236`; the copy across crashes (`crashedAnywhere`):
 each message once in `messages`; `CONTINUE` not in the views; a dead turn

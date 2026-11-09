@@ -24,9 +24,10 @@ const format = (output: z.ZodObject) =>
   JSON.stringify(z.toJSONSchema(output));
 
 /**
- * What each prompt ends with, with `output`: the system prompt's ask, again,
- * where an agent reads it last (after a long run of tool calls, it may have
- * drifted from its system prompt to a summary in prose).
+ * What the model is told after each prompt, with `output`: the system
+ * prompt's ask, again, where an agent reads it last (after a long run of tool
+ * calls, it may have drifted from its system prompt to a summary in prose).
+ * It is not stored: clients read the prompt as it was asked.
  */
 const reminder =
   '\n\nWhen you are done, reply with your answer as JSON only, of the schema you were given: no other text.';
@@ -61,17 +62,22 @@ function parsed<O extends z.ZodObject>(output: O, reply: string): { value: z.inf
   return result.success ? { value: result.data } : { wrong: z.prettifyError(result.error) };
 }
 
+/** The error of a prompt whose answer is not a value of its `output`, `wrong` saying why. */
+const notAsked = (wrong: string) =>
+  new restate.TerminalError(`The agent's reply is not the answer asked for: ${wrong}`);
+
 /**
  * The check of an answer that must be a value of `output`: what asks again
- * for one, if it is not (`answerOnce`'s `check`, which asks within the turn).
+ * for one, if it is not (`answerOnce`'s `check`, which asks within the
+ * turn), or, once it asked (`last`), the error that fails the turn.
  */
 export const recheck =
   (output: z.ZodObject) =>
-  (reply: string): string | undefined => {
+  (reply: string, last?: boolean): string | undefined => {
     const answer = parsed(output, reply);
-    return 'wrong' in answer
-      ? `Your reply is not the answer asked for: ${answer.wrong}\nReply again, with the JSON only.`
-      : undefined;
+    if (!('wrong' in answer)) return undefined;
+    if (last) throw notAsked(answer.wrong);
+    return `Your reply is not the answer asked for: ${answer.wrong}\nReply again, with the JSON only.`;
   };
 
 /**
@@ -79,18 +85,24 @@ export const recheck =
  * answering with a value of `options.output` if it has one, or else with the
  * agent's text. A reply that is not the value is asked again within its
  * turn, once (`check`), and the reply to that must be one, or the prompt
- * fails, terminal.
+ * fails, terminal, and its turn is closed failed. The model is told
+ * `reminder` after the prompt, which the conversation keeps as it was asked
+ * (`answerOnce`'s `reminder`).
  */
 export const withChecked = async <T extends { system?: string; output?: z.ZodObject }>(
   text: string,
   options: T,
-  prompt: (text: string, options: T, check?: (answer: string) => string | undefined) => Promise<string>,
+  prompt: (
+    text: string,
+    options: T,
+    check?: (answer: string) => string | undefined,
+    reminder?: string,
+  ) => Promise<string>,
 ): Promise<Answer<T['output']>> => {
   const { output } = options;
   if (!output) return prompt(text, options) as Promise<Answer<T['output']>>;
   const asked = { ...options, system: [options.system, format(output)].filter(Boolean).join('\n\n') };
-  const answer = parsed(output, await prompt(text + reminder, asked, recheck(output)));
-  if ('wrong' in answer)
-    throw new restate.TerminalError(`The agent's reply is not the answer asked for: ${answer.wrong}`);
+  const answer = parsed(output, await prompt(text, asked, recheck(output), reminder));
+  if ('wrong' in answer) throw notAsked(answer.wrong);
   return answer.value as Answer<T['output']>;
 };

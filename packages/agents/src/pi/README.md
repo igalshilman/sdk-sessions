@@ -26,6 +26,7 @@ await serve(assistant);
 | `output`      | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
 | `workspace`   | A directory for pi-durable's coding tools (`read`, `write`, `edit`, `bash`), on the local file system; use a sandbox                                           |
 | `serviceTier` | OpenAI's service tier for each request: `fast` for its fast mode (priced higher), `flex`, and so on                                                            |
+| `retry`       | How pi asks the model again after a request failed for a reason that passes (an outage, a rate limit): by default without limit, 2 s to a minute apart         |
 
 For a session object of your own, `pi.chat(options)` is the handler and
 `pi.messages()` the view; `options` may be a function of the invocation's context, such as
@@ -69,6 +70,11 @@ handler does. A retried attempt opens the Harness again and carries on:
 - a tool's error fails the attempt, and Restate retries it (pi-durable would
   hand it to the model); a `restate.TerminalError` of a `@restatedev/agents`
   tool is its answer to the model;
+- a provider's outage never ends the turn: pi asks the model again until it
+  answers (pi-durable gives up after 3 retries; `retry` sets how often), and
+  each retry is committed, so a retried attempt waits as the attempt before
+  it would have; a request the provider refuses for good (a wrong API key)
+  ends the turn, with a terminal error that says what to check;
 - a run a killed invocation left is aborted, never finished: its turn is
   closed (`ended`) in the agent's conversation of turns, and the next
   prompt tells the model how it ended.
