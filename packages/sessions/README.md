@@ -62,11 +62,18 @@ your session object can call.
 `restate.serve(...services)` serves them, session objects and the SDK's
 alike, on `PORT` (9080 by default), with what they need beside them (such
 as the companion each @restatedev/agents agent brings with it).
-With `RESTATE_CONNECT_KEY` set, `serve` connects out to Restate Cloud
-instead of listening, under `RESTATE_CONNECT_NAME` (the deployment you
-register, `connect://<name>`): the same program either way, with nothing to
-change in it. Both ways go through `served`, so an agent always has its
-companion beside it.
+`restate.connect` does the same for Restate Cloud, where the program
+connects out rather than being called in:
+
+```ts
+restate.connect({ services: [notes, orders], name: 'notes-v1' });
+```
+
+`name` is the deployment you register (`connect://notes-v1`), and the key
+is `RESTATE_CONNECT_KEY`. It returns at once, with the SDK's `Connection`;
+`await restate.connect(…).ready` waits for the first handshake. Use this one, not the SDK's own `connect`: the
+SDK's binds only the services you list, leaving out what they need beside
+them, so an agent would run without its companion.
 
 `restate.remote` is a handle on something another program serves: named and
 typed here, implemented there. Type it with the definition it names,
