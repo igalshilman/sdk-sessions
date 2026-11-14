@@ -70,6 +70,13 @@ served([...]), port })`. `RESTATE_SERVE_ONLY=triage,planner` serves only
 the services it names, each agent with its companion, so that one program
 (or image) deploys in parts.
 
+With `RESTATE_CONNECT_KEY` set, `serve` connects out to Restate Cloud
+instead of listening, under `RESTATE_CONNECT_NAME` (the deployment you
+register, `connect://<name>`), with each agent's companion beside it as
+ever. Reach for the SDK's own `restate.connect` only with `served([...])`:
+on its own it binds the agents without their companions, and the first
+tool that waits has nothing to wait on.
+
 ## Choose a framework
 
 The same agent runs on each of them: `agent({ name, ...options })`, with

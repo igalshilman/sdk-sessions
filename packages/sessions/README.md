@@ -62,6 +62,28 @@ your session object can call.
 `restate.serve(...services)` serves them, session objects and the SDK's
 alike, on `PORT` (9080 by default), with what they need beside them (such
 as the companion each @restatedev/agents agent brings with it).
+With `RESTATE_CONNECT_KEY` set, `serve` connects out to Restate Cloud
+instead of listening, under `RESTATE_CONNECT_NAME` (the deployment you
+register, `connect://<name>`): the same program either way, with nothing to
+change in it. Both ways go through `served`, so an agent always has its
+companion beside it.
+
+`restate.remote` is a handle on something another program serves: named and
+typed here, implemented there. Type it with the definition it names,
+imported for its type alone, so that nothing of the other program is
+imported, bundled or run here:
+
+```ts
+import type { orders as theirs } from '../their/orders.ts';
+
+const orders = restate.remote.object<typeof theirs>('orders');
+await ctx.rpc(orders, key).status(id); // typed as the one they serve
+```
+
+Wrong input, an unknown handler and a misspelt name are each a type error.
+`serve` refuses a handle, since a service with no handlers would register
+over the real one.
+
 `RESTATE_SERVE_ONLY=a,b` serves only the services it names, each with what
 it needs: one program, deployed in parts. For anything else (another port,
 HTTP/1.1, a Lambda handler), the SDK's `restate.endpoint()` is there as

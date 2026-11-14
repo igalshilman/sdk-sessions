@@ -49,6 +49,45 @@ export interface Target {
 /** A definition the clients take: a service, a virtual object or a workflow, as `restate` makes them. */
 type Definition = { name: string };
 
+/** Marks a {@link remote}: {@link served} refuses one, since nothing here implements it. */
+const REMOTE = Symbol.for('restate-sessions.remote');
+
+/** Whether `service` is a {@link remote} handle rather than something to serve. */
+export const isRemote = (service: object): boolean => REMOTE in service;
+
+/** A handle of `kind`, carrying what the clients read of a definition: its name and its kind. */
+const handle = (kind: 'service' | 'object' | 'workflow', name: string) => ({
+  name,
+  // The kind, by both conventions: `_kind` for the clients here, the key
+  // itself for @restatedev/agents' tools (`'object' in target`).
+  [kind]: {},
+  _kind: kind,
+  [REMOTE]: true,
+});
+
+/**
+ * A handle on something another deployment serves, named and typed but not
+ * implemented here: `ctx.rpc`, `ctx.send` and the agents' tools take it as
+ * they take a definition, and the call goes out through Restate.
+ *
+ * Type it with the definition it names, imported for its type alone, so that
+ * nothing of the other deployment is imported at run time:
+ *
+ *   import type { workspace as impl } from '../coders/services/workspace.ts';
+ *
+ *   export const workspace = remote.object<typeof impl>('workspace');
+ *   await ctx.rpc(workspace, key).clone(issue);   // typed as the real one
+ *
+ * The name is checked against the definition's, so a typo is a type error.
+ * Serving a handle is one too, at run time: {@link served} refuses it, rather
+ * than registering a service with no handlers over the real one.
+ */
+export const remote = {
+  service: <D extends Definition>(name: D['name']): D => handle('service', name) as unknown as D,
+  object: <D extends Definition>(name: D['name']): D => handle('object', name) as unknown as D,
+  workflow: <D extends Definition>(name: D['name']): D => handle('workflow', name) as unknown as D,
+};
+
 // The handlers of a definition, of whichever kind: each kind's type only
 // infers from its own definitions, and is `unknown` for the others.
 type OfObject<D> = D extends VirtualObjectDefinition<string, infer M> ? M : unknown;

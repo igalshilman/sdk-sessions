@@ -11,7 +11,7 @@ export { Link } from './link.ts';
 export { ScopeKey } from './scope.ts';
 export { open, type Connection, type Store, type ConnectionTransaction } from './database.ts';
 export { failpoints, PromiseSelector, type Failpoint } from './selector.ts';
-export { needing, served } from './serve.ts';
+export { needing, served, serving, type Serving } from './serve.ts';
 export {
   attach,
   cancelCalls,

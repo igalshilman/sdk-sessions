@@ -34,6 +34,8 @@ export {
   type ViewContext,
 } from './object.ts';
 export type { CallOptions, Client, Rpc, Send, SendClient, SendOptions, Target } from './calls.ts';
+// A handle on what another deployment serves: named and typed, not implemented here.
+export { remote } from './calls.ts';
 // In place of the SDK's: the services, on PORT, with what they need beside
 // them; and `served`, the services with what they need, for an endpoint of your own.
 export { serve, served } from './serve.ts';

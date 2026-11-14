@@ -32,8 +32,10 @@ export { call, send, signal, subagent, tool, workflow, type Tool, type ToolCall,
 export { webhook, webhookMessage, type WebhookAuth, type WebhookEvent, type WebhookOptions } from './webhook.ts';
 
 /**
- * @restatedev/sessions' `serve`: the services on PORT, with what they need
- * beside them (each agent's companion); and `served`, those services, for
- * an endpoint of your own (`restate.endpoint()`).
+ * @restatedev/sessions' `serve`: the services on PORT, or connected out to
+ * Restate Cloud where RESTATE_CONNECT_KEY is set, either way with what they
+ * need beside them (each agent's companion); and `served`, those services,
+ * for an endpoint of your own (`restate.endpoint()`), or for the SDK's own
+ * `restate.connect`, which without it leaves the companions unserved.
  */
 export { serve, served } from '@restatedev/sessions';
