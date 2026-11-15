@@ -824,6 +824,22 @@ let unmoved = 0;
  * before the kill landed ahead of the answer. Still closed unanswered.
  */
 const repliedThenKilled: string[] = [];
+/** Killed prompts whose turn was answered before the kill landed: the invocations. */
+const answeredThenKilled: string[] = [];
+/**
+ * The answer of `session`'s turn whose prompt is message `promptId`: the
+ * summary view has each turn as its prompt and its answer, under their ids.
+ */
+async function answerOf(session: string, promptId: number): Promise<string | undefined> {
+  const summary: Messages['messages'] = [];
+  for (let page: Messages | undefined; !page || page.more;) {
+    page = await call<Messages>(`${session}/messages`, { view: 'summary', limit: 20, before: summary[0]?.id });
+    summary.unshift(...page.messages);
+  }
+  const at = summary.findIndex((m) => m.id === promptId);
+  const next = at < 0 ? undefined : summary[at + 1];
+  return next?.role === 'assistant' ? next.parts.flatMap((p) => (p.type === 'text' ? [p.text] : [])).at(-1) : undefined;
+}
 for (const [name, s] of sessions) {
   // A page at a time, from the latest back.
   const said: Messages['messages'] = [];
@@ -851,7 +867,8 @@ for (const [name, s] of sessions) {
   if (!KILLED.has(name)) continue;
   // Each transfer of the ledger was made by a call of one turn (by its id,
   // or the id it retries): one per prompt answered, at most one per prompt
-  // killed, whose turn ended unanswered.
+  // killed, whose turn ended unanswered (or answered, if the kill landed
+  // after its answer committed: then one).
   const session = `${name}/s${s}`;
   const made = new Map(turns.map((t) => [t, 0]));
   for (const id of ledgerIds.get(session) ?? []) {
@@ -887,6 +904,17 @@ for (const [name, s] of sessions) {
     const evidence = `${session} "${turn.text}"${kill ? ` (${kill.invocation} killed ${kill.how})` : ''}: ${n} transfers, ${JSON.stringify(turn.said)}`;
     if (kill?.outcome === 'killed') {
       assert.ok(n <= 1, `moved more than once: ${evidence}`);
+      if (!texts.some((t) => t.startsWith('Ended: '))) {
+        // A kill that lands after the turn's answer committed, before its
+        // invocation completed: Restate says killed, but the turn is
+        // answered, and stays so (nothing closes an answered turn). Its
+        // answer, as the summary view has it, is its final reply.
+        const answer = await answerOf(session, turn.said[0]!.id);
+        assert.match(answer ?? '', /^Done: moved/, `a killed turn not closed: ${evidence}`);
+        assert.equal(n, 1, `answered, but moved ${n}: ${evidence}`);
+        answeredThenKilled.push(kill.invocation);
+        continue;
+      }
       // Closed, not answered: its last word is the closing note, after
       // whatever its own invocation's model said.
       assert.match(texts.at(-1) ?? '', /^Ended: /, `a killed turn not closed: ${evidence}`);
@@ -1012,7 +1040,8 @@ const killedBy = Map.groupBy(killed, (k) => `${k.name} ${k.outcome} ${k.how}`);
 console.error(
   `prompts killed: ${[...killedBy].map(([what, ks]) => `${ks.length} ${what}`).join(', ')}; ` +
     `${killedCalls.length} of the killed had called the ledger, ${unmoved} moved no money, ` +
-    `${repliedThenKilled.length} held their model's reply (${repliedThenKilled.join(', ')})`,
+    `${repliedThenKilled.length} held their model's reply (${repliedThenKilled.join(', ')}), ` +
+    `${answeredThenKilled.length} were answered before the kill landed (${answeredThenKilled.join(', ')})`,
 );
 for (const name of KILLED) {
   assert.ok(
