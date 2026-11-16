@@ -82,6 +82,22 @@ on the JavaScript thread, enters that runtime's context (`answer` in
 one namespace's garbage collection never lists another's packs. Not set,
 every pack stays in the state.
 
+`RESTATE_SQL_L0_BYTES` sets L0's 4 MiB (`StateOptions::l0_bytes`, which
+`sql::Open::options` gives every open: `state_options` in `node.rs`), as
+bytes, or with `KiB`, `MiB` or `GiB`, read at the process's first open; a
+value that is not a size fails every open with its message, as a cache size
+does. `0` puts every checkpoint's pack in the object store: the state keeps
+the head, the tail since the checkpoint before the head's (each checkpoint
+then waits for the absolute rule, 128 entries or 1 MiB, so up to about
+twice that and the entries that passed it) and the two manifests the head
+names (about 1.7 bytes per 16 KiB frame, and the records of up to 1 KiB).
+Without an object store it changes nothing. It may differ between
+processes, or opens, of a database: it changes no stored format, only the
+tier the next checkpoint's pack goes to. Every pack's name records its
+tier, which reads and garbage collection go by, so a lower value moves
+what L0 holds with the next checkpoint, and a higher one leaves the packs
+in L1 there and puts the next checkpoints in L0.
+
 ## Values
 
 | SQL     | JavaScript                                                       |

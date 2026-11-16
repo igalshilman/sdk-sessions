@@ -402,6 +402,21 @@ cluster its own path, because a database deletes the packs under its
 directory that its own head does not need. A URL that names no store fails
 every open with its message.
 
+`RESTATE_SQL_L0_BYTES` sets those 4 MiB (bytes, or with `KiB`, `MiB` or
+`GiB`, read at the process's first open). `0` puts every checkpoint's pack
+in the object store, however small the database. Restate then keeps only
+the head, the tail of recent commits (up to two checkpoints' worth: 128
+commits or 1 MiB each, plus the commit that passed it) and the last two
+checkpoints' manifests (a few bytes per 16 KiB of database, and records of
+up to 1 KiB). A cold read of anything older than the tail is an object
+store read, and each checkpoint, every 128 commits or so, an upload and a
+listing of the database's directory. Until its first checkpoint, a
+database is all tail, in Restate. The value may change from one deployment
+to the next: a lower one moves what Restate holds at the next checkpoint, a
+higher one keeps the checkpoints after it in Restate, and packs never move
+back. Without `RESTATE_SQL_OBJECT_STORE` it changes nothing; a value that
+is not a size fails every open with its message.
+
 **No journal replay.** On a retry or a resume, the SDK normally replays the
 journal: each operation returns its recorded result, and must match it.
 That can't work here, because a later attempt makes different reads,
