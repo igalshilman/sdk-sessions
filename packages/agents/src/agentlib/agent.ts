@@ -100,7 +100,9 @@ export function agent<P extends string, O = string>(definition: Options<O> & Def
  * the SDK's `TerminalError`, so a failed turn would look retryable.
  */
 function checkOneSdk(name: string) {
-  if (Object.getPrototypeOf(GuardrailError) === restate.TerminalError) return;
+  // Anywhere up the chain: agentlib's errors may have their own base (0.2.0's
+  // `GuardrailError` extends `ToolError`).
+  if (GuardrailError.prototype instanceof restate.TerminalError) return;
   throw new Error(
     `${name}: @restatedev/agentlib runs on another copy of @restatedev/restate-sdk ` +
       'than @restatedev/sessions. Install @restatedev/restate-sdk@1.18.2 ' +

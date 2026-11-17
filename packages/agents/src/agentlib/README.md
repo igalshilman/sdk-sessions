@@ -45,7 +45,7 @@ See [`examples/basic/agentlib.ts`](../../../examples/basic/agentlib.ts),
 with a transfer that waits for an approval.
 
 ```sh
-npm install @restatedev/agents @restatedev/agentlib@0.1.0 @restatedev/restate-sdk-gen@1.18.2 \
+npm install @restatedev/agents @restatedev/agentlib@0.2.0 @restatedev/restate-sdk-gen@1.18.2 \
   @restatedev/restate-sdk@1.18.2 @ai-sdk/openai   # or @ai-sdk/anthropic
 ```
 
@@ -170,10 +170,10 @@ with HTTP 424, as for every agent, and the conversation shows it unanswered.
 Any other failure of a model by name (an outage, a rate limit) fails the attempt, and Restate retries it, as
 for every agent: the model has no retry limit of its own. A model you give
 retries as you set it (`aiModel`'s `retry`; agentlib's default is 3
-attempts, then the message fails, `Failed: …`). agentlib 0.1.0 asks
-Anthropic for strict tools, which it refuses with bounded numbers (agentlib's
-own `read_tool_result` has them): an `anthropic/…` model is sent the tools'
-schemas without their numbers' bounds, which the tools still check.
+attempts, then the message fails, `Failed: …`). An `anthropic/…` model is
+sent the tools' schemas without their numbers' bounds, which the tools still
+check: agentlib 0.1.0 asked Anthropic for strict tools, which it refuses with
+bounded numbers (agentlib's own `read_tool_result` has them).
 
 ## A long conversation
 

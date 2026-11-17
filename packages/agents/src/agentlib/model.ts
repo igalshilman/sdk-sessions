@@ -119,9 +119,11 @@ export function withoutBounds(schema: unknown): unknown {
 
 /**
  * Wraps an Anthropic `model` so that it gets its tools' schemas without
- * numeric bounds. agentlib 0.1.0 asks for strict tools where a schema allows
- * it, and Anthropic refuses strict tools with bounded numbers (such as
- * agentlib's own `read_tool_result`). The tools still check their input.
+ * numeric bounds. agentlib 0.1.0 asked for strict tools where a schema
+ * allowed it, and Anthropic refuses strict tools with bounded numbers (such as
+ * agentlib's own `read_tool_result`). 0.2.0 leaves strict mode to the AI SDK's
+ * defaults; the bounds still go, which costs nothing: the tools still check
+ * their input.
  */
 function withoutSchemaBounds(model: Model): Model {
   return (request) => {

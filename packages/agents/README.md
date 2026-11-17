@@ -113,7 +113,7 @@ npm install @restatedev/agents @earendil-works/pi-ai@1.5.2 @deepseek-ai/cordis \
   @deepseek-ai/{dsh-system-prompt,dsh-tools,dsh-tool-executor-native,dsh-user-approval}@0.2.2-rc.2 \
   @deepseek-ai/{dsh-commands,dsh-compaction,dsh-compaction-basic,dsh-compaction-tool-result-pruner,dsh-token-meter}@0.2.2-rc.2   # DeepSeek
 npm install @restatedev/agents @opencode/{core,sdk,server,plugin}@2.2.7 effect@4.1.0                     # OpenCode, on Node 24
-npm install @restatedev/agents @restatedev/agentlib@0.1.0 @restatedev/restate-sdk-gen@1.18.2 \
+npm install @restatedev/agents @restatedev/agentlib@0.2.0 @restatedev/restate-sdk-gen@1.18.2 \
   @restatedev/restate-sdk@1.18.2 @ai-sdk/openai  # agentlib, and the provider of its models: or @ai-sdk/anthropic
 ```
 
