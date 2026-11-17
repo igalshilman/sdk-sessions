@@ -300,12 +300,15 @@ suspension either: an attempt that hears nothing is shut down and the next one
 runs the handler from the start. It tested machinery that no longer exists, so
 it was deleted rather than ported.
 
-`crash` is the one that still cannot follow. It serves through `e2e/serve.ts`,
-which wraps its stores with `withFaults`; a session on the VM has no
-JavaScript store to wrap, and refuses rather than quietly serving one. Fault
-injection needs a route into `VmStore` — a hook the addon consults per
-operation — before `crash` can run on this path, and that is worth designing
-rather than bolting on.
+`crash` followed last. It serves through `e2e/serve.ts` with `withFaults`,
+which wrapped its stores; a session on the VM has no JavaScript store to wrap,
+and refuses rather than quietly serving one. So `test/faults.ts` aborts the
+process at the VM's boundary instead, where every request of an attempt
+crosses into JavaScript: before the driver writes the VM's output
+(`takeOutput`: a read, a commit's tail and head, a call), and as a chunk of
+Restate's comes in once the attempt runs (`notifyInput`: a read's state, a
+commit's ack), before the VM reads it. A commit is two abort points, as it was
+with the store's `sync`, and nothing in the addon changed for it.
 
 **Every endpoint reaches the VM now.** Before decision 4, a deployment got
 there only by calling `sessions.serve`, so the e2e scripts that build their
@@ -497,10 +500,10 @@ this itself is the better end state.
   refused for the wrong reason, naming endpoint types to someone whose
   endpoint is fine. The README states the minimum.
 
-- **`crash` has no VM variant**, and is out of CI until it does.
-  `e2e/serve.ts` injects faults with `withFaults`, and a VM attempt refuses a
-  wrapped store (decision 3), so the fault injection has to reach `VmStore`
-  before the repository's crash acceptance test can run again.
+- ~~**`crash` has no VM variant**, and is out of CI until it does.~~ Fixed:
+  `test/faults.ts` aborts at the VM's boundary (`takeOutput`, `notifyInput`)
+  rather than in a wrapped store, which a VM attempt refuses (decision 3), and
+  `crash` is back in CI.
 - ~~**foyer's debug print.**~~ Fixed. shared-core#117 pinned foyer 0.22.6,
   whose `foyer-storage/src/io/device/file.rs:103` had a stray
   `println!("==========> {capacity}")`, so every process that opened a disk
