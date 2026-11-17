@@ -44,7 +44,7 @@ let requests = 0;
 const maybeAbort = () => {
   // Drawn as without the floor: a seed rolls the same numbers at the same requests.
   if (++requests === at || (random() * 1000 < perMille && performance.now() >= after)) {
-    console.error(`aborting at state request ${requests}`);
+    console.error(`aborting at request ${requests}`);
     // As abruptly as process.abort(), without a core dump or a crash report.
     process.kill(process.pid, 'SIGKILL');
   }
