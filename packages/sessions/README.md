@@ -559,12 +559,6 @@ storage in the session's database.
   attachment), even one nobody awaits: Restate then shuts the attempt down
   after the timeout, and starts the next one when the answer comes. The
   database's own reads and acks don't stop a heartbeat.
-- **A cancellation waits for the call.** Cancelling an invocation whose
-  attempt Restate shut down while it waited for a call takes effect only
-  when that call answers: until then the invocation stays suspended, for
-  good if the call never answers. So an agent's `stop` leaves a turn that
-  waits on an approval suspended, and `status` still shows it answering,
-  until the approval comes; the turn then ends cancelled.
 - **One acked write per commit.** Every commit waits for Restate to ack its
   head's write, a round trip to the runtime. Statements that commit one by
   one pay it each time, so group them in a transaction.

@@ -25,11 +25,16 @@ no single await point, no selector, no working run.
 
 ## Decisions
 
-### 0. shared-core 8.7.0, from the registry
+### 0. shared-core 8.7.1, from the registry
 
 `ExplicitRecoveryVM` was unreleased while this was written, so the addon was
 pinned to a git revision, which could not ship. 8.7.0 carries it, and the
 addon takes it as an ordinary version.
+
+8.7.1 adds one change (sdk-shared-core#120): the suspension of an attempt
+Restate shut down names the cancellation next to the calls, so that cancelling
+an invocation suspended on a call starts its next attempt. On 8.7.0 the
+cancellation took effect only when the call answered.
 
 8.7.0 also undoes the one problem the bump brought with it (see below).
 

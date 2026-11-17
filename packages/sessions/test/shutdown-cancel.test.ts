@@ -66,12 +66,9 @@ async function suspendedOn(options: SideOptions = {}) {
 }
 
 describe('an attempt shut down while a call is outstanding', () => {
-  // Waits for the shared-core release with the fix (branch
-  // `claude/cancel-wakes-a-shut-down-attempt` of restate-sdk-shared-core):
-  // 8.7.0 leaves the cancel signal out of the suspension, so cancelling the
-  // invocation takes effect only when the call answers. Once the addon is
-  // built on that release, `it.fails` itself fails: take the marker off.
-  it.fails('suspends on the cancel signal too, while no cancellation has come', async () => {
+  // The suspension names the cancel signal while no cancellation has come, so
+  // that cancelling a suspended invocation starts its next attempt.
+  it('suspends on the cancel signal too, while no cancellation has come', async () => {
     expect((await suspendedOn()).signals).toContain(CANCEL_SIGNAL);
   }, 30_000);
 
