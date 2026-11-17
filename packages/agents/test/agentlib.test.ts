@@ -170,6 +170,8 @@ describe('refused', () => {
     expect(refused(new restate.CancelledError())).toBe(false);
     class Overflow extends restate.TerminalError {}
     expect(refused(new Overflow('too long', { errorCode: 413 }))).toBe(false);
+    // A journaled overflow, as replay restores it: a plain TerminalError, 413.
+    expect(refused(new restate.TerminalError('too long', { errorCode: 413 }))).toBe(false);
     expect(refused(new Error('fetch failed'))).toBe(false);
   });
 });
