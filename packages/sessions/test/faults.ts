@@ -1,5 +1,5 @@
 // Fault injection for crash tests: with ABORT_PER_MILLE, the process aborts
-// at random requests of the objects' stores to Restate; and with ABORT_AT, at
+// at random requests of the session objects to Restate; and with ABORT_AT, at
 // that request (counted from 1), so that it aborts at least once. ABORT_SEED
 // seeds the random aborts: a process given the same seed aborts at the same of
 // its requests (the requests themselves depend on timing). With
@@ -10,17 +10,28 @@
 // more requests, bring the next abort sooner. A lifetime floor bounds how
 // often a process dies whatever the load. ABORT_AT is not held back by it.
 //
-// A request is what an attempt awaits of Restate: a read (`get`), the state's
-// keys (`keys`), a sync. It aborts before each, and after a sync too: a
-// commit stored, and the attempt killed before it awaits anything more.
-// Writes (`set`, `clear`) are commands the SDK sends with the next request,
-// so killing the process between two of them is killing it before that
-// request: they are no abort points of their own. As they were, a commit
-// that writes many keys (a checkpoint, deleting a long tail) rolled for an
-// abort at each write, twice, and hardly ever survived; a key whose every
-// commit is one could not commit at all.
+// A request is what an attempt asks of Restate and awaits: a read of the
+// object's state, a commit's writes, a call. A session object's attempt runs
+// on the explicit recovery VM, whose store is in the addon: its reads and
+// writes never cross into JavaScript, so there is no store here to wrap
+// (`withStoreWrapper` is refused on the VM). They cross the VM's boundary
+// instead, and the process aborts there:
+//
+//   - before a request goes out: as the attempt's driver takes the VM's
+//     output (`takeOutput`), before it is written. A read, a commit's tail and
+//     head, a call, the answer at the end: what was buffered is lost with the
+//     process;
+//   - after it is answered: as a chunk of Restate's comes in once the attempt
+//     runs (`notifyInput`), before the VM reads it. A read's state, or the ack
+//     of a commit: the commit stored, and the attempt killed before it acts
+//     on anything more.
+//
+// The invocation's own input, before the handler starts, is no abort point;
+// neither is a turn that writes nothing. A commit is one request, whatever
+// it writes: two abort points, as a commit was when the store's sync was its
+// abort point.
 import * as restate from '@restatedev/restate-sdk';
-import { served, type Store, withStoreWrapper } from '@restatedev/sessions/internal';
+import { served, Vm } from '@restatedev/sessions/internal';
 import { fileURLToPath } from 'node:url';
 import { seeded, seedFromEnv } from './random.ts';
 
@@ -39,35 +50,36 @@ const maybeAbort = () => {
   }
 };
 
-/** `store`, aborting the process at its requests (see above). */
-const faulty = (store: Store): Store => ({
-  get: async (key) => {
-    maybeAbort();
-    return store.get(key);
-  },
-  set: (key, value) => store.set(key, value),
-  clear: (key) => store.clear(key),
-  sync: async () => {
-    maybeAbort();
-    await store.sync();
-    maybeAbort();
-  },
-  // A store that cannot list its keys stays one: it is never swept.
-  keys:
-    store.keys &&
-    (async () => {
-      maybeAbort();
-      return store.keys!();
-    }),
-});
+/** Abort the process at the requests of every attempt on the VM (see above), once per process. */
+let installed = false;
+function abortAtRequests() {
+  if (installed) return;
+  installed = true;
+  const vm = (Vm as unknown as { prototype: Vm }).prototype;
+  // The addon's own, called with the attempt's VM as `this`.
+  const original = (name: keyof Vm): unknown => Object.getOwnPropertyDescriptor(vm, name)!.value;
+  const takeOutput = original('takeOutput') as (this: Vm) => Buffer;
+  vm.takeOutput = function (this: Vm) {
+    const output = takeOutput.call(this);
+    if (output.length > 0) maybeAbort();
+    return output;
+  };
+  const notifyInput = original('notifyInput') as (this: Vm, chunk: Uint8Array) => void;
+  vm.notifyInput = function (this: Vm, chunk: Uint8Array) {
+    if (this.isReadyToExecute()) maybeAbort();
+    notifyInput.call(this, chunk);
+  };
+}
 
 /**
  * `services`, with what they need beside them (`served`: an agent's
- * companion, say), their session objects' stores aborting the process with
- * ABORT_PER_MILLE.
+ * companion, say), the process aborting at their session objects' requests
+ * with ABORT_PER_MILLE or ABORT_AT.
  */
-export const withFaults = (services: restate.ServeOptions['services']): restate.ServeOptions['services'] =>
-  perMille > 0 ? served(services).map((service) => withStoreWrapper(service, faulty)) : served(services);
+export const withFaults = (services: restate.ServeOptions['services']): restate.ServeOptions['services'] => {
+  if (perMille > 0 || at > 0) abortAtRequests();
+  return served(services);
+};
 
 /** Serve `services` when `meta` is the entry module's `import.meta`. */
 export function serveIfMain(meta: ImportMeta, services: restate.ServeOptions['services']) {
