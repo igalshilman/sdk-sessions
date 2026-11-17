@@ -198,7 +198,8 @@ pub(crate) struct VmInner {
 impl VmInner {
     /// Take every notification the VM has ready, handing Rust's to their
     /// waiters and queueing the rest for JavaScript. Once the attempt is
-    /// closed with an error, every waiter gets it.
+    /// closed with an error, every waiter fails: with the attempt's end if
+    /// Restate shut it down, with the error otherwise.
     fn route(&mut self) -> std::result::Result<(), Error> {
         loop {
             match self.vm.take_next_notification() {
@@ -214,8 +215,21 @@ impl VmInner {
                 },
                 Ok(None) => return Ok(()),
                 Err(error) => {
+                    // What the driver's own awaits fail with: the attempt's
+                    // end if Restate shut it down, which `src/database.ts`
+                    // knows by this text, and otherwise why it failed. A
+                    // commit that a shutdown interrupts is then told apart
+                    // from an error of the handler's own, as a call is.
+                    let for_waiters = if error.is_suspended_error() {
+                        Error::new(
+                            restate_sdk_shared_core::error::codes::INTERNAL,
+                            ATTEMPT_OVER.to_owned(),
+                        )
+                    } else {
+                        error.clone()
+                    };
                     for (_, waiter) in self.rust_waiters.drain() {
-                        let _ = waiter.send(Err(error.clone()));
+                        let _ = waiter.send(Err(for_waiters.clone()));
                     }
                     return Err(error);
                 }

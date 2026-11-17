@@ -9,209 +9,23 @@ import { describe, expect, it } from 'vitest';
 import * as restate from '@restatedev/sessions';
 import { database, HEAD_KEY, start } from '@restatedev/sessions/internal';
 import { CancelledError } from '@restatedev/restate-sdk';
-import { serveSession, servedHere, type Stream } from '../src/handler.ts';
-import { bytes, decode, field, frame, uint } from './wire.ts';
-import { messages, REQUESTED_ACK, TYPE as BASE, V8, value } from './vm-support.ts';
-
-const TYPE = {
-  ...BASE,
-  getStateKeys: 0x0406,
-  getStateKeysCompletion: 0x8006,
-  run: 0x0411,
-  oneWayCall: 0x040e,
-} as const;
-
-const text = (b: Uint8Array | undefined) => (b === undefined ? undefined : Buffer.from(b).toString());
+import { serveSession, servedHere } from '../src/handler.ts';
+import { commits, pause, restateSide, said, seeded as seededBy, text, TYPE } from './side.ts';
+import { decode } from './wire.ts';
+import { REQUESTED_ACK, V8 } from './vm-support.ts';
 
 /**
- * Restate's side: it holds the object's state, answers the reads, applies the
- * writes, and acks the commands that asked to be acked.
+ * The state an earlier invocation of `key` left: its schema is applied. On a
+ * key never written, an attempt's first commit is the schema's, made as the
+ * session opens, and that is the one `cancelOnCommit` would land on. After
+ * this, it is the handler's own.
  */
-function restateSide(state = new Map<string, Uint8Array>(), { cancelOnCommit = false, cancelAtStart = false } = {}) {
-  const chunks: Uint8Array[] = [];
-  let resolveChunk: (() => void) | undefined;
-  let closed = false;
-  /**
-   * The journal index of the last command seen. Restate numbers *every*
-   * command, so an ack must count the calls too, not only the writes.
-   */
-  let index = 0; // the input is the journal's first command, at index 0
+const seeded = (key: string) => seededBy(notes, 'add', key, 'seed');
 
-  const inbound: Uint8Array[] = [];
-  const toSdk = {
-    push(chunk: Uint8Array) {
-      inbound.push(chunk);
-      resolveChunk?.();
-      resolveChunk = undefined;
-    },
-    close() {
-      closed = true;
-      resolveChunk?.();
-      resolveChunk = undefined;
-    },
-  };
-
-  const body: AsyncIterable<Uint8Array> = {
-    async *[Symbol.asyncIterator]() {
-      for (;;) {
-        while (inbound.length > 0) yield inbound.shift()!;
-        if (closed) return;
-        await new Promise<void>((resolve) => (resolveChunk = resolve));
-      }
-    },
-  };
-
-  let head: { status: number; headers: Record<string, string> } | undefined;
-  let ended = false;
-  /** How many of the attempt's messages have been answered. */
-  let answered = 0;
-  /** Whether the one cancel signal has been sent (`cancelOnCommit`). */
-  let signalled = false;
-  const stream: Stream = {
-    headers: { 'content-type': V8 },
-    body,
-    writeHead: (status, headers) => void (head = { status, headers }),
-    write: (chunk) => void chunks.push(chunk),
-    close: () => void (ended = true),
-  };
-
-  return {
-    stream,
-    get head() {
-      return head;
-    },
-    get ended() {
-      return ended;
-    },
-    /** Everything the attempt wrote, as messages. */
-    sent: () => messages(Buffer.concat(chunks)),
-    /** Start the invocation for `key` with `input`. */
-    start(key: string, input: unknown) {
-      toSdk.push(
-        frame(TYPE.start, [
-          ...bytes(1, [1, 2, 3, 4]),
-          ...bytes(2, 'inv_test'),
-          // Known entries: the input, and for a retry of a cancelled
-          // invocation the signal the earlier attempt got. Restate sends
-          // every attempt the entries of the ones before it, and the VM is
-          // not ready to execute until it has them.
-          ...uint(3, cancelAtStart ? 2 : 1),
-          ...[...state].flatMap(([k, v]) => field(4, 2, [...bytes(1, k), ...bytes(2, [...v])])),
-          ...bytes(6, key),
-        ]),
-      );
-      toSdk.push(frame(TYPE.input, bytes(14, value(JSON.stringify(input)))));
-      // A retry of a cancelled invocation: the signal is among the entries of
-      // the earlier attempts, so the VM knows before the handler starts.
-      if (cancelAtStart) toSdk.push(frame(TYPE.signal, [...uint(2, 1), ...bytes(4, [])]));
-    },
-    /**
-     * Restate cancels the invocation now. Called while the handler works
-     * outside Restate, nothing of the attempt is waiting and the
-     * cancellation is carried to its next wait.
-     */
-    cancel() {
-      toSdk.push(frame(TYPE.signal, [...uint(2, 1), ...bytes(4, [])]));
-    },
-    /**
-     * Answer what the attempt asks for until it ends, then close the request
-     * body. Closing it earlier is what Restate's inactivity timeout does, and
-     * would shut the attempt down.
-     */
-    async settle({ ms = 20_000 } = {}) {
-      const deadline = Date.now() + ms;
-      for (;;) {
-        if (ended || Date.now() >= deadline) break;
-        await new Promise((resolve) => setTimeout(resolve, 1));
-        const sent = messages(Buffer.concat(chunks));
-        for (const message of sent.slice(answered)) {
-          answered++;
-          // Commands are journaled and numbered; ephemeral commands (0x02xx)
-          // and notifications (0x8xxx) are not.
-          if (message.type >= 0x0400 && message.type < 0x8000) {
-            index++;
-            // Restate acks a stored command; the VM waits for the ack of the
-            // sync's clear, and ignores the rest.
-            // Restate acks a command only if it asked to be acked, and the
-            // ack of one covers every command before it. Acking the rest
-            // would answer a commit that is still waiting.
-            if ((message.flags & REQUESTED_ACK) !== 0) {
-              // Cancelling instead of acking is a cancellation that lands
-              // with the database waiting on Restate.
-              // Restate signals a cancellation once, not on every commit:
-              // what follows it is acked as usual, so the handler can see
-              // its first call fail and carry on, as it does on the
-              // selector's path.
-              const signalNow = cancelOnCommit && !signalled;
-              signalled ||= signalNow;
-              if (signalNow) toSdk.push(frame(TYPE.signal, [...uint(2, 1), ...bytes(4, [])]));
-              toSdk.push(frame(TYPE.commandAck, uint(1, index)));
-            }
-          }
-          if (message.type === TYPE.getStateEphemeral) {
-            const key = text(message.fields.get(2)?.[0] as Uint8Array)!;
-            const id = message.fields.get(1)![0] as number;
-            const held = state.get(key);
-            toSdk.push(
-              frame(TYPE.getStateEphemeralNotification, [
-                ...uint(1, id),
-                ...(held === undefined ? field(4, 2, []) : field(5, 2, value(held))),
-              ]),
-            );
-          } else if (message.type === TYPE.setState) {
-            const key = text(message.fields.get(1)?.[0] as Uint8Array)!;
-            const wrapped = decode(message.fields.get(3)![0] as Uint8Array);
-            state.set(key, wrapped.get(1)![0] as Uint8Array);
-          } else if (message.type === TYPE.clearState) {
-            state.delete(text(message.fields.get(1)?.[0] as Uint8Array)!);
-          } else if (message.type === TYPE.call) {
-            const id = message.fields.get(10)![0] as number;
-            toSdk.push(frame(TYPE.callInvocationIdCompletion, [...uint(1, id), ...bytes(16, 'inv_started')]));
-            // A call to key `k` is never answered: that is what a `start()`ed
-            // call, whose result nobody holds, looks like to the handler.
-            if (text(message.fields.get(5)?.[0] as Uint8Array) !== 'k') {
-              const result = message.fields.get(11)![0] as number;
-              const echoed = text(message.fields.get(3)![0] as Uint8Array)!;
-              toSdk.push(frame(TYPE.callCompletion, [...uint(1, result), ...field(5, 2, value(echoed))]));
-            }
-          } else if (message.type === TYPE.getStateKeys) {
-            const id = message.fields.get(11)![0] as number;
-            toSdk.push(
-              frame(TYPE.getStateKeysCompletion, [
-                ...uint(1, id),
-                ...field(
-                  5,
-                  2,
-                  [...state.keys()].flatMap((k) => bytes(1, k)),
-                ),
-              ]),
-            );
-          }
-        }
-        // The attempt is over once it has said so; nothing more will come.
-        if (sent.some((m) => m.type === TYPE.end || m.type === TYPE.error)) break;
-      }
-      if (!ended && !messages(Buffer.concat(chunks)).some((m) => m.type === TYPE.end || m.type === TYPE.error)) {
-        // Closing the body here is what Restate's inactivity timeout does, and
-        // the attempt would report a shutdown — which reads as a puzzling
-        // assertion failure rather than as the hang it is.
-        throw new Error(`the attempt did not end within ${ms}ms`);
-      }
-      toSdk.close();
-    },
-    state,
-  };
-}
-
-/** How `step` ended: `ok`, or the name of what it failed with. */
-async function said(step: () => Promise<unknown>): Promise<string> {
-  try {
-    await step();
-    return 'ok';
-  } catch (error) {
-    return error instanceof CancelledError ? 'CancelledError' : (error as Error).name;
-  }
-}
+/** What `cleansUp` saw once its attempt was shut down: nothing such an attempt returns is written. */
+const afterShutDown: string[] = [];
+/** Lets `cleansUp` go on, once it is waiting. */
+let goOn: (() => void) | undefined;
 
 const notes = restate.sessionObject({
   name: 'Notes',
@@ -245,6 +59,17 @@ const notes = restate.sessionObject({
       await new Promise((resolve) => setTimeout(resolve, 300));
       const read = () => ctx.db.get('SELECT count(*) AS n FROM notes');
       return `${commit},${await said(read)},${await said(read)}`;
+    },
+    /**
+     * Works outside Restate until the test lets it go on, then cleans up with
+     * its database and a call, and notes how each ended.
+     */
+    cleansUp: async (ctx: restate.SessionContext) => {
+      await new Promise<void>((resolve) => (goOn = resolve));
+      const db = await said(() => ctx.db.execute('INSERT INTO notes (body) VALUES (?)', ['x']));
+      const call = await said(() => ctx.rpc({ service: 'Callee', key: 'a', handler: 'echo', input: 'A' }));
+      afterShutDown.push(`${db},${call}`);
+      return 'unwritten';
     },
     /** A commit, then a call: which of the two a cancellation failed. */
     commitThenCall: async (ctx: restate.SessionContext) => {
@@ -356,6 +181,32 @@ const notes = restate.sessionObject({
   },
 });
 
+/**
+ * Run `cleansUp` on `key` until Restate shuts its attempt down, after a
+ * cancellation that nothing was waiting for if `cancelFirst`; what its
+ * clean-up saw.
+ */
+async function shutDown(key: string, cancelFirst: boolean): Promise<string | undefined> {
+  goOn = undefined;
+  const r = restateSide();
+  const serving = serveSession(notes, 'cleansUp', r.stream);
+  r.start(key, null);
+  const settling = r.settle();
+  // The session opened, and the handler is working outside Restate.
+  await pause(50);
+  expect(goOn, 'the handler is waiting').toBeDefined();
+  if (cancelFirst) {
+    r.cancel();
+    await pause(20); // nothing waits: the cancellation is carried
+  }
+  r.shutDown();
+  await pause(20); // the attempt is over
+  goOn!();
+  await serving;
+  await settling;
+  return afterShutDown.pop();
+}
+
 describe('a session object served on the explicit recovery VM', () => {
   it('serves only the protocol versions the VM accepts', () => {
     expect(servedHere({ 'content-type': V8 })).toBe(true);
@@ -399,7 +250,7 @@ describe('a session object served on the explicit recovery VM', () => {
     // a handler could not tell from `CancelledError` whether its write
     // happened. The commit runs to its end and says so; the cancellation is
     // owed to the handler's next await, and this handler has none.
-    const state = new Map<string, Uint8Array>();
+    const state = await seeded('k5');
     const r = restateSide(state, { cancelOnCommit: true });
     const serving = serveSession(notes, 'commits', r.stream);
     r.start('k5', null);
@@ -409,6 +260,17 @@ describe('a session object served on the explicit recovery VM', () => {
     const answered = decode(output!.fields.get(14)![0] as Uint8Array);
     expect(text(answered.get(1)![0] as Uint8Array)).toBe('"committed"');
     expect(state.has(HEAD_KEY)).toBe(true);
+    // The premise: the attempt made one commit, the handler's, so that is
+    // the one the signal landed on.
+    expect(commits(r.sent())).toBe(1);
+    // And what it committed is there to read: the seed's row, and this one.
+    const after = restateSide(state);
+    const reading = serveSession(notes, 'add', after.stream);
+    after.start('k5', 'third');
+    await after.settle();
+    await reading;
+    const count = after.sent().find((m) => m.type === TYPE.output);
+    expect(text(decode(count!.fields.get(14)![0] as Uint8Array).get(1)![0] as Uint8Array)).toBe('3');
   }, 30_000);
 
   it('a cancellation that lands on a commit in flight is delivered once, to the await after it', async () => {
@@ -416,7 +278,7 @@ describe('a session object served on the explicit recovery VM', () => {
     // the addon once each decided whether to carry it: the addon failed the
     // commit, the driver carried its own to the call, and the handler saw
     // two.
-    const r = restateSide(new Map(), { cancelOnCommit: true });
+    const r = restateSide(await seeded('k6'), { cancelOnCommit: true });
     const serving = serveSession(notes, 'commitThenCall', r.stream);
     r.start('k6', null);
     await r.settle();
@@ -424,6 +286,21 @@ describe('a session object served on the explicit recovery VM', () => {
     const output = r.sent().find((m) => m.type === TYPE.output);
     const answered = decode(output!.fields.get(14)![0] as Uint8Array);
     expect(text(answered.get(1)![0] as Uint8Array)).toBe('"ok,CancelledError"');
+    // The premise: the attempt made one commit, the handler's, so that is
+    // the one the signal landed on.
+    expect(commits(r.sent())).toBe(1);
+  }, 30_000);
+
+  it('once the attempt is shut down, a carried cancellation is not delivered: the attempt is over', async () => {
+    // What the handler does after a shutdown fails with the attempt's end,
+    // and the attempt that follows gets the cancellation. A `CancelledError`
+    // there is terminal to whatever cleans up, for an invocation that will
+    // be retried.
+    const without = await shutDown('ks1', false);
+    const carried = await shutDown('ks2', true);
+    expect(carried).not.toContain('CancelledError');
+    expect(carried).toBe(without);
+    expect(without).toMatch(/,AttemptShutDown$/);
   }, 30_000);
 
   it('a view reads, and writes nothing: its sync has nothing to store', async () => {

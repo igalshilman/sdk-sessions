@@ -340,6 +340,10 @@ export class AttemptDriver {
    * nothing.
    */
   takeCarriedCancellation(): boolean {
+    // The attempt is over: what the handler does then fails with that, as
+    // its awaits of Restate do, and the attempt that follows gets the
+    // cancellation.
+    if (this.ended !== undefined) return false;
     const carried = this.carriedCancellation;
     this.carriedCancellation = false;
     return carried;

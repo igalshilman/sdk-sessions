@@ -99,9 +99,11 @@ over the real one.
 
 `RESTATE_SERVE_ONLY=a,b` serves only the services it names, each with what
 it needs: one program, deployed in parts. For anything else (another port,
-HTTP/1.1, a Lambda handler), the SDK's `restate.endpoint()` is there as
-ever: bind it what `restate.served([...services])` lists, the services with
-what they need.
+an HTTP/1.1 server), the SDK's `restate.endpoint()` is there as ever: bind
+it what `restate.served([...services])` lists, the services with what they
+need. A session object needs a bidirectional stream, so an HTTP/1.1 handler
+serves one only when built with `{ bidirectional: true }`
+([not supported](#not-supported)).
 
 ### The contexts
 
@@ -154,8 +156,9 @@ views: {
 ## Retries
 
 A handler runs in attempts. Restate starts a new attempt after a crash, a
-retryable error or a suspension, and every attempt runs the handler from its
-first line. A commit is durable once its promise resolves, and every later
+retryable error or a shutdown of the attempt (see
+[the caveats](#caveats)), and every attempt runs the handler from its first
+line. A commit is durable once its promise resolves, and every later
 attempt sees it. An error, terminal or not, doesn't undo what the handler
 already committed.
 
@@ -248,11 +251,11 @@ ctx.send(audit).record(entry);
 ```
 
 The SDK never makes up idempotency keys: a call has one only if you pass it.
-With a key, a new attempt, including one resuming from a suspension, reaches
-the invocation the first attempt started and gets its result. Build the key
-from the request id and what the call is for. Restate scopes keys to the
-target handler and remembers them for the target's idempotency retention, a
-day by default.
+With a key, a new attempt, including one Restate starts when the call
+answers, reaches the invocation the first attempt started and gets its
+result. Build the key from the request id and what the call is for. Restate
+scopes keys to the target handler and remembers them for the target's
+idempotency retention, a day by default.
 
 A key names one call. If an invocation makes the same call several times,
 once per tool call for example, add something to the key that tells them
@@ -314,7 +317,9 @@ it. A retry of a cancelled invocation, after a crash, gets the cancellation
 at its first await; the open that makes what the crash left in the outbox is
 the session's own, and is not failed. No attempt follows a cancelled one, so as an attempt ends, a
 session that a failure ended is opened again, which makes what the outbox
-holds and empties it.
+holds and empties it. Once Restate has shut an attempt down, a cancellation
+carried to its next await is not delivered: what the handler does then
+fails with the attempt's end, and the next attempt gets the cancellation.
 
 ## Sends in a transaction
 
@@ -337,8 +342,9 @@ with the idempotency key `transaction/<id>/<index>` (or the send's own key),
 where `<id>` is a random id of the transaction. Then, before `transaction()`
 resolves, a second commit empties the outbox. Restate stores an attempt's
 commands in order, so the sends are stored by the time that commit is. An
-attempt that suspends later, to wait days for an approval for example, has
-nothing left to send again when it resumes, long after the keys expired.
+attempt that Restate shuts down later, while it waits days for an approval
+for example, leaves the next attempt nothing to send again, long after the
+keys expired.
 
 If an attempt ends between the two commits, the sends stay in the outbox.
 The next exclusive attempt opens the database when it starts, and sends them
@@ -362,25 +368,30 @@ record its outcome in the transaction. The shop's `Orders` does this, and its
 
 **Where the data lives.** The database is stored in the object's state,
 under the keys `v22/head`, `v22/tail/…`, `v22/manifest/…` and `v22/pack/…`.
-Reads are `ctx.get`, writes are `ctx.set` and `ctx.clear`, and a sync is an
-empty `ctx.run`. Handlers and views can't reach any other state key, since
-a session has no key/value state of its own.
+The addon reads and writes them as the attempt's own state commands, and a
+write that must be stored before the database goes on asks Restate to ack
+it. Handlers and views can't reach any other state key, since a session has
+no key/value state of its own.
 
-**Reads and writes.** A read is a state read. It is journaled for now (once
-protocol v8 ships it won't be), and it goes
-to the runtime unless this attempt wrote the key or the invocation started
-with it. An invocation starts with only the database's head (`state:
-{ preload: ['v22/head'] }`): its open's first read needs no round trip, and
-it doesn't start by loading every page. A write or a clear is a state write, and returns at once.
-Restate keeps an attempt's writes and sends in the order they were made, so
-a crash can lose the last ones, but never a write without those before it.
+**Reads and writes.** A read is a state read. It goes to the runtime unless
+this attempt wrote the key or the invocation started with it. An invocation
+starts with only the database's head (`state: { preload: ['v22/head'] }`):
+its open's first read needs no round trip, and it doesn't start by loading
+every page. On service protocol v8, a read that goes to the runtime is an
+ephemeral get, which the journal doesn't record; on v7, which Restate 1.8
+negotiates, it is a lazy get, recorded in the journal with its value. A
+write or a clear is a state write, and returns at once. Restate keeps an
+attempt's writes and sends in the order they were made, so a crash can lose
+the last ones, but never a write without those before it.
 
 **Commits.** A transaction writes the pages it changed, and its records, as
 one tail entry under a key of its own. Then it writes the head, which points
-to that entry; this is the commit point. One empty `ctx.run` then waits until
-all of it is stored, so a commit is one round trip. Whatever a crash keeps,
-the stored head only points to tail entries and checkpoints that are stored
-too. Now and then, a commit first folds the tail into a checkpoint (see the
+to that entry; this is the commit point. The head's write asks Restate for
+an ack, which Restate gives only once the writes before it are stored, and
+the commit waits for that ack, so a commit is one round trip. Whatever a
+crash keeps, the stored head only points to tail entries and checkpoints
+that are stored too. Now and then, a commit first folds the tail into a
+checkpoint (see the
 [state's architecture](native/src/state/docs/ARCHITECTURE.md)).
 
 **The page cache.** The process caches the pages it read and wrote, and the
@@ -428,8 +439,8 @@ journal: each operation returns its recorded result, and must match it.
 That can't work here, because a later attempt makes different reads,
 depending on what the page cache holds. With explicit recovery
 (`restate.internal.explicitRecovery()`, which every session handler and view
-has), the SDK skips the recorded journal, and the handler runs again from
-the start against the state as it is. Recovery is then up to the storage:
+has), the attempt skips the recorded journal, and the handler runs again
+from the start against the state as it is. Recovery is then up to the storage:
 opening the database reads the head, so a commit the crashed attempt didn't
 finish is as if it never started.
 
@@ -440,7 +451,7 @@ alongside them.
 
 ## Concurrent awaits
 
-You can await a context's calls (the SDK's `RestatePromise`s) and the
+You can await a context's calls and the
 database's calls concurrently: with `Promise.all`, `Promise.race`, your own
 combinators, several async functions at once, or a library's. The database's
 own reads run concurrently too.
@@ -461,8 +472,8 @@ contend for, so a handler awaits whatever it likes.
 `NodeEndpoint.prototype` — the class `restate.endpoint()`, `restate.serve`
 and `connect`'s tunnel all build theirs from. That prototype and the
 endpoint's builder are SDK internals as of 1.18.2, so the package pins that
-version. A fetch endpoint is not built from it and cannot serve a session
-object; it is refused rather than half-served.
+version. A fetch or Lambda endpoint is not built from it and cannot serve a
+session object; it is refused rather than half-served.
 
 What you get:
 
@@ -470,8 +481,9 @@ What you get:
   handle, so a call awaited late isn't held up by a slow call made earlier.
 - **An operation starts when you make it.** A call goes out without an
   `await`, and a failure nobody awaits is not an unhandled rejection.
-- **Cancellation reaches every awaited promise**, and each one rejects with
-  `CancelledError`.
+- **Cancellation reaches every awaited call**, and each one rejects with
+  `CancelledError`; a `ctx.db` call already under way runs to its end
+  ([cancelling an invocation](#cancelling-an-invocation)).
 
 ```ts
 const quote = restate.sessionObject({
@@ -528,22 +540,39 @@ storage in the session's database.
 
 ## Caveats
 
-- **Every read is journaled with its value.** A state read adds the value to
-  the invocation's journal, so reading pages costs log writes, and the page
-  cache matters more than usual. A completed invocation's journal, reads
-  included, is kept for Restate's default retention.
+- **On protocol v7, every read is journaled with its value.** A state read
+  that goes to the runtime adds the value to the invocation's journal, so
+  reading pages costs log writes, and the page cache matters more than
+  usual. Restate 1.8 negotiates v7; on v8 such a read is ephemeral. A
+  completed invocation's journal, reads included, is kept for Restate's
+  default retention.
 - **The journal grows across attempts.** Entries an attempt skips stay, and
   each attempt adds its own.
-- **A suspension is a restart.** Resuming means running from the start, so a
-  long handler that hits the inactivity timeout starts over.
-- **One sync per commit.** Every commit waits for an empty `ctx.run` after
-  its head, a round trip to the runtime. Statements that commit one by one
-  pay it each time, so group them in a transaction.
+- **A shutdown is a restart.** Restate shuts an attempt down once its
+  inactivity timeout passes with nothing heard from it, and the next attempt
+  runs from the start. While the handler works outside Restate (a model
+  request, say), the attempt sends a heartbeat every 20 seconds
+  (`RESTATE_SESSIONS_HEARTBEAT`, in milliseconds), so a long handler keeps
+  its attempt. A deployment that shortens Restate's inactivity timeout must
+  shorten this with it. No heartbeat is sent while an answer of Restate's is
+  outstanding (a call's result or invocation id, a send's invocation id, an
+  attachment), even one nobody awaits: Restate then shuts the attempt down
+  after the timeout, and starts the next one when the answer comes. The
+  database's own reads and acks don't stop a heartbeat.
+- **A cancellation waits for the call.** Cancelling an invocation whose
+  attempt Restate shut down while it waited for a call takes effect only
+  when that call answers: until then the invocation stays suspended, for
+  good if the call never answers. So an agent's `stop` leaves a turn that
+  waits on an approval suspended, and `status` still shows it answering,
+  until the approval comes; the turn then ends cancelled.
+- **One acked write per commit.** Every commit waits for Restate to ack its
+  head's write, a round trip to the runtime. Statements that commit one by
+  one pay it each time, so group them in a transaction.
 - **10 GiB per database.** A statement that would grow a key's database past
   that fails with SQLite's "database or disk is full", as an SQL error (a
   `TerminalError`), and `ctx.db` keeps working.
-- **Assumptions still to confirm with the runtime.** An empty `ctx.run` is
-  acknowledged only after the commands before it are stored (the sync). An
+- **Assumptions still to confirm with the runtime.** A state write's ack
+  comes only after the commands before it are stored (the sync). An
   abandoned attempt's commands are never applied after a new attempt starts
   (fencing). State that a lazy read returns is durable. The crash tests kill
   processes, so they check recovery, not durability across a machine crash.
@@ -553,8 +582,11 @@ storage in the session's database.
 - Key/value state, durable steps, timers and awakeables in a session object.
   Put them in a regular `restate.object`, `service` or `workflow`, and call
   it.
-- Request/response deployments, such as Lambda. They suspend at every
-  await, and for a session a suspension is a restart.
+- Request/response deployments, such as Lambda. A session object needs a
+  bidirectional stream. A handler of `restate.endpoint()` that has none
+  (HTTP/1.1, unless built with `{ bidirectional: true }`, or HTTP/2 built
+  with `{ bidirectional: false }`) fails the invocation, which pauses it. A
+  fetch or Lambda endpoint refuses it.
 
 ## Tests
 
