@@ -1,5 +1,6 @@
 // The agentlib agent's model: a model by name (`openai/…`, `anthropic/…`) or
 // one of agentlib's, and how its provider's refusals end a turn.
+import { isContextOverflow } from '@restatedev/agentlib';
 import type { CompactionPolicy, Model, ModelRequest } from '@restatedev/agentlib';
 import type { aiModel } from '@restatedev/agentlib/provider';
 import { sdk as restate } from '@restatedev/sessions/internal';
@@ -74,10 +75,13 @@ async function loadLanguageModel(
  * does not change: a request answered with a 4xx (a wrong API key, an unknown
  * model, a rejected request), or a missing API key. Only a plain
  * `TerminalError` qualifies: agentlib's own errors (an overflow, a protocol
- * error) and cancellations are subclasses.
+ * error) and cancellations are subclasses. An overflow is never one: it is a
+ * subclass only on the first attempt, and replay restores it as a plain
+ * `TerminalError` with code 413, which agentlib still has to see to compact.
  */
 export function refused(error: unknown): error is restate.TerminalError {
   if (!(error instanceof restate.TerminalError)) return false;
+  if (isContextOverflow(error)) return false;
   if (error.constructor !== restate.TerminalError) return false;
   const clientError = error.code >= 400 && error.code < 500;
   return clientError || /API key/i.test(error.message);
@@ -119,9 +123,11 @@ export function withoutBounds(schema: unknown): unknown {
 
 /**
  * Wraps an Anthropic `model` so that it gets its tools' schemas without
- * numeric bounds. agentlib 0.1.0 asks for strict tools where a schema allows
- * it, and Anthropic refuses strict tools with bounded numbers (such as
- * agentlib's own `read_tool_result`). The tools still check their input.
+ * numeric bounds. agentlib 0.1.0 asked for strict tools where a schema
+ * allowed it, and Anthropic refuses strict tools with bounded numbers (such as
+ * agentlib's own `read_tool_result`). 0.2.0 leaves strict mode to the AI SDK's
+ * defaults; the bounds still go, which costs nothing: the tools still check
+ * their input.
  */
 function withoutSchemaBounds(model: Model): Model {
   return (request) => {

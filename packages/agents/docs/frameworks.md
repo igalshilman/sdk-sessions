@@ -841,7 +841,7 @@ and its ask never settles. An ask of no tool call is denied.
 
 ## agentlib
 
-`@restatedev/agentlib` 0.1.0, on `@restatedev/restate-sdk-gen` 1.18.2.
+`@restatedev/agentlib` 0.2.0, on `@restatedev/restate-sdk-gen` 1.18.2.
 [`src/agentlib/`](../src/agentlib). Not on the conversation of turns, nor
 in a session object: it is the one integration on the classic Restate SDK.
 
@@ -909,8 +909,9 @@ in a session object: it is the one integration on the classic Restate SDK.
   own (`retry: {}`): an outage fails the attempt, and the object's retry
   policy (every agent's) retries it; a 4xx, or a missing API key, is a
   refusal (424). agentlib 0.1.0's `aiModel`
-  asks for strict tools where the schema allows; Anthropic refuses strict
-  tools with bounded numbers, so its tools' schemas go without them.
+  asked for strict tools where the schema allowed, and Anthropic refuses strict
+  tools with bounded numbers, so its tools' schemas go without them (0.2.0
+  leaves strict mode to the AI SDK; the tools still check their input).
 - **Tests**: [`e2e/agentlib.ts`](../../e2e/agentlib.ts), against a real
   server: a signal's wait, steering, `messages` by page, cursor and
   summary, `sync`, a denied approval, a stop, a refusal, `clear`, Restate's
