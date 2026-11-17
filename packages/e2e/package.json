@@ -8,14 +8,16 @@
   "scripts": {
     "crash": "node crash.ts",
     "concurrency": "node concurrency.ts",
-    "suspension": "node suspension.ts",
     "versions": "node versions.ts",
     "tools": "node restate-tools.ts",
     "steering": "node steering.ts",
     "bench": "node bench.ts",
     "serve": "node serve.ts",
     "packaging": "node packaging.ts",
-    "agentlib": "node agentlib.ts"
+    "agentlib": "node agentlib.ts",
+    "explicit-recovery": "node explicit-recovery.ts",
+    "leak": "node --expose-gc leak.ts",
+    "identity": "node identity.ts"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "1.5.2",

@@ -1,9 +1,9 @@
 // Session objects (@restatedev/sessions), against a real Restate server: their
 // handlers run with explicit recovery (a retried attempt starts over, against
 // the database as committed), and their operations are awaited concurrently,
-// with native or hand-written combinators (@restatedev/sessions' promise selector
-// drives them all); a suspension waits for any of them, and a cancellation
-// reaches all of them. With lazy state, every page the database reads is a
+// with native or hand-written combinators: the explicit recovery VM settles
+// each as its result arrives. A cancellation reaches what the handler awaits
+// of Restate, once. With lazy state, every page the database reads is a
 // request to the server. A wait is a call to a journaled service, `Helper`,
 // which sleeps.
 //
@@ -257,18 +257,25 @@ const database = restate.sessionObject({
 
     // Cancels itself inside its transaction, then compensates in its database.
     // The cancellation reaches one await of the handler's, once, as in any
-    // handler: whichever of these it reaches, what came before that await is
-    // stored, so the transaction committed and its mark is sent though
-    // nothing invokes this key again, and the compensation is stored too.
+    // handler. A call of the database that it fails did nothing, and one
+    // already under way when it arrives runs to its end: so the transaction,
+    // which issued the cancellation, committed and its mark is sent though
+    // nothing invokes this key again; and the compensation is stored exactly
+    // once, by the call itself or, where the cancellation reached that call,
+    // by making it again. A cancelled call that had landed would show as a
+    // second row.
     // The result: how many awaits failed with the cancellation.
     cancelledCommit: async (ctx, i: number) => {
       let cancellations = 0;
+      /** Whether `step` failed with the cancellation. */
       const counting = async (step: () => Promise<unknown>) => {
         try {
           await step();
+          return false;
         } catch (e) {
           if (!(e instanceof restate.CancelledError)) throw e;
           cancellations++;
+          return true;
         }
       };
       await counting(() => ctx.db.values('SELECT count(*) FROM t'));
@@ -279,7 +286,8 @@ const database = restate.sessionObject({
           ctx.cancel(ctx.request.id);
         }),
       );
-      await counting(() => ctx.db.execute('INSERT INTO t VALUES (?)', [-1 - i]));
+      const compensate = () => ctx.db.execute('INSERT INTO t VALUES (?)', [-1 - i]);
+      if (await counting(compensate)) await compensate();
       await counting(() => pause(ctx, `cancelled-${i}`, 500)); // by now, the cancellation came
       return cancellations;
     },
@@ -327,8 +335,11 @@ for (const deadline = Date.now() + 60_000; ; await sleep(200)) {
     break;
   if (Date.now() > deadline) throw new Error('restate-server did not start');
 }
-const endpoint = await restate.endpoint().bind(helper).bind(conc).bind(database).listen(PORT);
-void endpoint;
+// The session objects run on the explicit recovery VM. Any endpoint does:
+// `restate.endpoint()` and `connect` route to it through the same seam this
+// serve does (`sessions/src/endpoint.ts`).
+process.env.PORT = String(PORT);
+void (await restate.serve(helper, conc, database));
 for (const deadline = Date.now() + 60_000; ; await sleep(200)) {
   const registered = await fetch(`${ADMIN}/deployments`, {
     method: 'POST',
@@ -497,7 +508,7 @@ await check(
   async () => {
     for (let i = 0; i < 5; i++) {
       assert.equal((await call(`Db/cancelled-${i}/cancelledCommit`, i)).value, 1, `cancelled-${i}: cancellations seen`);
-      // The transaction, and the compensation after the cancellation.
+      // The transaction, and the compensation, once each.
       assert.deepEqual((await call(`Db/cancelled-${i}/committed`)).value, [-1 - i, i], `cancelled-${i}: rows`);
     }
     // Each transaction's send went out, though nothing invoked its key again.

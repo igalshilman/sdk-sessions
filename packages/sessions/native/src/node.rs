@@ -25,20 +25,24 @@
 //! statement inside a transaction, returns its value, or throws its error;
 //! one that waits for the store goes on in the runtime and returns a promise.
 //! The caller `await`s either.
+use crate::vm::{Vm, VmInner};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{JsValue, sys};
 use napi_derive::napi;
+use restate_sdk_shared_core::explicit_recovery::ExplicitRecoveryVM;
 use restate_sdk_shared_core::sql::{self, Numeric, Value};
 use restate_sdk_shared_core::state::{
     self, KvStore, ObjectStoreL1, PageCache, PageCacheConfig, StateOptions,
 };
+use restate_sdk_shared_core::{NotificationHandle, Value as VmValue};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// What a request to the store does: the store's method it calls.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,6 +228,209 @@ impl KvStore for JsQueue {
     }
 }
 
+/// The VM a store's command acts on, and what issuing one answers.
+type CoreVm = restate_sdk_shared_core::explicit_recovery::CoreExplicitRecoveryVM;
+type VmResult = std::result::Result<NotificationHandle, restate_sdk_shared_core::Error>;
+/// The ack of a write that asked for one.
+type Acked = futures::channel::oneshot::Receiver<
+    std::result::Result<VmValue, restate_sdk_shared_core::Error>,
+>;
+
+/// The state key a sync clears with an ack, under the prefix tooling hides.
+const SYNC_KEY: &str = "v22/sync";
+/// The name the listing of the keys is given, under the same prefix.
+const KEYS_NAME: &str = "v22/keys";
+
+/// The store of a session's database over the attempt's VM ([`crate::vm`]):
+/// its reads, writes, listing and acks are the VM's commands, awaited here in
+/// Rust, so none of them reaches JavaScript.
+///
+/// JavaScript is still called at one point: a committing transaction's sends,
+/// which it makes between the commit's write of the head and the wait for that
+/// write's ack. That is the store's `sync`, which `src/database.ts` wraps to
+/// run what the transaction gave `withCommit`.
+struct VmStore {
+    vm: Arc<Mutex<VmInner>>,
+    /// The commit hook: the store's `sync`, on JavaScript's thread.
+    dispatch: Dispatch,
+    /// The database beside the object's own, if this is one: its keys are
+    /// named apart (see `beside` in `src/session.ts`).
+    name: Option<String>,
+    /// A view: it reads beside the owner and writes nothing.
+    reader: bool,
+    /// The writes issued, and how many of them an ack covers.
+    issued: AtomicU64,
+    synced: AtomicU64,
+}
+
+impl VmStore {
+    /// The object's state key of the database's `key`.
+    fn key(&self, key: &str) -> String {
+        match &self.name {
+            None => key.to_owned(),
+            Some(name) => {
+                let at = key.find('/').map_or(0, |at| at + 1);
+                format!("{}db/{name}/{}", &key[..at], &key[at..])
+            }
+        }
+    }
+
+    /// `key` back, if it is this database's; `None` for any other of the object's.
+    fn unbeside(&self, key: &str) -> Option<String> {
+        let Some(name) = &self.name else {
+            return Some(key.to_owned());
+        };
+        let at = key.find('/').map_or(0, |at| at + 1);
+        let prefix = format!("db/{name}/");
+        key[at..]
+            .strip_prefix(&prefix)
+            .map(|rest| format!("{}{rest}", &key[..at]))
+    }
+
+    /// The notification of the command `act` issues. Issuing it and waiting
+    /// for it are one critical section (see [`Vm::issue_and_wait`]).
+    async fn wait(&self, act: impl FnOnce(&mut CoreVm) -> VmResult) -> io::Result<VmValue> {
+        let receiver = Vm::issue_and_wait(&self.vm, act).map_err(io_error)?;
+        match receiver.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(io_error(error)),
+            Err(_) => Err(io_error("the attempt ended")),
+        }
+    }
+
+    /// Issue a write that asks for no ack; its count, for the sync that covers
+    /// it. The VM answers such a write at once, and nothing waits for that
+    /// answer, so it is dropped here rather than crossing into JavaScript.
+    fn write(&self, act: impl FnOnce(&mut CoreVm) -> VmResult) -> io::Result<u64> {
+        self.writable()?;
+        Vm::issue_and_discard(&self.vm, act).map_err(io_error)?;
+        Ok(self.issued.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// Issue a write that asks to be acked: its count, and the ack to await.
+    /// The waiter is registered with the command, under one lock.
+    fn write_acked(&self, act: impl FnOnce(&mut CoreVm) -> VmResult) -> io::Result<(u64, Acked)> {
+        self.writable()?;
+        let receiver = Vm::issue_and_wait(&self.vm, act).map_err(io_error)?;
+        Ok((self.issued.fetch_add(1, Ordering::SeqCst) + 1, receiver))
+    }
+
+    fn writable(&self) -> io::Result<()> {
+        match self.reader {
+            true => Err(io_error("a view writes no state")),
+            false => Ok(()),
+        }
+    }
+
+    /// Wait for the ack of the write `issued`: every write up to it is stored
+    /// when it comes, since Restate acks a write only after those before it.
+    async fn stored(&self, issued: u64, acked: Acked) -> io::Result<()> {
+        match acked.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(io_error(error)),
+            Err(_) => return Err(io_error("the attempt ended")),
+        }
+        self.synced.fetch_max(issued, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// What a commit runs on JavaScript before it waits for its ack: the
+    /// committing transaction's sends.
+    async fn committing(&self) -> io::Result<()> {
+        let promise = self
+            .dispatch
+            .call_async_catch((Op::Sync as u32, String::new(), None).into())
+            .await
+            .map_err(io_error)?;
+        promise.await.map_err(io_error).map(drop)
+    }
+}
+
+impl KvStore for VmStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<Option<Bytes>>> {
+        Box::pin(async move {
+            let key = self.key(key);
+            match self
+                .wait(|vm| vm.cmd_state_get(key.clone(), Some(key)))
+                .await?
+            {
+                VmValue::Success(value) => Ok(Some(value)),
+                VmValue::Void => Ok(None),
+                VmValue::Failure(failure) => Err(io_error(failure.message)),
+                _ => Err(io_error("the state read answered with the wrong type")),
+            }
+        })
+    }
+
+    fn put(&self, key: &str, value: Bytes) -> io::Result<()> {
+        let key = self.key(key);
+        self.write(|vm| vm.cmd_state_set(key.clone(), value, Some(key), false))
+            .map(drop)
+    }
+
+    fn delete(&self, key: &str) -> io::Result<()> {
+        let key = self.key(key);
+        self.write(|vm| vm.cmd_state_clear(key.clone(), Some(key), false))
+            .map(drop)
+    }
+
+    /// The head of a flush, written and synced in one: Restate acks a write
+    /// only once the writes before it are stored, so its ack is the sync.
+    fn put_and_sync<'a>(&'a self, key: &'a str, value: Bytes) -> BoxFuture<'a, io::Result<()>> {
+        let named = self.key(key);
+        // Issued now, as a put is.
+        let written =
+            self.write_acked(|vm| vm.cmd_state_set(named.clone(), value, Some(named), true));
+        Box::pin(async move {
+            let (issued, acked) = written?;
+            self.committing().await?;
+            self.stored(issued, acked).await
+        })
+    }
+
+    fn sync(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async move {
+            if self.reader {
+                // A view wrote nothing to sync.
+                return Ok(());
+            }
+            if self.synced.load(Ordering::SeqCst) == self.issued.load(Ordering::SeqCst) {
+                // Nothing new to store: only what the commit itself makes.
+                return self.committing().await;
+            }
+            let key = self.key(SYNC_KEY);
+            let (issued, acked) =
+                self.write_acked(|vm| vm.cmd_state_clear(key.clone(), Some(key), true))?;
+            self.committing().await?;
+            self.stored(issued, acked).await
+        })
+    }
+
+    fn keys(&self) -> BoxFuture<'_, io::Result<Vec<String>>> {
+        Box::pin(async move {
+            if self.reader {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "a view lists no keys",
+                ));
+            }
+            // Named under the state format's prefix, which tooling hides.
+            let keys = match self
+                .wait(|vm| vm.cmd_state_get_keys(Some(KEYS_NAME.to_owned())))
+                .await?
+            {
+                VmValue::StateKeys(keys) => keys,
+                _ => {
+                    return Err(io_error(
+                        "the listing of the keys answered with the wrong type",
+                    ));
+                }
+            };
+            Ok(keys.iter().filter_map(|key| self.unbeside(key)).collect())
+        })
+    }
+}
+
 /// A failure of the database as JavaScript gets it: one a retry would repeat
 /// ([`sql::Refused`]) has the code `InvalidArg`, which `src/database.ts`
 /// tells apart, as it may have ended the session.
@@ -370,6 +577,33 @@ fn object_store() -> io::Result<Option<ObjectStoreL1>> {
     Ok(l1.insert(ObjectStoreL1::from_env()?).clone())
 }
 
+/// Open the database of `namespace` over the attempt's VM: its state is read
+/// and written as the VM's commands ([`VmStore`]), and `store` is called only
+/// at a commit, through its `sync`, to make the committing transaction's
+/// sends. `name` names a database beside the object's own.
+#[napi(
+    ts_args_type = "namespace: string, store: Store, vm: Vm, name?: string, reader?: boolean",
+    ts_return_type = "Promise<Database>"
+)]
+pub(crate) fn open_on_vm<'env>(
+    env: &'env Env,
+    namespace: String,
+    store: Object<'env>,
+    vm: &Vm,
+    name: Option<String>,
+    reader: Option<bool>,
+) -> Result<PromiseRaw<'env, Database>> {
+    let store = Arc::new(VmStore {
+        vm: vm.inner(),
+        dispatch: dispatcher(env, store)?,
+        name,
+        reader: reader == Some(true),
+        issued: AtomicU64::new(0),
+        synced: AtomicU64::new(0),
+    });
+    open_with(env, namespace, store, reader)
+}
+
 /// Open the database of `namespace` over `store` (see the module's doc),
 /// kept warm in the process's page cache, with its packs past L0
 /// ([`state_options`]) in the process's object store; see
@@ -391,6 +625,17 @@ pub(crate) fn open<'env>(
         dispatch,
         lists_keys,
     });
+    open_with(env, namespace, store, reader)
+}
+
+/// Open `namespace`'s database over `store`, kept warm in the process's page
+/// cache, with its packs past L0 in the process's object store.
+fn open_with<'env>(
+    env: &'env Env,
+    namespace: String,
+    store: Arc<dyn KvStore + Send + Sync>,
+    reader: Option<bool>,
+) -> Result<PromiseRaw<'env, Database>> {
     env.spawn_future(async move {
         let mut open = sql::Database::open(store).options(state_options()?);
         if let Some(cache) = page_cache().await? {

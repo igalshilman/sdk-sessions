@@ -7,3 +7,5 @@
 //! crate is the napi bindings around its `sql::Database`.
 #[cfg(not(test))]
 mod node;
+#[cfg(not(test))]
+mod vm;

@@ -29,16 +29,12 @@ server, are in its `test/` directory (`pnpm test` at the root runs them all).
   forward keep the database working (`pnpm --filter e2e versions`).
 - [`concurrency.ts`](concurrency.ts): the context without journal replay
   (`pnpm --filter e2e concurrency`).
-- [`suspension.ts`](suspension.ts): when a session object's handler is
-  suspended: one that works outside Restate past the inactivity timeout goes
-  on, whether or not it watches for its cancellation, a cancellation reaches
-  it while its input is open or at its next await, and the selector's loop is
-  held at its failpoints while the input closes; Restate is told of no await
-  while it works. With no inactivity timeout
-  (a request-response invocation, its input closed from the start) it
-  answers too; and steps of work, each committed, end under timeouts shorter
-  than a step, each commit suspending the attempt (`SUSPENSION_TIMEOUTS=20,150`
-  for others) (`pnpm --filter e2e suspension`).
+- [`identity.ts`](identity.ts): a deployment that verifies request
+  signatures, which every `connect` is. A signed invocation of a session
+  object runs and answers, under a deployment prefix too; an unsigned one,
+  one signed for another handler and one with an expired token are each
+  refused with a 401 before the handler runs
+  (`pnpm --filter e2e identity`).
 - [`suspensions.ts`](suspensions.ts): what every suite here asks Restate at
   its end: whether it suspended an invocation on its cancel signal alone,
   which only a cancellation resumes. To force suspensions in a suite, give

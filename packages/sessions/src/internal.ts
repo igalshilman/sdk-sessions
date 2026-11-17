@@ -1,6 +1,6 @@
 // For tests: an attempt's session over a context of their own, the store's
-// fault injection, a database over a store of their own, and the selector on
-// its own. For this repository's libraries: the schemas their tables are in,
+// fault injection, and a database over a store of their own. For this
+// repository's libraries: the schemas their tables are in,
 // databases of their own, and the Restate SDK as @restatedev/sessions runs it (its
 // own copy, so that a library's journaled handlers serve beside its objects).
 export * as sdk from '@restatedev/restate-sdk';
@@ -10,8 +10,12 @@ export type { ObjectConfig, SqlHost } from './session.ts';
 export { Link } from './link.ts';
 export { ScopeKey } from './scope.ts';
 export { open, type Connection, type Store, type ConnectionTransaction } from './database.ts';
-export { failpoints, PromiseSelector, type Failpoint } from './selector.ts';
+// The attempt on the explicit recovery VM, for the tests that drive one.
+export { AttemptDriver, AttemptFailed, AttemptShutDown } from './driver.ts';
+export { Vm, isShutDown } from './vm.ts';
+export { serveSession, servedHere, type Stream } from './handler.ts';
 export { needing, served } from './serve.ts';
+export { invokeRoute, patchEndpoint } from './endpoint.ts';
 export {
   attach,
   cancelCalls,
@@ -25,4 +29,3 @@ export {
   withStoreWrapper,
   type AttemptContext,
 } from './object.ts';
-export type { DoProgressResult, Selectable, UnresolvedFuture } from './selector.ts';

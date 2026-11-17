@@ -4,8 +4,9 @@
 // (`native/src/node.rs`); this module orders the calls and runs transactions.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Buffer } from 'node:buffer';
-import { createRequire } from 'node:module';
-import { PLATFORMS, platform } from './platform.ts';
+import { addon as loaded } from './addon.ts';
+import { STATE_WAIT_OVER, type Vm } from './vm.ts';
+import { AttemptShutDown } from './driver.ts';
 
 /** An SQL value. Integers come back as numbers, or as bigints beyond 2^53. */
 export type SqlValue = null | number | bigint | string | Uint8Array;
@@ -112,6 +113,7 @@ export interface Store {
 /** The addon (`native/src/node.rs`). */
 interface Addon {
   open(namespace: string, store: Store, reader: boolean): Promise<NativeSession>;
+  openOnVm(namespace: string, store: Store, vm: Vm, name: string | undefined, reader: boolean): Promise<NativeSession>;
 }
 
 /**
@@ -134,23 +136,7 @@ interface NativeSession {
 /** A value, or a promise of it: `await` takes either. */
 type Answer<T> = T | Promise<T>;
 
-const addon = load();
-
-/** The addon of this machine's platform, from its package (see platform.ts). */
-function load(): Addon {
-  const machine = platform();
-  const name = `@restatedev/sessions-${machine}`;
-  try {
-    return createRequire(import.meta.url)(name) as Addon;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') throw error;
-    throw new Error(
-      `@restatedev/sessions found no addon for ${machine}, the package ${name}: it ships them for ` +
-        `${PLATFORMS.join(', ')}. In its repository, \`pnpm build\` builds this machine's.`,
-      { cause: error },
-    );
-  }
-}
+const addon = loaded as unknown as Addon;
 
 /**
  * Open the database of `namespace` over `store`. One process-wide page cache
@@ -163,6 +149,31 @@ export async function open(namespace: string, store: Store, { reader = false } =
     return new Connection(await addon.open(namespace, boundary, reader), boundary);
   } catch (error) {
     throw boundary.failed?.error ?? error;
+  }
+}
+
+/**
+ * Open the database of `namespace` over the attempt's VM: the state is read
+ * and written as the VM's own commands, in the addon, so none of it crosses
+ * into JavaScript. `store` is called at one point only — its `sync`, which the
+ * boundary uses to run what the committing transaction gave
+ * {@link ConnectionTransaction.withCommit} — so its `get`, `set` and `clear`
+ * are never reached. `name` names a database beside the object's own.
+ */
+export async function openOnVm(
+  namespace: string,
+  store: Store,
+  vm: Vm,
+  { name, reader = false }: { name?: string; reader?: boolean } = {},
+): Promise<Connection> {
+  const boundary = new Boundary(store);
+  try {
+    return new Connection(await addon.openOnVm(namespace, boundary, vm, name, reader), boundary);
+  } catch (error) {
+    // The open reads the database's head. On this path that read waits in the
+    // addon, so its failure arrives as text and `boundary.failed` is never
+    // set: a cancellation here must still reach the handler as one.
+    throw stateWaitFailure(error) ?? boundary.failed?.error ?? error;
   }
 }
 
@@ -275,6 +286,12 @@ abstract class Sql implements DatabaseWriter {
    */
   protected failure(error: unknown): unknown {
     if (error instanceof SqlError) return error;
+    // The state is read and written in the addon on the VM's path, so the
+    // end of the attempt fails those waits there and its text is all that
+    // crosses back. Give the handler the class the driver's own awaits fail
+    // with.
+    const stateWait = stateWaitFailure(error);
+    if (stateWait !== undefined) return stateWait;
     const failed = this.boundary.failed;
     if (failed !== undefined && !this.native.isUsable()) return failed.error;
     const repeats = (error as { code?: unknown }).code === REFUSED || this.native.isUsable();
@@ -285,6 +302,18 @@ abstract class Sql implements DatabaseWriter {
 // The code of the addon's errors that a retry would repeat even though they
 // ended the session (its `Refused`), and of arguments it cannot convert.
 const REFUSED = 'InvalidArg';
+
+/**
+ * The error of a call that failed because the attempt's state waits were
+ * failed in the addon, at the end of the attempt. `undefined` for anything
+ * else.
+ */
+function stateWaitFailure(error: unknown): unknown {
+  const message = (error as { message?: unknown }).message;
+  if (typeof message !== 'string') return undefined;
+  if (message.includes(STATE_WAIT_OVER)) return new AttemptShutDown();
+  return undefined;
+}
 
 /**
  * A session of a database: calls run one at a time, in call order, and a

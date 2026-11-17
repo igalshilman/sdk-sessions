@@ -2,7 +2,7 @@
 // What `restate.serve` serves: the services given, each with what it needs
 // beside it (a library's own objects), once, or those RESTATE_SERVE_ONLY names.
 import * as restate from '@restatedev/sessions';
-import { needing, sdk, served } from '@restatedev/sessions/internal';
+import { invokeRoute, needing, sdk, served } from '@restatedev/sessions/internal';
 import { describe, expect, it } from 'vitest';
 
 const helper = restate.service({ name: 'helper', handlers: { help: async (_ctx: restate.Context) => 'ok' } });
@@ -52,5 +52,25 @@ describe('remote', () => {
 
   it('is refused where services are served: nothing here implements it', () => {
     expect(() => served([workspace])).toThrow(/workspace: a remote handle/);
+  });
+});
+
+describe('the path of an invocation', () => {
+  it('is the last three fragments, as the SDK reads it', () => {
+    expect(invokeRoute('/invoke/Notes/add')).toEqual({ service: 'Notes', handler: 'add' });
+    // A deployment registered under a prefix: the SDK matches these, and
+    // matching only a bare `/invoke/...` would hand them to it without a
+    // word, so a session object would be refused on a path that should work.
+    expect(invokeRoute('/behind/a/prefix/invoke/Notes/add')).toEqual({ service: 'Notes', handler: 'add' });
+    expect(invokeRoute('/invoke/Notes/add?x=1')).toEqual({ service: 'Notes', handler: 'add' });
+  });
+
+  it('is nothing for what is not an invocation', () => {
+    // Listed in the message so a failure says which path broke.
+    // A bare `//` is a URL with an empty host, which `URL` refuses outright:
+    // it has to be nothing here, not a throw in the request listener.
+    for (const path of ['/discover', '/health', '/invoke/Notes', '/invoke//add', '/invoke/Notes/', '/', '', '//']) {
+      expect(invokeRoute(path)).toBeUndefined();
+    }
   });
 });

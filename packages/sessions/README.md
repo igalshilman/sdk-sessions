@@ -17,6 +17,12 @@ It runs on a released Restate server and the published SDK, version 1.18.2,
 which it pins ([why](#concurrent-awaits)). See
 [the requirements](../../README.md#requirements).
 
+A session object needs a Restate that speaks **service protocol v7 or later**
+— 1.5 and up. Its VM accepts no less, and an invocation that negotiates an
+older protocol is refused with a 415 that says so. Journaled services and
+virtual objects are unaffected: they are the SDK's, at any version it
+supports.
+
 ```ts
 import * as restate from '@restatedev/sessions';
 
@@ -277,18 +283,18 @@ with an idempotency key instead, which gives every attempt the same answer
 ([calls and sends](#calls-and-sends)).
 
 A cancellation reaches a handler as Restate's reaches any handler: once, at
-the awaits pending when it comes, which fail with a `CancelledError`. The
-session adds nothing to it. A `ctx.db` call is one such await: the request
-of its own to Restate that a cancellation reaches (a read, or the sync a
-commit waits for) fails, and so does the call. What the call sent to Restate
-before that await stays: a commit's writes, and its transaction's sends,
-which are made right after the writes, before the commit waits for anything.
-So a `CancelledError` from `transaction()` doesn't say whether it committed,
-as no cancelled await does: the database does. If it committed, its sends
-are made, once.
+an await, which fails with a `CancelledError`. The awaits of Restate pending
+when it comes fail (a `ctx.rpc`, a `wait`). A `ctx.db` call is treated
+differently, so that its failure means one thing: a call already under way
+when the cancellation comes runs to its end, and the cancellation goes to
+what the handler awaits next; a `ctx.db` call that fails with a
+`CancelledError` was refused before it began. So a `CancelledError` from
+`ctx.db` says the call did nothing: it wrote nothing, and a `transaction()`
+neither committed nor made its sends. A transaction that resolves committed,
+and its sends are made, once.
 
-The calls after it work: the next opens the session again, and reads what
-is stored. So a handler can check what committed, and compensate:
+The calls after it work. So a handler can compensate, or make the call
+again:
 
 ```ts
 try {
@@ -305,8 +311,8 @@ try {
 A transaction whose body awaits something else (a `ctx.rpc`) that a
 cancellation reaches fails with it and rolls back, unless the body catches
 it. A retry of a cancelled invocation, after a crash, gets the cancellation
-at its first await, which may be the open that makes what the crash left in
-the outbox. No attempt follows a cancelled one, so as an attempt ends, a
+at its first await; the open that makes what the crash left in the outbox is
+the session's own, and is not failed. No attempt follows a cancelled one, so as an attempt ends, a
 session that a failure ended is opened again, which makes what the outbox
 holds and empties it.
 
@@ -442,21 +448,26 @@ own reads run concurrently too.
 On its own, the published SDK drives each awaited promise with a loop of its
 own, and lets only one of them wait for the server at a time
 (`ExternalProgressChannel`). A second waiter fails the attempt with
-`awaitNext already pending`, and it is retried forever. So session handlers
-drive every promise they await with a single loop,
-[the selector](src/selector.ts). Before the handler runs, it takes over the
-invocation's `promisesExecutor.doProgress`, and gives it back when the
-attempt ends. These are SDK internals as of 1.18.2, so the package pins that
-version, and refuses to run a handler on an SDK without them.
-[`test/selector.test.ts`](test/selector.test.ts) tests the selector against
-a fake VM and the SDK's single-waiter channel.
+`awaitNext already pending`, and it is retried forever.
+
+A session object does not run on that VM. It runs on shared-core's
+`ExplicitRecoveryVM`, the state machine for handlers that are never replayed
+([`docs/explicit-recovery.md`](docs/explicit-recovery.md)): a command returns
+a notification handle, results come back in any order, and the driver settles
+each promise as its handle is notified. There is no single await point to
+contend for, so a handler awaits whatever it likes.
+
+`src/endpoint.ts` routes a session object's invocation there, by patching
+`NodeEndpoint.prototype` — the class `restate.endpoint()`, `restate.serve`
+and `connect`'s tunnel all build theirs from. That prototype and the
+endpoint's builder are SDK internals as of 1.18.2, so the package pins that
+version. A fetch endpoint is not built from it and cannot serve a session
+object; it is refused rather than half-served.
 
 What you get:
 
-- **One await point.** The loop asks the server about all awaited promises
-  at once. After a suspension, the handler resumes on the first of them to
-  complete, and a promise awaited while the loop waits joins its next check,
-  so a call awaited late isn't held up by a slow call made earlier.
+- **No await point to contend for.** Every awaited promise waits on its own
+  handle, so a call awaited late isn't held up by a slow call made earlier.
 - **An operation starts when you make it.** A call goes out without an
   `await`, and a failure nobody awaits is not an unhandled rejection.
 - **Cancellation reaches every awaited promise**, and each one rejects with

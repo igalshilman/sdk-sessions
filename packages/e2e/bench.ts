@@ -122,7 +122,10 @@ const ADMIN = 'http://127.0.0.1:9070';
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 if (process.argv[2] === 'serve') {
-  await restate.endpoint().bind(bench).listen(PORT);
+  // The attempt runs on the explicit recovery VM and the database's store
+  // lives in the addon.
+  process.env.PORT = String(PORT);
+  await restate.serve(bench);
 } else if (process.argv[1] === fileURLToPath(import.meta.url)) {
   await drive(process.argv[2]);
 }
@@ -287,7 +290,7 @@ async function drive(out?: string) {
   phases.push(await phase('count, one key, cold process', 'count', null, 1, 1, () => `${run}-hot`));
 
   // Databases of 1, 10 and 100 MB, of 1 KiB rows, loaded 1 MB per call.
-  const SIZES = [1, 10, 100];
+  const SIZES = (process.env.BENCH_SIZES ?? '1,10,100').split(',').map(Number);
   const ROWS_PER_MB = 1000;
   const sized = (mb: number) => `${run}-${mb}mb`;
   const anyRow = (mb: number) => () => 1 + Math.floor(Math.random() * mb * ROWS_PER_MB);

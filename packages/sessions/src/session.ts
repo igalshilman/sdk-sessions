@@ -5,10 +5,11 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import type * as restate from '@restatedev/restate-sdk';
-import { serde, TerminalError } from '@restatedev/restate-sdk';
+import { CancelledError, serde, TerminalError } from '@restatedev/restate-sdk';
 import { millisOrDurationToMillis, type Serde } from '@restatedev/restate-sdk-core';
 import {
   open,
+  openOnVm,
   type Row,
   sqlOver,
   SqlError,
@@ -20,6 +21,7 @@ import {
   type Store,
   type ConnectionTransaction,
 } from './database.ts';
+import type { Vm } from './vm.ts';
 import { Link } from './link.ts';
 import { apply, dropAll, ensureOf, ensuring, type Schema } from './schema.ts';
 import { type Send, sendOf } from './calls.ts';
@@ -69,6 +71,19 @@ export interface SqlHost {
   /** The object's state keys. */
   stateKeys(): PromiseLike<string[]>;
   run(name: string, action: () => void): PromiseLike<void>;
+  /**
+   * The attempt's VM, when it has one: the addon then reads and writes the
+   * object's state as the VM's own commands, and none of it crosses into
+   * JavaScript (see `openOnVm`).
+   */
+  readonly vm?: Vm;
+  /**
+   * Whether a cancellation is owed to the handler's next await, taking it:
+   * the attempt's driver has one when a cancellation arrived that failed
+   * nothing the handler awaits. Absent where the SDK's context serves the
+   * attempt, whose own awaits fail with it.
+   */
+  readonly takeCancellation?: () => boolean;
   genericSend(send: restate.GenericSend<Uint8Array>): unknown;
 }
 
@@ -161,6 +176,26 @@ const unbeside = (name: string) => (key: string) => {
  * the life of the process. One the SDK cancels fails as any await does: the
  * session it ends fails its calls with the CancelledError (see `open`).
  */
+/**
+ * The store of a database the addon keeps on the VM: it reads and writes the
+ * state itself, and calls this only at a commit, through `sync`, where the
+ * boundary runs what the committing transaction gave `withCommit`. Reaching
+ * anything else is a bug in the addon, and says so rather than going quiet.
+ */
+function commitOnly(): Store {
+  return {
+    get: servedByVm('get'),
+    set: servedByVm('set'),
+    clear: servedByVm('clear'),
+    sync: async () => {},
+  };
+}
+
+/** What a store the addon never calls does if it is called after all. */
+const servedByVm = (op: string) => () => {
+  throw new Error(`@restatedev/sessions: the VM serves the state; the store's ${op} is not called`);
+};
+
 function objectStore(ctx: SqlHost, end: AttemptEnd, dbName: string | undefined): Store {
   const keyOf = dbName === undefined ? (key: string) => key : beside(dbName);
   const request = <T>(promise: PromiseLike<T>) => end.race(promise);
@@ -444,10 +479,10 @@ export class Attempt {
     this.name = name;
     this.hasOutbox = !ctx.shared && name === undefined;
     this.db = {
-      ...sqlOver((sql, params) => this.call((db) => db.queryColumns(sql, params)), handlerError),
-      transaction: (body) => this.transaction(body),
+      ...sqlOver((sql, params) => this.asked(() => this.call((db) => db.queryColumns(sql, params))), handlerError),
+      transaction: (body) => this.asked(() => this.transaction(body)),
     };
-    ensuring(this.db, (schemas) => this.call((db) => this.ensureSchemas(db, schemas)));
+    ensuring(this.db, (schemas) => this.asked(() => this.call((db) => this.ensureSchemas(db, schemas))));
     ATTEMPT.on(this.db, this);
   }
 
@@ -457,6 +492,26 @@ export class Attempt {
     let other = this.databases.get(name);
     if (other === undefined) this.databases.set(name, (other = new Attempt(this.ctx, this.config, name)));
     return other.db;
+  }
+
+  /**
+   * `call`, which the handler asked for, unless a cancellation is owed to
+   * it: then the call fails with the cancellation, and does nothing.
+   *
+   * This is where the database delivers a cancellation, and the only place.
+   * What the handler asks for passes through here; what the session does for
+   * itself does not — the open, the object's schema, the sends a crashed
+   * attempt left unmade, emptying the outbox after a commit — and a
+   * cancellation that failed one of those would be delivered to nobody, or
+   * would report a transaction as cancelled after it committed. And it is
+   * before the call issues anything, so a call that fails with
+   * `CancelledError` wrote nothing and sent nothing: a call already under way
+   * when the cancellation arrives runs to its end, and the cancellation goes
+   * to what the handler awaits next.
+   */
+  private asked<T>(call: () => Promise<T>): Promise<T> {
+    if (this.ctx.takeCancellation?.()) return Promise.reject(new CancelledError());
+    return call();
   }
 
   /**
@@ -486,8 +541,8 @@ export class Attempt {
    * handler, its sends commit with it, in the outbox, and are made with its
    * commit, right after its writes and before it waits for anything
    * (`withCommit`): Restate stores an attempt's commands in order, so they
-   * are stored only if the commit is, and whatever fails the commit's wait (a
-   * cancellation, say) comes after them. A second commit empties the outbox
+   * are stored only if the commit is, and whatever fails the commit's wait
+   * (the attempt's end, say) comes after them. A second commit empties the outbox
    * before `transaction` resolves: left until the handler's end, they would
    * be made again by an attempt that resumes a long wait (an approval), past
    * the idempotency retention that drops a repeat.
@@ -564,9 +619,23 @@ export class Attempt {
     // database (a name has no `/`).
     const key = `${ctx.request().target.service}/${encodeURIComponent(ctx.key)}`;
     const namespace = this.name === undefined ? key : `${key}/${this.name}`;
-    const object = objectStore(ctx, end, this.name);
     const wrap = this.config.wrapStore;
-    const db = await open(namespace, wrap ? wrap(object) : object, { reader: ctx.shared });
+    // With a VM, the addon reads and writes the state itself and nothing of
+    // the store crosses into JavaScript. A wrapper (fault injection, through
+    // `withStoreWrapper`) would then have nothing to wrap, and using the
+    // JavaScript store instead would quietly test the other path: the tests
+    // that wrap give their attempts no VM, so this says so rather than
+    // choosing for them.
+    if (ctx.vm !== undefined && wrap !== undefined) {
+      throw new TerminalError(
+        'withStoreWrapper wraps the store of an attempt served by the SDK; an attempt on the VM has none to wrap',
+      );
+    }
+    const onVm = ctx.vm !== undefined;
+    const object = onVm ? commitOnly() : objectStore(ctx, end, this.name);
+    const db = onVm
+      ? await openOnVm(namespace, object, ctx.vm, { name: this.name, reader: ctx.shared })
+      : await open(namespace, wrap ? wrap(object) : object, { reader: ctx.shared });
     try {
       // A view writes nothing: a write fails, rather than vanish with the attempt.
       if (ctx.shared) await db.execute('PRAGMA query_only = 1');

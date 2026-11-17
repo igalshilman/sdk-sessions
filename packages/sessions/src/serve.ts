@@ -1,5 +1,10 @@
 // `serve`: the services of a program, on PORT, with what they need beside
 // them (a library's objects, such as each @restatedev/agents agent's companion).
+//
+// A session object's invocations run on the explicit recovery VM whichever of
+// these serves them, and so does an endpoint built by hand: `endpoint.ts`
+// wraps the SDK's endpoint class, which every transport builds its request
+// handler from.
 import * as restate from '@restatedev/restate-sdk';
 import { isRemote } from './calls.ts';
 

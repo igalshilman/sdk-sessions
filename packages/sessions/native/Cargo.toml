@@ -18,11 +18,16 @@ napi-derive = "3"
 # checkpoints' packs in the object store RESTATE_SQL_OBJECT_STORE names
 # (`state::ObjectStoreL1`): S3, GCS or Azure, with their features, or a
 # directory.
-restate-sdk-shared-core = { version = "8.5.0", features = [
+restate-sdk-shared-core = { version = "8.7.0", features = [
   "sql",
   "object_store_aws",
   "object_store_gcp",
   "object_store_azure",
+  # Verifying a request's signature, which this package must do itself: it
+  # runs a session object's invocation ahead of the SDK's handler, where the
+  # SDK would have verified it (`src/endpoint.ts`).
+  "request_identity",
+  "rust_crypto",
 ] }
 futures = "0.3"
 bytes = "1.10"

@@ -38,5 +38,6 @@ export type { CallOptions, Client, Rpc, Send, SendClient, SendOptions, Target } 
 export { remote } from './calls.ts';
 // In place of the SDK's: the services, on PORT, with what they need beside
 // them; `connect`, the same for Restate Cloud (the SDK's own leaves them out);
-// and `served`, the services with what they need, for an endpoint of your own.
+// and `served`, the services with what they need, for an endpoint of your own
+// — which runs them on the VM too (`endpoint.ts`).
 export { connect, serve, served } from './serve.ts';
