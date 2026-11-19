@@ -69,6 +69,7 @@ import {
   configured,
   fromTool,
   inboxOf,
+  keptAlive,
   ModelError,
   modelOf,
   providerOf,
@@ -138,6 +139,7 @@ function routeOf(model: string): Route {
  * approval runs (see {@link approving}).
  */
 async function boot(
+  ctx: restate.SessionContext,
   db: restate.Database,
   route: Route,
   system?: string,
@@ -145,6 +147,10 @@ async function boot(
   approvals = false,
 ): Promise<Context> {
   const harness = new Context();
+  // Every model request (a turn's, a compaction's) runs kept alive, from its
+  // first pull to the stream's end however it ends. Tools and the approval's
+  // wait are not in it.
+  harness.on('llm/stream', (_options, next) => keptAlive(ctx, next()));
   await harness.plugin(LlmRuntime);
   await harness.plugin(SessionStore);
   await harness.plugin(SystemPrompt, system ? { personaPrefix: system } : {});
@@ -491,7 +497,7 @@ const runOf =
   async (conversation) => {
     const turn = conversation.turn;
     const route = routeOf(modelOf(named, DEEPSEEK_MODEL));
-    const harness = await boot(ctx.db, route, system, compaction, approval !== undefined);
+    const harness = await boot(ctx, ctx.db, route, system, compaction, approval !== undefined);
     const persistence = harness.sessionPersistence as SqlSessionPersistence;
     // A tool's error fails the attempt, which Restate retries: the harness
     // stores nothing more, so the retry finds the tool's call without a result.

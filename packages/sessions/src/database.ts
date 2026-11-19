@@ -136,6 +136,13 @@ interface NativeSession {
 /** A value, or a promise of it: `await` takes either. */
 type Answer<T> = T | Promise<T>;
 
+/**
+ * Run `fn`, keeping the attempt alive meanwhile: the attempt's `working`
+ * (see `driver.ts`). The database's calls run in it, being local work that
+ * never waits on Restate for long.
+ */
+export type Working = <T>(fn: () => T | Promise<T>) => Promise<T>;
+
 const addon = loaded as unknown as Addon;
 
 /**
@@ -164,11 +171,11 @@ export async function openOnVm(
   namespace: string,
   store: Store,
   vm: Vm,
-  { name, reader = false }: { name?: string; reader?: boolean } = {},
+  { name, reader = false, working }: { name?: string; reader?: boolean; working?: Working } = {},
 ): Promise<Connection> {
-  const boundary = new Boundary(store);
+  const boundary = new Boundary(store, working);
   try {
-    return new Connection(await addon.openOnVm(namespace, boundary, vm, name, reader), boundary);
+    return new Connection(await boundary.alive(() => addon.openOnVm(namespace, boundary, vm, name, reader)), boundary);
   } catch (error) {
     // The open reads the database's head. On this path that read waits in the
     // addon, so its failure arrives as text and `boundary.failed` is never
@@ -192,9 +199,11 @@ class Boundary implements Store {
   withSync: (() => void) | undefined;
   readonly keys?: () => Promise<string[]>;
   private readonly store: Store;
+  private readonly working: Working | undefined;
 
-  constructor(store: Store) {
+  constructor(store: Store, working?: Working) {
     this.store = store;
+    this.working = working;
     // A store without keys keeps its garbage (see `Store.keys`).
     const keys = store.keys?.bind(store);
     if (keys) this.keys = () => this.kept(keys);
@@ -219,6 +228,11 @@ class Boundary implements Store {
       run?.();
       return this.store.sync();
     });
+  }
+
+  /** `call`, in the attempt's `working` scope if the database has one. */
+  alive<T>(call: () => T | Promise<T>): Promise<T> {
+    return this.working === undefined ? (async () => call())() : this.working(call);
   }
 
   /** `request`'s result, keeping its error, thrown at once or rejected. */
@@ -274,7 +288,7 @@ abstract class Sql implements DatabaseWriter {
    */
   protected async request<T>(call: () => Answer<T>): Promise<T> {
     try {
-      return await call();
+      return await this.boundary.alive(call);
     } catch (error) {
       throw this.failure(error);
     }
@@ -356,7 +370,7 @@ export class Connection extends Sql {
       this.boundary.withSync = tx.commitRuns();
       let unsynced: (() => void) | undefined;
       try {
-        await this.native.commit(records);
+        await this.boundary.alive(() => this.native.commit(records));
       } catch (error) {
         // A COMMIT that fails (a deferred constraint) leaves the transaction
         // open: without the rollback, the calls after it would run inside it.

@@ -106,6 +106,16 @@ graph })` gives it, and a handler of your own passes it as the run context
 `SqlCheckpointSaver(ctx.db)`). A node refuses to run without it, a
 checkpointer, or `durability: 'sync'`.
 
+## Kept alive
+
+An attempt of a session object is shut down by Restate after its inactivity
+timeout (a minute), and run again from the start, unless work keeps it alive
+(`ctx.working`). Each request of a model does: the built-in graph's model
+node, the summarizer's, and, in a graph of your own, every chat model's request
+wherever the graph makes it (a node's, `createAgent`'s), through a callback
+handler the agent passes in the run's config (so a graph of your own needs
+nothing). A tool is not kept alive, unless it sets `keepalive`.
+
 ## Through crashes
 
 The built-in agent keeps no checkpoints: its conversation is the object's

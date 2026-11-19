@@ -349,5 +349,7 @@ function sessionOf(ctx: restate.ObjectContext): SessionContext {
     get cancel(): never {
       return missing('ctx.cancel', CALLS_INSTEAD);
     },
+    // An agentlib agent runs on the SDK's journaled context, which has no `working`: the work just runs.
+    working: <T>(fn: () => T | Promise<T>) => (async () => fn())(),
   });
 }

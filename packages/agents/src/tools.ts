@@ -110,12 +110,21 @@ export const text = (value: unknown) =>
  * a Restate call it makes fails with) is its answer, `Error: <message>`, for
  * the model to act on; and so are arguments that do not fit `input`, which
  * `run` never sees.
+ *
+ * A tool does not keep its attempt alive: one that works for longer than
+ * Restate's inactivity timeout (a minute, by default) is cut off, and done
+ * again from the start of the turn, by every attempt. One that must work
+ * that long sets `keepalive`, and runs in `ctx.working`; it keeps long waits
+ * on Restate (a call, a signal) out of its `run`, or holds its process for
+ * as long as they take.
  */
 export const tool = <S extends z.ZodObject>(options: {
   name: string;
   description: string;
   input: S;
   run: (input: z.infer<S>, context: ToolContext) => unknown;
+  /** Keep the attempt alive while `run` runs: see {@link tool}. */
+  keepalive?: boolean;
 }): Tool => withSpec(ownTool(options), { kind: 'run', run: options.run });
 
 /** {@link tool}, without its spec: Restate's tools give their own. */
@@ -124,6 +133,7 @@ const ownTool = <S extends z.ZodObject>(options: {
   description: string;
   input: S;
   run: (input: z.infer<S>, context: ToolContext) => unknown;
+  keepalive?: boolean;
 }): Tool => ({
   [TOOL]: true,
   name: options.name,
@@ -136,7 +146,8 @@ const ownTool = <S extends z.ZodObject>(options: {
     if (!parsed.success) return `Error: the arguments do not fit the tool's input: ${z.prettifyError(parsed.error)}`;
     const input = parsed.data;
     try {
-      return text(await options.run(input, { ctx, callId, idempotencyKey: `${ctx.request.id}:${callId}` }));
+      const run = () => options.run(input, { ctx, callId, idempotencyKey: `${ctx.request.id}:${callId}` });
+      return text(await (options.keepalive ? ctx.working(run) : run()));
     } catch (error) {
       // The turn stopped (its invocation was cancelled, or its attempt
       // ended): it ends, rather than the model going on with the tool's error

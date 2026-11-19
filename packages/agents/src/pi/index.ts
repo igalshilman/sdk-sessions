@@ -63,7 +63,9 @@ import {
   type ConversationRetryPolicy,
   type ConversationStreamOptions,
   type ToolRegistration,
+  type Wrap,
 } from '@earendil-works/pi-durable';
+import { keptModels } from './keepalive.ts';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { CodingTools } from '@earendil-works/pi-durable/tools';
 import type { Transaction } from '@restatedev/sessions';
@@ -323,6 +325,7 @@ async function extensions(
   system: string | undefined,
   workspace: string | undefined,
   afterTools: (conversation: ConversationId) => Promise<void>,
+  ctx: restate.SessionContext,
 ) {
   const registry = createRegistry();
   registry.install(defineExtension({ name: 'tools', tools }));
@@ -339,6 +342,14 @@ async function extensions(
   registry.install(CodingTools);
   // Tell the model where the coding tools work.
   registry.install(defineExtension({ name: 'workspace', sections: [section('cwd', () => workspace)] }));
+  // The coding tools run in `ctx.working`: they work on the machine (a `bash` may run for minutes), and never
+  // wait on Restate. Installed after theirs, which they wrap.
+  const kept = (t: ToolRegistration): ToolRegistration => ({
+    ...t,
+    execute: (args, api, context) => ctx.working(() => t.execute(args, api, context)),
+  });
+  const wraps = (CodingTools.tools ?? []).map((t): Wrap => ({ tool: t.name, wrap: kept }));
+  registry.install(defineExtension({ name: 'keepalive', wraps }));
   return { registry, env: () => new NodeExecutionEnv({ cwd: workspace }) };
 }
 
@@ -462,6 +473,7 @@ export const withPi = async <T>(
       ending = false;
       if (!ends) await steering?.(of);
     },
+    ctx,
   );
   const settings = {
     // A task that crashes is run again however often Restate retries the attempt (its retry policy decides):
@@ -478,7 +490,8 @@ export const withPi = async <T>(
   const database = new SqlKvDatabase(ctx.db);
   const harness = await Harness.open(
     await openSqlKvStorage(ctx.db, database),
-    { models, registry, env, settings },
+    // Each request of a model is kept alive, whoever made the registry (see keepalive.ts).
+    { models: keptModels(ctx, models), registry, env, settings },
     context,
   );
 

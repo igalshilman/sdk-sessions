@@ -88,7 +88,7 @@ test('a send takes its options with the target, and a no-input handler none', as
   ]);
 });
 
-test('a context has the key, the request, the database, calls and cancel; a view no sends, and reads only', async () => {
+test('a context has the key, the request, the database, calls, cancel and working; a view no sends or working, and reads only', async () => {
   const map = new Map<string, Uint8Array>();
   assert.deepEqual(await invoke(account, 'contexts', fakeContext({ map, service: 'account' })), [
     'cancel',
@@ -103,7 +103,7 @@ test('a context has the key, the request, the database, calls and cancel; a view
     views: { db: async (ctx) => Object.keys(ctx.db).toSorted() },
   });
   assert.deepEqual(await invoke(seen, 'keys', fakeContext({ map, service: 'seen' })), {
-    ctx: ['cancel', 'db', 'key', 'request', 'rpc', 'send'],
+    ctx: ['cancel', 'db', 'key', 'request', 'rpc', 'send', 'working'],
     db: ['execute', 'get', 'query', 'transaction', 'values'],
   });
   assert.deepEqual(await invoke(seen, 'db', fakeContext({ map, service: 'seen' })), ['get', 'query', 'values']);

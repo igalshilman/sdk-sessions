@@ -19,12 +19,12 @@
 // Restate shuts an attempt down by closing the request body, after its
 // inactivity timeout. From then on the attempt is over: every action throws,
 // the promises still pending reject, and a new attempt runs the handler from
-// the start. See the heartbeats on what keeps an attempt at work alive.
+// the start, unless work in `working` keeps the attempt alive.
 import * as restate from '@restatedev/restate-sdk';
 import { isShutDown, type Vm, type VmFailure, type VmInput, type VmNotification } from './vm.ts';
 
 /**
- * How often an attempt at work of its own tells Restate it makes progress, in
+ * How often an attempt in `working` tells Restate it makes progress, in
  * milliseconds: RESTATE_SESSIONS_HEARTBEAT, or 20 seconds.
  *
  * Restate shuts down an attempt it has heard nothing from for its inactivity
@@ -172,6 +172,10 @@ export class AttemptDriver {
   private carriedCancellation = false;
   private readonly cancelledPromise: Promise<void>;
   private heartbeats: ReturnType<typeof setInterval> | undefined;
+  /** The `working` scopes open: the attempt heartbeats while there is one. */
+  private scopes = 0;
+  /** When the attempt last wrote to Restate, which restarts Restate's inactivity timer. */
+  private wroteAt = Date.now();
   private readonly aborter = new AbortController();
   /**
    * The invocation's input. Taking it from the VM copies the body across the
@@ -226,7 +230,9 @@ export class AttemptDriver {
   private flush(): void {
     this.queued = false;
     const output = this.vm.takeOutput();
-    if (output.length > 0) this.write(output);
+    if (output.length === 0) return;
+    this.write(output);
+    this.wroteAt = Date.now();
   }
 
   /**
@@ -550,24 +556,42 @@ export class AttemptDriver {
   // --- Keeping an attempt at work alive
   //
   // Restate shuts an attempt down once its inactivity timeout passes with
-  // nothing heard. A heartbeat stops that while the handler works outside
-  // Restate, on this rule: only while nothing of this attempt waits on
-  // Restate. With something
-  // waiting, a shutdown is what should happen — Restate starts a new attempt
-  // when the answer comes, instead of holding a connection open meanwhile.
+  // nothing heard. That is the default: the attempt suspends on what it waits
+  // for (or, waiting for nothing, starts again at once), and a wait of days
+  // holds no process. Work that must not be cut off says so with `working`:
+  // while any of it runs, the attempt heartbeats, whatever else it waits for.
 
-  /** Start the heartbeats of a running handler. */
-  startHeartbeats(everyMs = heartbeatMs()): void {
-    if (this.heartbeats !== undefined || this.ended !== undefined) return;
-    this.heartbeats = setInterval(() => {
-      if (this.ended !== undefined || this.waiting.size > 0) return;
-      try {
-        this.act((vm) => vm.heartbeat());
-      } catch {
-        // The attempt ended: the tick notices.
-      }
-    }, everyMs);
+  /**
+   * Run `fn`, keeping the attempt alive meanwhile: one heartbeat every
+   * `everyMs` from the first scope opening to the last closing. The first
+   * comes at once if the attempt has been silent for `everyMs` already (most
+   * of the timeout may be gone), so the silence never reaches twice that;
+   * otherwise the scopes the database opens for each of its calls would each
+   * send one.
+   */
+  async working<T>(fn: () => T | Promise<T>, everyMs = heartbeatMs()): Promise<T> {
+    if (this.scopes++ === 0) this.startHeartbeats(everyMs);
+    try {
+      return await fn();
+    } finally {
+      if (--this.scopes === 0) this.stopHeartbeats();
+    }
+  }
+
+  private startHeartbeats(everyMs: number): void {
+    if (this.ended !== undefined) return;
+    if (Date.now() - this.wroteAt >= everyMs) this.heartbeat();
+    this.heartbeats = setInterval(() => this.heartbeat(), everyMs);
     this.heartbeats.unref?.();
+  }
+
+  private heartbeat(): void {
+    if (this.ended !== undefined) return;
+    try {
+      this.act((vm) => vm.heartbeat());
+    } catch {
+      // The attempt ended: the tick notices.
+    }
   }
 
   private stopHeartbeats(): void {

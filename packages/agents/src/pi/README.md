@@ -94,6 +94,22 @@ The files of a `workspace` are not in the database: they last as long as the
 disk does, and a coding tool a crash cut off is not run again (the model is
 told it was interrupted).
 
+## Kept alive
+
+An attempt of a session object is shut down by Restate after its inactivity
+timeout (a minute), and run again from the start, unless work keeps it alive
+(`ctx.working`). Each request of a model does, wherever pi makes it (a turn's,
+a deferred response's, a compaction's): the agent wraps the model registry (its
+own, or the `models` given), and a request is kept alive from its call until
+its response ends, fails, is abandoned or is aborted. So does each built-in
+coding tool (`read`, `write`, `edit`, `bash`): it works on the machine, and a
+`bash` may run for minutes.
+
+A tool of your own is not kept alive: a `tool()` sets `keepalive` if it may
+work for longer than the timeout, or it is cut off, as by a crash (the next
+attempt tells the model it was interrupted, see above). A tool kept alive must
+not wait on Restate (a call, a signal) inside.
+
 ## Run
 
 ```sh

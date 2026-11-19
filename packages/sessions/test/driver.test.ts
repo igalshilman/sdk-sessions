@@ -274,21 +274,67 @@ describe('an attempt on the explicit recovery VM', () => {
     expect(request.attemptCompletedSignal.aborted).toBe(true);
   });
 
-  it('heartbeats only while nothing of the attempt waits on Restate', async () => {
+  it('heartbeats only inside working, whatever the attempt waits for', async () => {
     const r = attempt();
-    r.attempt.startHeartbeats(5);
-    // Nothing waits: the handler is at work of its own, so the attempt says so.
+    const beats = () => types(Buffer.concat(r.written)).filter((t) => t === TYPE.awaitingOn).length;
+    // Outside working the attempt is silent, waiting or not: Restate may shut it down.
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(types(Buffer.concat(r.written))).toContain(TYPE.awaitingOn);
-    // With a call outstanding, Restate knows what it waits for: no heartbeat,
-    // so that a shutdown can happen and a new attempt resume on the answer.
+    expect(beats()).toBe(0);
+    // Inside, it heartbeats on the interval, with a call outstanding too; at
+    // once if it has been silent for an interval already.
     const waiting = r.makeCall('one').result;
+    await turn();
+    r.written.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const release = Promise.withResolvers<void>();
+    const working = r.attempt.working(() => release.promise.then(() => 'done'), 5);
+    await turn();
+    expect(beats()).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(beats()).toBeGreaterThan(1);
+    // Two scopes open: the attempt is kept alive until the last closes.
+    const inner = Promise.withResolvers<void>();
+    const nested = r.attempt.working(() => inner.promise, 5);
+    release.resolve();
+    expect(await working).toBe('done');
+    const during = beats();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(beats()).toBeGreaterThan(during);
+    inner.resolve();
+    await nested;
+    await turn();
+    const after = beats();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(beats()).toBe(after);
+    r.answerCall(0, { result: '"1"' });
+    await waiting;
+  });
+
+  it('opens a working scope right after writing without a heartbeat of its own', async () => {
+    const r = attempt();
+    // Something written just now restarted Restate's timer: the scope's
+    // first heartbeat waits for the interval (the database opens one per call).
+    void r.makeCall('one').result;
+    await turn();
+    r.written.length = 0;
+    await r.attempt.working(async () => {
+      await turn();
+    }, 1_000);
+    await turn();
+    expect(types(Buffer.concat(r.written))).not.toContain(TYPE.awaitingOn);
+  });
+
+  it('closes a working scope whose work throws', async () => {
+    const r = attempt();
+    await expect(
+      r.attempt.working(() => {
+        throw new Error('boom');
+      }, 5),
+    ).rejects.toThrow('boom');
     await turn();
     r.written.length = 0;
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(types(Buffer.concat(r.written))).not.toContain(TYPE.awaitingOn);
-    r.answerCall(0, { result: '"1"' });
-    await waiting;
   });
 
   it('ends the handler with its output, and writes it', async () => {

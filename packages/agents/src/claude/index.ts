@@ -43,6 +43,7 @@ import {
   type Configure,
   configured,
   fromTool,
+  keepAlive,
   modelIdOf,
   modelOf,
   RETURNED_UNRECORDED,
@@ -245,7 +246,7 @@ const runOf =
         await step();
       }
       let paused = false;
-      for await (const message of runner) {
+      for await (const message of requests(ctx, runner)) {
         // A reply that cannot go on ends the turn, whose tool calls do not run.
         const stopped = stoppedShort(message, maxTokens);
         if (stopped) throw new restate.TerminalError(stopped);
@@ -273,6 +274,33 @@ const runOf =
       if (!paused) throw new Error('the tool runner ended without a reply');
     }
   };
+
+/**
+ * `runner`'s replies, each model request kept alive: from the moment the
+ * loop asks for the next reply until it arrives (the runner does not stream,
+ * so the reply is the whole response), however it ends: an error, or the turn
+ * stopped. The tools run outside it: the loop runs them (`generateToolResponse`)
+ * before it asks again, and the runner then finds their results done.
+ */
+async function* requests<T>(ctx: restate.SessionContext, runner: AsyncIterable<T>): AsyncGenerator<T> {
+  const replies = runner[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const release = keepAlive(ctx);
+      let next: IteratorResult<T>;
+      try {
+        next = await replies.next();
+      } finally {
+        release();
+      }
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    // Ends the runner's loop (its span and its stream) when the caller leaves it early, as a final reply does.
+    await replies.return?.();
+  }
+}
 
 /**
  * Why the model's `message` stopped short of a reply to go on from: cut off
@@ -425,11 +453,13 @@ export const summarizer =
   (options: Options = {}): Summarize =>
   async (ctx, request) => {
     const { client, model, maxTokens } = agentOf(ctx, { ...options, tools: [] });
-    const message = await client.beta.messages.create({
-      model,
-      max_tokens: maxTokens,
-      messages: [{ role: 'user', content: request }],
-    });
+    const message = await ctx.working(() =>
+      client.beta.messages.create({
+        model,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: request }],
+      }),
+    );
     return textOf(message.content);
   };
 

@@ -17,6 +17,7 @@ import {
   handlerOf,
   invalidArguments,
   followedWhileWorking,
+  scopes,
   sqlAttempt,
   withoutIds,
   conversation,
@@ -398,6 +399,74 @@ describe('the DeepSeek Harness agent', () => {
       expect(last).toContain('<compacted-summary>');
       expect(last).not.toContain('0: lorem');
       expect(await prompts(c)).toEqual(['0:', '1:', '2:', '3:', '4:', '5:']);
+    });
+  });
+
+  it('keeps every model request alive, and neither a tool nor a cancelled turn leaves a scope open', async () => {
+    const kept = scopes();
+    const requests: number[] = [];
+    let during = -1;
+    const transfer = tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: () => {
+        during = kept.open;
+        return 'moved';
+      },
+    });
+    const reply = teller.reply;
+    teller.reply = (messages) => {
+      requests.push(kept.open);
+      return reply(messages);
+    };
+    try {
+      const c = conversation(deepseek.chat({ tools: [transfer] }), 'kept', undefined, { working: kept.working });
+      expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe('Done: moved');
+      // The request with the call, the tool's, and the request with its result.
+      expect(requests).toHaveLength(2);
+      expect(requests.every((open) => open > 0)).toBe(true);
+      expect(during).toBe(0);
+      expect(kept.open).toBe(0);
+
+      // Cancelled in the middle of a request.
+      const asked = Promise.withResolvers<void>();
+      const aborted = Promise.withResolvers<never>();
+      teller.reply = () => {
+        asked.resolve();
+        return aborted.promise;
+      };
+      const handler = handlerOf(deepseek.chat({ tools: [transfer] }));
+      const sql = sqlAttempt({ map: new Map(), key: 'kept-cancel', id: 'inv1', working: kept.working });
+      const answering = sql.end(() => handler(sql.ctx, 'Hello'));
+      await asked.promise;
+      expect(kept.open).toBeGreaterThan(0);
+      sql.cancel();
+      await expect(answering).rejects.toBeInstanceOf(restate.CancelledError);
+      // The provider's request ends as the abort reaches it: the scope with it.
+      aborted.reject(new Error('aborted'));
+      await vi.waitFor(() => expect(kept.open).toBe(0));
+    } finally {
+      teller.reply = reply;
+    }
+  });
+
+  it('keeps the request that condenses the input alive too', async () => {
+    await onSmallModel(async ({ requests }) => {
+      const kept = scopes();
+      const open: number[] = [];
+      const reply = teller.reply;
+      teller.reply = (messages) => {
+        open.push(kept.open);
+        return reply(messages);
+      };
+      const c = conversation(condensing, 'condensed-kept', undefined, { working: kept.working });
+      for (let n = 0; n < 6; n++) await c.attempt(`inv${n}`, long(n));
+      expect(saidIn(requests.at(-1)!)).toContain('<compacted-summary>');
+      // Each request, the summary's among them (6 turns, one more request at least).
+      expect(open.length).toBeGreaterThan(6);
+      expect(open.every((n) => n > 0)).toBe(true);
+      expect(kept.open).toBe(0);
     });
   });
 

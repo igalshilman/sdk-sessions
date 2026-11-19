@@ -254,7 +254,7 @@ function toolLoop(
     .addNode('model', async ({ messages }) => {
       const steered = await takeSteers(ctx, conversation);
       const asked = [...messages, ...steered];
-      const reply = await withTools.invoke(system ? [new SystemMessage(system), ...asked] : asked);
+      const reply = await ctx.working(() => withTools.invoke(system ? [new SystemMessage(system), ...asked] : asked));
       await turn.appendReply([reply]);
       return { messages: [...steered, reply] };
     })
@@ -472,8 +472,8 @@ export const messages = () => conversationView(items);
  */
 export const summarizer =
   (model?: Options['model']): Summarize =>
-  async (_ctx, request) =>
-    (await (await modelOfOptions(model)).invoke([new HumanMessage(request)])).text;
+  async (ctx, request) =>
+    ctx.working(async () => (await (await modelOfOptions(model)).invoke([new HumanMessage(request)])).text);
 
 /** An agent: a virtual object `name`, one per key, whose `chat` handler is {@link chat}, and `messages` {@link messages}. */
 export const agent = <P extends string, O extends z.ZodObject | undefined = undefined>({

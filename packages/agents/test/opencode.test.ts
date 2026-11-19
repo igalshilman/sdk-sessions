@@ -32,6 +32,7 @@ import {
   followedWhileWorking,
   followingOf,
   handlerOf,
+  scopes,
   sqlAttempt,
   steeredAtAStep,
   type PromptHandler,
@@ -1580,4 +1581,150 @@ describe.skipIf(!NODE_24)('the OpenCode agent, killed at the end of a turn', () 
       expect(transfers).toBe(1);
     }, 60_000);
   }
+});
+
+/** The model: it calls each of `names`, one reply each, then answers. */
+const calling =
+  (names: string[], requests: number[], kept: ReturnType<typeof scopes>) =>
+  ({ prompt: asked }: Fake.Request): Fake.Reply => {
+    requests.push(kept.open);
+    const done = asked.filter((m) => m.role === 'tool').length;
+    if (done < names.length) return { call: { id: `call_${randomUUID()}`, name: names[done]!, input: {} } };
+    return { text: 'All done' };
+  };
+
+/** The model: it runs the long command, then answers. */
+const sleeper = ({ prompt: asked }: Fake.Request): Fake.Reply =>
+  asked.at(-1)!.role === 'tool'
+    ? { text: 'Slept' }
+    : {
+        call: {
+          id: `call_${randomUUID()}`,
+          name: 'shell',
+          input: { command: 'echo go > started.txt; sleep 1.5; echo end > ended.txt' },
+        },
+      };
+/** What `open` was at each sample while the command ran. */
+const sampled = async () => {
+  const kept = scopes();
+  fake.script.reply = sleeper;
+  const workspace = await workspaceOf();
+  const exists = (name: string) =>
+    readFile(join(workspace, name)).then(
+      () => true,
+      () => false,
+    );
+  const samples: number[] = [];
+  const timer = setInterval(() => {
+    void (async () => {
+      if ((await exists('started.txt')) && !(await exists('ended.txt'))) samples.push(kept.open);
+    })();
+  }, 50);
+  try {
+    const c = conversation(opencode.chat({ workspace }), 'shell', undefined, {
+      working: kept.working,
+    });
+    expect(await c.attempt('inv1', 'Sleep')).toBe('Slept');
+  } finally {
+    clearInterval(timer);
+  }
+  expect(kept.open).toBe(0);
+  return samples;
+};
+
+describe.skipIf(!NODE_24)("the OpenCode agent's scopes of ctx.working", () => {
+  /** The tools' input: nothing. */
+  const NOTHING = z.object({});
+  /** What a tool saw of the scopes, as it ran: `[name, open]`. */
+  const seen: [string, number][] = [];
+  const watched = (kept: ReturnType<typeof scopes>) => [
+    tool({
+      name: 'plain',
+      description: 'A tool that is not kept alive',
+      input: NOTHING,
+      run: async () => (seen.push(['plain', kept.open]), 'plain done'),
+    }),
+    tool({
+      name: 'long',
+      description: 'A tool that is kept alive',
+      input: NOTHING,
+      keepalive: true,
+      run: async () => (seen.push(['long', kept.open]), 'long done'),
+    }),
+  ];
+  beforeEach(() => {
+    seen.length = 0;
+  });
+
+  it('keeps the attempt alive as the model answers, and a tool only if it says so', async () => {
+    const kept = scopes();
+    const requests: number[] = [];
+    fake.script.reply = calling(['plain', 'long'], requests, kept);
+    const c = conversation(opencode.chat({ tools: watched(kept) }), 'scopes', undefined, { working: kept.working });
+    expect(await c.attempt('inv1', 'Go')).toBe('All done');
+    // Every request of the model ran in a scope.
+    expect(requests).toHaveLength(3);
+    expect(requests.every((open) => open > 0)).toBe(true);
+    // The plain tool ran with none. The tool kept alive ran with exactly one: its own scope (the turn's is
+    // paused while any tool runs, as OpenCode has no hook to tell which of them keeps itself alive).
+    expect(seen).toEqual([
+      ['plain', 0],
+      ['long', 1],
+    ]);
+    expect(kept.open).toBe(0);
+  }, 60_000);
+
+  it('holds no scope once a turn is stopped', async () => {
+    const kept = scopes();
+    const chat = handlerOf(opencode.chat({ tools: [] }));
+    const entered = Promise.withResolvers<void>();
+    const sql = sqlAttempt({ map: new Map(), key: 'scopes-stopped', id: 'inv1', working: kept.working });
+    // The model's reply never comes, as the turn is stopped.
+    fake.script.reply = () => {
+      entered.resolve();
+      throw new Error('stopped');
+    };
+    const answering = sql.end(() => chat(sql.ctx, 'Go'));
+    answering.catch(() => {});
+    await entered.promise;
+    expect(kept.open).toBeGreaterThan(0);
+    sql.cancel();
+    await answering.catch(() => {});
+    expect(kept.open).toBe(0);
+  }, 60_000);
+
+  it('holds no scope while a turn waits for an approval, nor once it is stopped there', async () => {
+    const kept = scopes();
+    fake.script.reply = runner;
+    const workspace = await workspaceOf();
+    const chat = handlerOf(opencode.chat({ workspace, approval: true, plugins: [askShell] }));
+    const asked = Promise.withResolvers<void>();
+    const open: number[] = [];
+    const sql = sqlAttempt({
+      map: new Map(),
+      key: 'scopes-approval',
+      id: 'inv1',
+      working: kept.working,
+      signal: () => {
+        open.push(kept.open);
+        asked.resolve();
+        return new Promise(() => {});
+      },
+    });
+    const answering = sql.end(() => chat(sql.ctx, 'Run it'));
+    answering.catch(() => {});
+    await asked.promise;
+    // Even OpenCode's shell, kept alive, waits for its approval outside a scope.
+    expect(open).toEqual([0]);
+    expect(kept.open).toBe(0);
+    sql.cancel();
+    await expect(answering).rejects.toBeInstanceOf(restate.CancelledError);
+    expect(kept.open).toBe(0);
+  }, 60_000);
+
+  it("runs OpenCode's shell in the turn's scope", async () => {
+    const samples = await sampled();
+    expect(samples.length).toBeGreaterThan(5);
+    expect(samples.every((open) => open === 1)).toBe(true);
+  }, 60_000);
 });

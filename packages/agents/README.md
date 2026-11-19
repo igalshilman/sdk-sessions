@@ -481,6 +481,16 @@ stored its result. They keep these calls in the object's database (the
 table `restate_agent_calls`) for this. A tool of your own needs a way for the model to name the call it
 retries (see their READMEs).
 
+**Long work.** Restate shuts an attempt down when it has heard nothing
+from it for its inactivity timeout (a minute, by default), and a new attempt
+runs the turn from where it was stored. Every agent keeps the model's
+requests alive, however long they take, and so do the built-in tools of
+OpenCode and pi (a shell, file edits), which work on the machine. A tool of
+your own is not kept alive, so a wait for a call or a signal holds no
+process: one that works for longer than the timeout sets `keepalive: true`
+(`tool({ ..., keepalive: true })`), or it is cut off by every attempt, and
+keeps long waits on Restate out of its `run`.
+
 **Tools for each invocation** (each user's, say) come with the options of
 `chat`: `pi.chat(async (ctx) => ({ tools: await toolsOf(ctx) }))`.
 

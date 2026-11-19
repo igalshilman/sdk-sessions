@@ -9,7 +9,7 @@ export { asDatabase, lazyDatabase, database, reset, Attempt, withAttempt } from 
 export type { ObjectConfig, SqlHost } from './session.ts';
 export { Link } from './link.ts';
 export { ScopeKey } from './scope.ts';
-export { open, type Connection, type Store, type ConnectionTransaction } from './database.ts';
+export { open, type Connection, type Store, type ConnectionTransaction, type Working } from './database.ts';
 // The attempt on the explicit recovery VM, for the tests that drive one.
 export { AttemptDriver, AttemptFailed, AttemptShutDown } from './driver.ts';
 export { Vm, isShutDown } from './vm.ts';

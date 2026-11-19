@@ -22,11 +22,15 @@ import {
   steeredAtAStep,
   followingOf,
   sqlAttempt,
+  scopes,
 } from './support.ts';
 import { Teller } from './fakes/langgraph.ts';
 import * as langgraph from '@restatedev/agents/langgraph';
 import { prompt } from './langgraph.ts';
 import { bank } from './bank.ts';
+import { tool } from '@restatedev/agents';
+import { z } from 'zod';
+import type { BaseMessage } from '@langchain/core/messages';
 
 describe('the LangGraph agent', () => {
   it('answers arguments that do not fit a tool with what is wrong, for the model to fix', async () => {
@@ -381,5 +385,43 @@ describe('the LangGraph agent, steered', () => {
         'loop',
       ),
     ).toBe(true);
+  });
+});
+
+describe('the LangGraph agent, kept alive', () => {
+  /** The teller, which notes how many scopes are open as it serves each request. */
+  class Watched extends Teller {
+    readonly #kept: { readonly open: number };
+    seen: number[] = [];
+    constructor(kept: { readonly open: number }) {
+      super({});
+      this.#kept = kept;
+    }
+    override reply(messages: BaseMessage[]) {
+      this.seen.push(this.#kept.open);
+      return super.reply(messages);
+    }
+  }
+
+  it('keeps each request of the model alive, and a tool not: none stays open after the turn', async () => {
+    const kept = scopes();
+    const model = new Watched(kept);
+    const inTool: number[] = [];
+    const transfer = tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: async () => {
+        inTool.push(kept.open);
+        return 'moved 5 from account 1 to account 2';
+      },
+    });
+    const c = conversation(langgraph.chat({ model, tools: [transfer] }), 'kept', undefined, { working: kept.working });
+    expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe('Done: moved 5 from account 1 to account 2');
+    // Two requests (the prompt's, the tool's result's), each inside a scope; the tool outside one.
+    expect(model.seen).toHaveLength(2);
+    expect(model.seen.every((open) => open > 0)).toBe(true);
+    expect(inTool).toEqual([0]);
+    expect(kept.open).toBe(0);
   });
 });

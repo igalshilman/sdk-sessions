@@ -7,6 +7,14 @@ import * as pi from '@restatedev/agents/pi';
 import { num, obj } from '@earendil-works/pi-schema';
 import { defineTool } from '@earendil-works/pi-durable';
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createModels } from '@earendil-works/pi-ai/models';
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
+import type { Models } from '@earendil-works/pi-ai';
+import { keptModels } from '../src/pi/keepalive.ts';
 import { callTools, fakeProvider, say, textOf, unavailable } from './fakes/pi.ts';
 import { AttemptEnded } from '../src/common.ts';
 import { Conversation } from '../src/conversation.ts';
@@ -24,6 +32,7 @@ import {
   followingOf,
   sqlAttempt,
   steeredAtAStep,
+  scopes,
 } from './support.ts';
 import { followedRound, THREE_TOOLS } from './following.ts';
 
@@ -489,5 +498,133 @@ describe('pi, steered', () => {
     expect(answer).toBe('moved 5 from account 1 to account 2\nthe books are fine');
     expect(audits).toBe(2);
     expect(taken).toEqual(['steer-1']);
+  });
+});
+
+/** `chat` over the registry `models` of a provider that answers `respond`, in an attempt that counts its scopes. */
+async function turn(
+  kept: ReturnType<typeof scopes>,
+  respond: Parameters<typeof fakeProvider>[2],
+  options: Parameters<typeof pi.withPi>[1],
+  text: string,
+) {
+  const models = createModels();
+  models.setProvider(fakeProvider('scribe', 'scribe', respond));
+  const sql = sqlAttempt({ map: new Map(), key: 'k', id: 'inv', working: kept.working });
+  const chat = chatHandler(async (ctx, message) =>
+    pi.withPi(ctx, { models, model: 'scribe/scribe', ...options }, (p) => p.prompt(message)),
+  );
+  return sql.end(() => chat.handler(sql.ctx, text));
+}
+
+/** A registry whose `streamSimple` answers with `stream`, the request made as it is called. */
+const registryOf = (stream: ReturnType<typeof createAssistantMessageEventStream>) =>
+  ({ streamSimple: () => stream, completeSimple: async () => ({}) }) as unknown as Models;
+const ctxOf = (kept: ReturnType<typeof scopes>) => ({ working: kept.working }) as unknown as restate.SessionContext;
+
+/** A turn whose model runs `bash` for a moment; the scopes open while it runs. */
+async function sleeping(options: Parameters<typeof pi.withPi>[1]) {
+  const root = await mkdtemp(join(tmpdir(), 'pi-kept-'));
+  try {
+    const kept = scopes();
+    const during: number[] = [];
+    const running = turn(
+      kept,
+      (context) =>
+        context.messages.at(-1)!.role === 'toolResult'
+          ? say('done')
+          : callTools([['bash', { command: 'touch started && sleep 0.3' }]]),
+      { workspace: join(root, 'w'), ...options },
+      'sleep a bit',
+    );
+    const sampling = vi
+      .waitFor(() => expect(existsSync(join(root, 'w', 'started'))).toBe(true), { timeout: 10_000, interval: 5 })
+      .then(() => during.push(kept.open));
+    await Promise.all([running, sampling]);
+    return { during, after: kept.open };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+describe('pi, kept alive', () => {
+  it('keeps each request of the model alive, and a tool not: none stays open after the turn', async () => {
+    const kept = scopes();
+    const seen: number[] = [];
+    const inTool: number[] = [];
+    const transfer = tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: async () => {
+        inTool.push(kept.open);
+        return 'moved 5 from account 1 to account 2';
+      },
+    });
+    const answer = await turn(
+      kept,
+      (context) => {
+        seen.push(kept.open);
+        return context.messages.at(-1)!.role === 'toolResult'
+          ? say('Done')
+          : callTools([['transfer', { from: 1, to: 2, amount: 5 }]]);
+      },
+      { tools: [transfer] },
+      'Please move 5 from 1 to 2',
+    );
+    expect(answer).toBe('Done');
+    expect(seen).toHaveLength(2);
+    expect(seen.every((open) => open > 0)).toBe(true);
+    expect(inTool).toEqual([0]);
+    expect(kept.open).toBe(0);
+  });
+
+  it('runs a built-in coding tool kept alive', async () => {
+    const { during, after } = await sleeping({});
+    expect(during[0]).toBeGreaterThan(0);
+    expect(after).toBe(0);
+  });
+
+  describe('the registry', () => {
+    it('keeps a stream alive from its call until it ends', async () => {
+      const kept = scopes();
+      const stream = createAssistantMessageEventStream();
+      const models = keptModels(ctxOf(kept), registryOf(stream));
+      const model = { id: 'm' } as never;
+      const returned = models.streamSimple(model, { messages: [] });
+      expect(kept.open).toBe(1);
+      stream.end({ role: 'assistant', content: [], stopReason: 'stop' } as never);
+      await returned.result();
+      await vi.waitFor(() => expect(kept.open).toBe(0));
+    });
+
+    it('releases a stream its consumer abandons, or whose request is aborted', async () => {
+      const kept = scopes();
+      const abandoned = createAssistantMessageEventStream();
+      const models = keptModels(ctxOf(kept), registryOf(abandoned));
+      // It has an event to break on.
+      abandoned.push({ type: 'start' } as never);
+      for await (const event of models.streamSimple({ id: 'm' } as never, { messages: [] })) {
+        expect(event.type).toBe('start');
+        break;
+      }
+      await vi.waitFor(() => expect(kept.open).toBe(0));
+      // Never ends, and no one iterates: the request's signal ends the wait.
+      const aborting = new AbortController();
+      const stuck = keptModels(ctxOf(kept), registryOf(createAssistantMessageEventStream()));
+      stuck.streamSimple({ id: 'm' } as never, { messages: [] }, { signal: aborting.signal });
+      expect(kept.open).toBe(1);
+      aborting.abort();
+      await vi.waitFor(() => expect(kept.open).toBe(0));
+    });
+
+    it('keeps a request that answers with a promise alive until it settles', async () => {
+      const kept = scopes();
+      const models = keptModels(ctxOf(kept), registryOf(createAssistantMessageEventStream()));
+      const completing = models.completeSimple({ id: 'm' } as never, { messages: [] });
+      expect(kept.open).toBe(1);
+      await completing;
+      expect(kept.open).toBe(0);
+    });
   });
 });

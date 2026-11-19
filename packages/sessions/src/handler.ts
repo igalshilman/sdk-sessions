@@ -78,6 +78,18 @@ export async function serveSession(
   // addon; this is how it asks for the tick that writes what it sent.
   vm.setScheduler(() => driver.scheduleTick());
 
+  // The response ends with the attempt, once the tick wrote its last words:
+  // not when the handler returns. Restate starts the next attempt only once
+  // it has, and a handler that Restate shut down at work of its own (outside
+  // `ctx.working`) runs on until that work is done, its actions throwing.
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    stream.close();
+  };
+  driver.whenEnded(() => setTimeout(close, 0));
+
   // The input pump: the only reader of the request body. It runs until the
   // body ends, beside the handler.
   const ready = Promise.withResolvers<void>();
@@ -100,7 +112,6 @@ export async function serveSession(
   try {
     await ready.promise;
     if (driver.over !== undefined || !driver.isReadyToExecute()) return;
-    driver.startHeartbeats();
     // Input this handler cannot read will not read on the next attempt
     // either: a terminal failure ends the invocation, where a retryable one
     // would have Restate send the same bytes forever. The SDK's own handler
@@ -125,7 +136,7 @@ export async function serveSession(
     await pump;
     // The attempt's last words are buffered: a turn lets the tick write them.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    stream.close();
+    close();
   }
 }
 
@@ -229,6 +240,8 @@ function contextOf(
     // database takes before it issues anything (`session.ts`).
     takeCancellation: () => driver.takeCarriedCancellation(),
     cancelPreviousCalls: () => driver.cancelPreviousCalls(),
+    // What `ctx.working` keeps alive, and the database's own calls too (`session.ts`).
+    working: <T>(fn: () => T | Promise<T>) => driver.working(fn),
     invocationEndPromise: { promise: ending.promise },
     defaultSerde: restate.serde.json,
     // The addon reads and writes the object's state on this, rather than

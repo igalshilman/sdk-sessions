@@ -66,6 +66,7 @@ import { companionHere } from '../companion.ts';
 import { SqlCheckpointSaver } from './checkpointer.ts';
 import { running } from './context.ts';
 import { terminalOf } from './errors.ts';
+import { KeepModelsAlive } from './keepalive.ts';
 
 /** A graph of your own: a `StateGraph` (not compiled), or a compiled one such as LangChain's `createAgent` makes. */
 export type AnyGraph =
@@ -357,12 +358,15 @@ async function runGraph(
   // version its structured answer had before it.
   const saver = new SqlCheckpointSaver(ctx.db, { metadata: { [PROMPT]: promptId, [STRUCTURED_BEFORE]: before } });
   const run = compiled(graph, saver);
+  // Each request of a model is kept alive, wherever the graph makes it (see keepalive.ts).
+  const kept = new KeepModelsAlive(ctx);
   const options = {
     ...THREAD,
     context,
     durability: 'sync',
     streamMode: 'values',
     signal: stopSignalOf(ctx),
+    callbacks: [kept],
   };
   if (asked && snapshot.next.length === 0) {
     // The run had finished, but its answer was not stored: that is the answer, rather than run again.
@@ -394,6 +398,9 @@ async function runGraph(
       // No refusal, whatever its name: a graph's models, tools and nodes are all its own.
       fromTool(ctx, error);
       throw error;
+    } finally {
+      // A request that never reported its end (a stopped run's) must not keep the attempt alive while it waits.
+      kept.releaseAll();
     }
     // The run stops at its interrupts: it goes on with the signals that answer them.
     const paused = await storedState(run);

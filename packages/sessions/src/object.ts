@@ -18,7 +18,7 @@
 import * as restate from '@restatedev/restate-sdk';
 import type { Serde, VirtualObjectDefinition } from '@restatedev/restate-sdk-core';
 import { type CallOptions, type Rpc, rpcOf, type Send, sendOf, type Target } from './calls.ts';
-import type { DatabaseReader, Store } from './database.ts';
+import type { DatabaseReader, Store, Working } from './database.ts';
 import { ensureOf, ensuring, Schema, type Step } from './schema.ts';
 import { patchEndpoint } from './endpoint.ts';
 import { Link } from './link.ts';
@@ -49,6 +49,23 @@ export interface SessionContext {
   readonly send: Send;
   /** Cancel an invocation, by its id: see {@link Cancel}. */
   readonly cancel: Cancel;
+  /**
+   * Run `fn`, keeping the attempt alive while it runs: for work outside
+   * Restate that may outlast Restate's inactivity timeout (a minute, by
+   * default), such as a model's request.
+   *
+   *   const reply = await ctx.working(() => model.generate(prompt));
+   *
+   * Outside it, an attempt Restate hears nothing from for that long is shut
+   * down: it suspends on the calls it waits for, and a new attempt runs the
+   * handler from the start when one answers (or at once, if it waits for
+   * none). So a wait of days holds no process, and work cut off that way is
+   * done again. Inside it, the attempt sends a heartbeat every 20 seconds
+   * (`RESTATE_SESSIONS_HEARTBEAT`, in milliseconds), whatever it waits for:
+   * keep a long wait on Restate (a call, a signal) out of it. The database's
+   * own calls keep the attempt alive by themselves.
+   */
+  readonly working: Working;
 }
 
 /**
@@ -149,6 +166,7 @@ export function host(
     run: (name, action) => exclusive.run(name, action),
     vm: (ctx as { vm?: SqlHost['vm'] }).vm,
     takeCancellation: (ctx as { takeCancellation?: SqlHost['takeCancellation'] }).takeCancellation,
+    working: workingOf(ctx),
     genericSend: (send) => ctx.genericSend(send),
   };
 }
@@ -266,11 +284,16 @@ export function contextOf(
           rpc,
           send: sendOf((send) => void ctx.genericSend(send)),
           cancel,
+          // An attempt the SDK serves (a test's) has nothing to keep alive.
+          working: workingOf(ctx) ?? ((fn) => (async () => fn())()),
         },
     scope,
   );
   return Object.freeze(context);
 }
+
+/** The `working` of an attempt on the VM's context `ctx` (`handler.ts`); none on the SDK's. */
+const workingOf = (ctx: object): Working | undefined => (ctx as { working?: Working }).working;
 
 /** {@link Cancel} over the SDK's context `ctx`. */
 const cancelOf =
@@ -498,17 +521,17 @@ function explicitOf(ctx: SessionContext, of: string) {
  *
  * It watches for the cancellation, and holds nothing: awaited alone, it does
  * not suspend the invocation, and Restate is not told that the handler waits
- * (a heartbeat tells Restate the attempt makes progress instead, see
- * `driver.ts`). The cancel signal comes while Restate keeps
+ * (a heartbeat, in `ctx.working`, tells Restate the attempt makes progress
+ * instead). The cancel signal comes while Restate keeps
  * the invocation's input open. Once Restate closed it (the handler sent and
  * got nothing for the inactivity timeout), a cancellation resolves this at
  * the handler's next await of Restate's, which suspends the invocation and
  * resumes it at once, or not at all if it awaits nothing more.
  *
  * So it is not a way to park a handler until it is cancelled. One that
- * awaits this and nothing else is not suspended: its attempt stays open past
- * the inactivity timeout, Restate aborts it at the abort timeout and retries
- * it from the start, and so on until the cancellation comes.
+ * awaits this and nothing else is not suspended: its attempt is shut down at
+ * the inactivity timeout and started again at once, and so on until the
+ * cancellation comes.
  */
 export const cancelled = async (ctx: SessionContext): Promise<void> => {
   await explicitOf(ctx, 'cancelled').cancellation();

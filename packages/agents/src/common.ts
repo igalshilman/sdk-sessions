@@ -259,6 +259,38 @@ export class AttemptEnded extends Error {
  */
 export const stopSignalOf = (ctx: restate.SessionContext): AbortSignal | undefined => TURN.get(ctx);
 
+// --- Keeping an attempt alive
+//
+// A model's request runs in `ctx.working`, so that Restate does not shut its
+// attempt down while it streams: the request would be made again, from the
+// start of the turn. Nothing else of a turn does, unless a tool says so
+// (`keepalive`): a wait on Restate (a call, a signal) suspends.
+
+/**
+ * Open a `ctx.working` scope until the function it returns is called (once
+ * or more): for a framework's hooks that bracket a model's request without
+ * wrapping it. A scope never released keeps the attempt alive to its end.
+ */
+export function keepAlive(ctx: restate.SessionContext): () => void {
+  const released = Promise.withResolvers<void>();
+  void ctx.working(() => released.promise);
+  return () => released.resolve();
+}
+
+/**
+ * `source`, kept alive while it is iterated: from the first pull to its end,
+ * however it ends (done, thrown, or returned early, as a `break` does). A
+ * model's streamed response, say.
+ */
+export async function* keptAlive<T>(ctx: restate.SessionContext, source: AsyncIterable<T>): AsyncGenerator<T> {
+  const release = keepAlive(ctx);
+  try {
+    yield* source;
+  } finally {
+    release();
+  }
+}
+
 /**
  * An agent's settings: whether it runs in the background (`background:
  * true`: no one follows it as it works), and, for an agent on the

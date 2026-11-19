@@ -13,7 +13,7 @@ import {
   type SqlHost,
   withAttempt,
 } from '@restatedev/sessions/internal';
-import type { AttemptContext, Store } from '@restatedev/sessions/internal';
+import type { AttemptContext, Store, Working } from '@restatedev/sessions/internal';
 
 /**
  * A handler's `ctx.db` over `map` without the SDK, opened on its first call:
@@ -77,6 +77,11 @@ export interface AttemptOptions {
   object?: { readonly name: string };
   /** The object's name, if no `object`: by default, one of its own. */
   service?: string;
+  /**
+   * The handler's `ctx.working`, as the VM's attempt has it: by default, it
+   * just runs. The database's own calls do not use it here.
+   */
+  working?: Working;
 }
 
 /**
@@ -99,6 +104,7 @@ export function sqlAttempt({
   shared = false,
   object,
   service = object?.name ?? `test-${randomUUID()}`,
+  working,
 }: AttemptOptions) {
   const check = () => {
     onRequest();
@@ -163,7 +169,7 @@ export function sqlAttempt({
     set: (name: string, value: unknown) => ctx.set(name, new TextEncoder().encode(JSON.stringify(value))),
     clear: (name: string) => ctx.clear(name),
     /** The handler's context, over this attempt's `ctx.db`. */
-    ctx: contextOf(sdkOf(ctx, cancel), attempt.db, { definition: object }),
+    ctx: contextOf(sdkOf(ctx, cancel, working), attempt.db, { definition: object }),
     /** A view's context, over this attempt's `ctx.db`. */
     view: contextOf(sdkOf(ctx, cancel), attempt.db, { view: true, definition: object }),
     /** Open the session now, as an exclusive attempt starts. */
@@ -197,8 +203,13 @@ const decoded = (parameter: unknown, inputSerde?: unknown) =>
     : parameter;
 
 /** The SDK's context behind a test's attempt `ctx`: its key, request, sends and cancellations. */
-const sdkOf = (ctx: SqlHost & { key: string }, cancel: (invocationId: string) => void): AttemptContext =>
+const sdkOf = (
+  ctx: SqlHost & { key: string },
+  cancel: (invocationId: string) => void,
+  working?: Working,
+): AttemptContext =>
   ({
+    ...(working ? { working } : {}),
     key: ctx.key,
     request: () => ctx.request(),
     genericSend: (send: restate.GenericSend<Uint8Array>) => ctx.genericSend(send),

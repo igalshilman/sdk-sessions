@@ -27,6 +27,7 @@ import {
   handlerOf,
   latestTurn,
   type PromptHandler,
+  scopes,
   sqlAttempt,
   steeredAtAStep,
   withoutIds,
@@ -532,6 +533,69 @@ describe('the Claude agent', () => {
       };
       await run('chat', 'Hello 5');
       expect(asked[0]![0]).toEqual({ role: 'user', content: `${SUMMARY}they chatted` });
+    } finally {
+      teller.reply = reply;
+    }
+  });
+
+  it('keeps every model request alive, and neither a tool nor a failed request leaves a scope open', async () => {
+    const kept = scopes();
+    const open: number[] = [];
+    let during = -1;
+    const transfer = tool({
+      name: 'transfer',
+      description: 'Move money.',
+      input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
+      run: () => {
+        during = kept.open;
+        return 'moved 5 from account 1 to account 2';
+      },
+    });
+    const reply = teller.reply;
+    teller.reply = (messages, request) => {
+      open.push(kept.open);
+      return reply(messages, request);
+    };
+    try {
+      const c = conversation(claude.chat({ tools: [transfer] }), 'kept', undefined, { working: kept.working });
+      expect(await c.attempt('inv1', 'Please move 5 from 1 to 2')).toBe('Done: moved 5 from account 1 to account 2');
+      // The prompt's request, and the request with the tool's result.
+      expect(open).toHaveLength(2);
+      expect(open.every((n) => n > 0)).toBe(true);
+      expect(during).toBe(0);
+      expect(kept.open).toBe(0);
+
+      // A request that fails ends its scope too.
+      let atFailure = 0;
+      teller.reply = () => {
+        atFailure = kept.open;
+        throw new Error('the request failed');
+      };
+      const failed = conversation(claude.chat({ tools: [transfer] }), 'kept-failed', undefined, {
+        working: kept.working,
+      });
+      // The client reports the fake's failure its own way: as its own error, or as a connection's.
+      await expect(failed.attempt('inv1', 'Hello')).rejects.toThrow(/the request failed|Connection error/);
+      expect(atFailure).toBeGreaterThan(0);
+      expect(kept.open).toBe(0);
+    } finally {
+      teller.reply = reply;
+    }
+  });
+
+  it("keeps the summarizer's request alive", async () => {
+    const kept = scopes();
+    let during = -1;
+    const reply = teller.reply;
+    teller.reply = (messages, request) => {
+      during = kept.open;
+      return reply(messages, request);
+    };
+    try {
+      const summarize = claude.summarizer({ client: new (await import('@anthropic-ai/sdk')).default() });
+      await summarize({ working: kept.working } as unknown as restate.SessionContext, 'Summarize the conversation: hi');
+      expect(during).toBeGreaterThan(0);
+      expect(kept.open).toBe(0);
     } finally {
       teller.reply = reply;
     }

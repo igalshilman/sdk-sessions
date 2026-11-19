@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { settleCalls as settle } from '../src/calls.ts';
 import { Conversation, type Entry } from '../src/conversation.ts';
 import { calling, type Item, ITEMS } from './fakes/items.ts';
+import { scopes } from './support.ts';
 
 /** Whether a turn that called `call_1` and stored `output` (an error if `error`) as its result has the call's result. */
 function storedAs(output: string, error = false) {
@@ -33,10 +34,11 @@ const refund = restate.workflow({
 });
 
 /** A context, keyed `alice`, of invocation `inv1`, recording what is called and sent, with the object's database in `state`. */
-function context(state = new Map<string, Uint8Array>()) {
+function context(state = new Map<string, Uint8Array>(), working?: ReturnType<typeof scopes>['working']) {
   const made: Record<string, unknown>[] = [];
   // The SDK's context behind the handler's: what the agent calls and sends.
   const sdk = {
+    ...(working ? { working } : {}),
     key: 'alice',
     request: () => ({ id: 'inv1', target: { service: 'assistant', handler: 'chat', key: 'alice' } }),
     // A call's invocation is the workflow run's of its key, as Restate's is.
@@ -75,6 +77,27 @@ describe('tool', () => {
     expect(result).toMatch(/^Error: the arguments do not fit the tool's input:/);
     expect(result).toMatch(/name/);
     expect(made).toEqual([]);
+  });
+
+  it('runs kept alive only with keepalive', async () => {
+    const kept = scopes();
+    const { ctx } = context(undefined, kept.working);
+    const seen: Record<string, number> = {};
+    const of = (name: string, keepalive?: boolean) =>
+      tool({
+        name,
+        description: name,
+        input: z.object({}),
+        keepalive,
+        run: () => {
+          seen[name] = kept.open;
+          return 'done';
+        },
+      });
+    await of('quick').run({}, { ctx, callId: 'call_1' });
+    await of('long', true).run({}, { ctx, callId: 'call_2' });
+    expect(seen).toEqual({ quick: 0, long: 1 });
+    expect(kept.open).toBe(0);
   });
 });
 

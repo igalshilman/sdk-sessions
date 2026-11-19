@@ -186,7 +186,7 @@ included. `packages/e2e/identity.ts` now signs with a key made for the run and
 asserts the half that can only pass for the right reason: a signed invocation
 runs and answers. A refusal-only test of a verifier proves nothing.
 
-### 6. A heartbeat while the handler works, and only then
+### 6. A heartbeat inside `ctx.working`, and only there
 
 The selector reported a working run so that Restate would not shut an attempt
 down while the handler worked outside Restate — a model request, say. The VM
@@ -194,14 +194,28 @@ has no runs, and shuts an attempt down whenever its inactivity timeout passes
 with nothing heard, so a model request longer than the timeout would restart
 the attempt forever.
 
-The rule here: heartbeat every 20 seconds while the handler runs **and nothing
-of the attempt waits on Restate**. That is the working run's behaviour. When
-something is waiting, a shutdown is the right outcome: Restate starts a new
-attempt when the answer arrives, rather than holding a connection open.
+The rule here: heartbeat every 20 seconds while a `ctx.working(fn)` scope is
+open, **whatever the attempt waits for**, and never outside one. The handler
+says which of its work must not be cut off (a model's request); everything
+else is shut down at the inactivity timeout, which is the right outcome for a
+wait: Restate starts a new attempt when the answer arrives, rather than
+holding a connection open. The database's own calls run in a scope too: they
+are the library's local work, and the open happens before any handler code
+could wrap it.
 
-sdk-python#314 heartbeats while an annotation is open instead. sessions has no
-annotations, so there is nothing to hang that on; if it grows them, the rule
-can narrow to match.
+An earlier rule heartbeat whenever nothing of the attempt waited on Restate.
+It kept a handler stuck on a promise of its own alive forever, and cut off a
+model's request that ran beside an outstanding call; and it decided for the
+handler what its default is. Suspension is the default now.
+
+A scope's first heartbeat comes at once if the attempt has written nothing
+for an interval (most of the timeout may be gone); otherwise on the
+interval, so that the database's scope per call costs no message.
+
+When Restate shuts an attempt down during work of the handler's own, the
+response ends then, not when the handler returns: Restate starts the next
+attempt only once it has. The handler runs on until that work is done, its
+actions throwing.
 
 ### 7. Cancellation: implicit fails the awaits, explicit only tells the handler
 
@@ -370,12 +384,11 @@ caller is awaiting one.
 - **A failed attempt logs nothing locally.** The SDK logs the error that failed
   an invocation before writing it to Restate; this path only writes it. The
   error reaches Restate either way, but `docker logs` is quieter.
-- **Heartbeats stop while any handle is outstanding**, including the result of
-  a call made with `start()` that nobody awaits. That is deliberate: the
-  pathology a heartbeat prevents is an attempt with _nothing_ outstanding being
-  shut down, since Restate then has no answer to resume it with and retries
-  from the start forever. With a call outstanding, a shutdown is recoverable —
-  Restate starts a new attempt when that call answers.
+- **Heartbeats only inside `ctx.working`**, whatever is outstanding, including
+  a call nobody awaits. Outside it, a shutdown is the default: Restate starts a
+  new attempt when a call answers, or at once if none is outstanding, so work
+  of the handler's own that outlasts the timeout without a scope is done again
+  by every attempt (see 6).
 
 ## The issue to open on sdk-typescript
 

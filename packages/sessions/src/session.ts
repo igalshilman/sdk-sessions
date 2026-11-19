@@ -20,6 +20,7 @@ import {
   type SqlValue,
   type Store,
   type ConnectionTransaction,
+  type Working,
 } from './database.ts';
 import type { Vm } from './vm.ts';
 import { Link } from './link.ts';
@@ -84,6 +85,11 @@ export interface SqlHost {
    * attempt, whose own awaits fail with it.
    */
   readonly takeCancellation?: () => boolean;
+  /**
+   * Keeps the attempt alive while a call of the database runs: the VM's
+   * attempt has it (`driver.ts`), the SDK's context does not.
+   */
+  readonly working?: Working;
   genericSend(send: restate.GenericSend<Uint8Array>): unknown;
 }
 
@@ -634,7 +640,7 @@ export class Attempt {
     const onVm = ctx.vm !== undefined;
     const object = onVm ? commitOnly() : objectStore(ctx, end, this.name);
     const db = onVm
-      ? await openOnVm(namespace, object, ctx.vm, { name: this.name, reader: ctx.shared })
+      ? await openOnVm(namespace, object, ctx.vm, { name: this.name, reader: ctx.shared, working: ctx.working })
       : await open(namespace, wrap ? wrap(object) : object, { reader: ctx.shared });
     try {
       // A view writes nothing: a write fails, rather than vanish with the attempt.

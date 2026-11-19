@@ -118,6 +118,7 @@ interface SessionContext {
   readonly rpc: Rpc;
   readonly send: Send;
   readonly cancel: Cancel; // cancel an invocation, by its id
+  working<T>(fn: () => T | Promise<T>): Promise<T>; // keep the attempt alive while fn runs
 }
 
 interface ViewContext {
@@ -132,6 +133,27 @@ interface ViewContext {
 Neither has key/value state, `run`, `sleep`, awakeables, promises or
 signals: the database is a session's only state. You can await their
 operations concurrently, with `Promise.all` or `Promise.race`.
+
+### Long work outside Restate
+
+Restate shuts an attempt down once it has heard nothing from it for its
+inactivity timeout, a minute by default. That is the default on purpose: the
+attempt suspends on the calls it waits for, and a new attempt starts when
+one answers, so a wait of hours or days holds no process. An attempt that
+waits for nothing starts again at once.
+
+Work of the handler's own that may take longer than that, such as a model's
+request, runs in `ctx.working`. While it runs, the attempt sends Restate a
+heartbeat every 20 seconds, whatever else it waits for:
+
+```ts
+const reply = await ctx.working(() => model.generate(prompt));
+```
+
+Keep long waits on Restate (a call, a signal) out of it, or the attempt
+holds its process for as long as they take. Work cut off outside it is done
+again by the next attempt, which runs from the start. The database's own
+calls keep the attempt alive by themselves.
 
 ### Views
 
@@ -550,15 +572,12 @@ storage in the session's database.
   each attempt adds its own.
 - **A shutdown is a restart.** Restate shuts an attempt down once its
   inactivity timeout passes with nothing heard from it, and the next attempt
-  runs from the start. While the handler works outside Restate (a model
-  request, say), the attempt sends a heartbeat every 20 seconds
-  (`RESTATE_SESSIONS_HEARTBEAT`, in milliseconds), so a long handler keeps
-  its attempt. A deployment that shortens Restate's inactivity timeout must
-  shorten this with it. No heartbeat is sent while an answer of Restate's is
-  outstanding (a call's result or invocation id, a send's invocation id, an
-  attachment), even one nobody awaits: Restate then shuts the attempt down
-  after the timeout, and starts the next one when the answer comes. The
-  database's own reads and acks don't stop a heartbeat.
+  runs from the start: when a call it waits for answers, or at once if it
+  waits for none. Only work in `ctx.working`
+  ([long work outside Restate](#long-work-outside-restate)) and the
+  database's own calls keep an attempt alive, with a heartbeat every 20
+  seconds (`RESTATE_SESSIONS_HEARTBEAT`, in milliseconds). A deployment that
+  shortens Restate's inactivity timeout must shorten this with it.
 - **One acked write per commit.** Every commit waits for Restate to ack its
   head's write, a round trip to the runtime. Statements that commit one by
   one pay it each time, so group them in a transaction.

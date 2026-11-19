@@ -2,11 +2,13 @@
 // src/langgraph/graph.ts): the Python SDK's tests/agents_langgraph_graph.py,
 // for what this package takes of it.
 import * as restate from '@restatedev/sessions';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AIMessage, type BaseMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { interrupt, MessagesAnnotation, START, END, StateGraph, Annotation } from '@langchain/langgraph';
 import * as langgraph from '@restatedev/agents/langgraph';
-import { sqlAttempt } from './support.ts';
+import { sqlAttempt, scopes } from './support.ts';
+import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import type { ChatResult } from '@langchain/core/outputs';
 
 /** The texts of `messages`, each with its type. */
 const said = (messages: readonly BaseMessage[]) => messages.map((m) => `${m.getType()}: ${m.text}`);
@@ -302,5 +304,59 @@ describe('a graph of your own', () => {
     expect(await agent.ask('hi')).toBe('system: Be brief. | human: hi');
     expect(await agent.texts()).toEqual(['user: hi', 'assistant: system: Be brief. | human: hi']);
     void HumanMessage;
+  });
+});
+
+const nodeOf = (model: BaseChatModel) =>
+  new StateGraph(MessagesAnnotation)
+    // The model is called without the run's config: the callbacks reach it through LangGraph's own context.
+    .addNode('reply', async ({ messages }) => ({ messages: [await model.invoke(messages)] }))
+    .addEdge(START, 'reply')
+    .addEdge('reply', END);
+
+describe('a graph of your own, kept alive', () => {
+  /** A chat model that notes the scopes open as it serves a request, then answers `reply` (or never, if it is `undefined`). */
+  class Watched extends BaseChatModel {
+    seen: number[] = [];
+    readonly #kept: { readonly open: number };
+    readonly #reply: string | undefined;
+    constructor(kept: { readonly open: number }, reply?: string) {
+      super({});
+      this.#kept = kept;
+      this.#reply = reply;
+    }
+    override _llmType() {
+      return 'watched';
+    }
+    override async _generate(): Promise<ChatResult> {
+      this.seen.push(this.#kept.open);
+      const reply = this.#reply;
+      if (reply === undefined) return new Promise<never>(() => {});
+      return { generations: [{ text: reply, message: new AIMessage(reply) }] };
+    }
+  }
+
+  it("keeps a node's request of the model alive, and none stays open after the turn", async () => {
+    const kept = scopes();
+    const model = new Watched(kept, 'hi there');
+    const chat = langgraph.chat({ graph: nodeOf(model) });
+    const sql = sqlAttempt({ map: new Map(), key: 'k', id: 'inv1', working: kept.working });
+    expect(await sql.end(() => chat.handler(sql.ctx, 'hello'))).toBe('hi there');
+    expect(model.seen).toHaveLength(1);
+    expect(model.seen[0]).toBeGreaterThan(0);
+    expect(kept.open).toBe(0);
+  });
+
+  it('releases the scope of a request cut off by a stop, which no callback ends', async () => {
+    const kept = scopes();
+    const model = new Watched(kept);
+    const chat = langgraph.chat({ graph: nodeOf(model) });
+    const sql = sqlAttempt({ map: new Map(), key: 'k', id: 'inv1', working: kept.working });
+    const answering = sql.end(() => chat.handler(sql.ctx, 'hello')).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(model.seen).toHaveLength(1));
+    expect(kept.open).toBeGreaterThan(0);
+    sql.abort();
+    await answering;
+    expect(kept.open).toBe(0);
   });
 });

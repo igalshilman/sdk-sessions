@@ -67,6 +67,28 @@ const made = (c: Made): Made => ({
 });
 
 /**
+ * A handler's `ctx.working` that counts its open scopes (`open`), for a test
+ * to see whether a model's request or a tool runs kept alive: pass `working`
+ * to {@link sqlAttempt} (or {@link conversation}).
+ */
+export function scopes() {
+  let open = 0;
+  return {
+    get open() {
+      return open;
+    },
+    working: async <T>(fn: () => T | Promise<T>): Promise<T> => {
+      open++;
+      try {
+        return await fn();
+      } finally {
+        open--;
+      }
+    },
+  };
+}
+
+/**
  * An attempt of a handler, @restatedev/sessions's own, with the agent's
  * companion of following over `map`: `ctx`, a handler's context, and `view`,
  * a view's. `route` answers the calls to anything but a companion. A call of
@@ -160,6 +182,8 @@ export function sqlAttempt(
     return method(c.parameter as never);
   };
   const sdk = {
+    // The handler's `ctx.working`, as the VM's attempt has it (a test's `scopes()`, say).
+    ...(options.working ? { working: options.working } : {}),
     key,
     request: () => ({ ...base.request(), target: { service, key, handler: 'chat' } }),
     // A call's invocation: one per target and key, as a workflow's run is,
@@ -234,6 +258,7 @@ export function conversation(
   handler: PromptHandler,
   key: string,
   from?: { state: ReadonlyMap<string, Uint8Array>; ledger: FakeLedger },
+  { working }: { working?: AttemptOptions['working'] } = {},
 ) {
   // From another conversation: a copy of its state.
   const map = new Map<string, Uint8Array>(from?.state);
@@ -311,7 +336,7 @@ export function conversation(
         signals.waits.push(wait);
         return signals.answer ? signals.answer(wait) : new Promise(() => {});
       };
-      const sql = sqlAttempt({ map, fence, key, id: requestId, onRequest, route, signal });
+      const sql = sqlAttempt({ map, fence, key, id: requestId, onRequest, route, signal, working });
       abort = sql.abort;
       const answer = sql.end(() => handlerOf(handler)(sql.ctx, prompt));
       if (crashAt === undefined) return answer;

@@ -411,7 +411,7 @@ await check('an operation starts without an await', async () => {
   assert.equal((await call('Concurrency/eager/eagerCall')).value, true);
 });
 
-await check("a handler's context: the key, the request, the database, calls and cancel", async () => {
+await check("a handler's context: the key, the request, the database, calls, cancel and working", async () => {
   assert.deepEqual((await call('Concurrency/context/context')).value, [
     'cancel',
     'db',
@@ -419,6 +419,7 @@ await check("a handler's context: the key, the request, the database, calls and 
     'request',
     'rpc',
     'send',
+    'working',
   ]);
 });
 

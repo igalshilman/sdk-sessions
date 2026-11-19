@@ -71,6 +71,11 @@
 // `approval`, its tool call waits for a person's approval, through Restate
 // (`permissionPlugin`).
 //
+// The attempt is kept alive (`ctx.working`) while OpenCode's turn runs, its
+// own tools (shell, read, edit...) included, but not while a tool of yours
+// executes (it says so itself: `tool({ keepalive })`), nor while an approval
+// is waited for (`gateOf`): OpenCode has no hook at the end of a model's request.
+//
 // TODO: a change of `model` on an existing session.
 import * as restate from '@restatedev/sessions';
 import { database, reset } from '@restatedev/sessions/internal';
@@ -89,6 +94,7 @@ import {
   configured,
   fromTool,
   inboxOf,
+  keepAlive,
   modelOf,
   providerOf,
   refusal,
@@ -506,6 +512,58 @@ const active = async (host: Host) => {
   return turns[SESSION as string] !== undefined;
 };
 
+/**
+ * Keeps the attempt alive (`ctx.working`) while OpenCode's turn runs, but
+ * not while a tool that is not kept alive executes, nor while a wait on
+ * Restate is made: OpenCode has no hook at the end of a model's request, so
+ * the turn's scope minus those windows is the nearest. The scope is open
+ * exactly while a turn is running (`turn`) and nothing is paused (`pause`:
+ * a set of ids, since tools may overlap, and a pause is made once per id).
+ * `end` closes it for good, whichever way the attempt ends.
+ */
+function gateOf(ctx: restate.SessionContext) {
+  let turns = 0;
+  let closed = false;
+  const paused = new Set<string>();
+  let release: (() => void) | undefined;
+  const sync = () => {
+    const open = !closed && turns > 0 && paused.size === 0;
+    if (open && !release) release = keepAlive(ctx);
+    else if (!open && release) {
+      release();
+      release = undefined;
+    }
+  };
+  return {
+    /** Run `fn` as a turn: the scope is open meanwhile, unless paused. Closed on every way out. */
+    async turn<T>(fn: () => Promise<T>): Promise<T> {
+      turns++;
+      sync();
+      try {
+        return await fn();
+      } finally {
+        turns--;
+        if (turns === 0) paused.clear();
+        sync();
+      }
+    },
+    pause(id: string) {
+      paused.add(id);
+      sync();
+    },
+    resume(id: string) {
+      paused.delete(id);
+      sync();
+    },
+    end() {
+      closed = true;
+      paused.clear();
+      sync();
+    },
+  };
+}
+type Gate = ReturnType<typeof gateOf>;
+
 /** How long a prompt's turn may be neither running nor ended: one resumed at boot starts well within it. */
 const STALLED_MS = 5_000;
 
@@ -845,6 +903,7 @@ function permissionPlugin(
   ctx: restate.SessionContext,
   approval: boolean,
   fail: (error: unknown) => Promise<never>,
+  gate: Gate,
 ): Plugin.Plugin {
   return {
     id: 'restate-agents.permission',
@@ -865,7 +924,12 @@ function permissionPlugin(
         const call = calls.get(callId);
         const asked = { ...call, action: event.action, resources: [...event.resources] };
         // An error of the wait fails the attempt: the ask never settles.
-        const value = await waitFor(ctx, callId, APPROVAL, asked, { approval: true, rejoin: true }).catch(fail);
+        // A wait on Restate is never inside a scope, whatever tool it is of (one kept alive, say).
+        const waiting = `approval:${callId}`;
+        gate.pause(waiting);
+        const value = await waitFor(ctx, callId, APPROVAL, asked, { approval: true, rejoin: true })
+          .catch(fail)
+          .finally(() => gate.resume(waiting));
         const decision = decided(value);
         if (decision.allowed) {
           event.effect = 'allow';
@@ -898,6 +962,10 @@ export const withOpenCode = async <T>(
   const workspace = typeof where === 'function' ? await where(ctx) : where;
   if (workspace) await mkdir(workspace, { recursive: true });
   const fence: Fence = { closed: false };
+  const gate = gateOf(ctx);
+  // OpenCode's own tools (shell, read, edit...) work on the machine and keep the turn alive; ours say so
+  // themselves (their `run` opens a scope of its own).
+  const ours = new Set(tools.map((t) => t.name));
   const { promise: failure, reject: failed } = Promise.withResolvers<never>();
   failure.catch(() => {});
   // A tool's error ends the attempt: nothing more is stored, and the tool
@@ -991,27 +1059,39 @@ export const withOpenCode = async <T>(
   const followPlugin: Plugin.Plugin = {
     id: 'restate-agents.follow',
     async setup(plugin) {
-      const before = await plugin.tool.hook('execute.before', async () => {
-        await copy()
-          .then(() => toolCallStarted(ctx))
-          .catch(fail);
+      // A tool's window: the hooks run, and the tool executes, with the turn's scope paused (the hooks
+      // copy and publish, which wait on Restate), unless the tool is kept alive: then only the hooks.
+      const before = await plugin.tool.hook('execute.before', async (event) => {
+        gate.pause(event.id);
+        try {
+          await copy()
+            .then(() => toolCallStarted(ctx))
+            .catch(fail);
+        } finally {
+          if (!ours.has(event.tool)) gate.resume(event.id);
+        }
       });
       const after = await plugin.tool.hook('execute.after', async (event) => {
-        if (!inboxOf(ctx)) return;
-        const output =
-          event.status === 'error'
-            ? // As OpenCode stores it: a denied permission's reason, say, not the tool's "Unable to read".
-              toSessionError(event.error).message
-            : outputOf({ type: 'tool', state: { status: 'completed', ...event.result } as Content['state'] });
-        const result: ItemResult = {
-          id: event.id,
-          name: event.tool,
-          output,
-          ...(event.status === 'error' ? { error: true } : {}),
-        };
-        await copy({ result, from: `${event.messageID}/${event.id}` })
-          .then(steer)
-          .catch(fail);
+        gate.pause(event.id);
+        try {
+          if (!inboxOf(ctx)) return;
+          const output =
+            event.status === 'error'
+              ? // As OpenCode stores it: a denied permission's reason, say, not the tool's "Unable to read".
+                toSessionError(event.error).message
+              : outputOf({ type: 'tool', state: { status: 'completed', ...event.result } as Content['state'] });
+          const result: ItemResult = {
+            id: event.id,
+            name: event.tool,
+            output,
+            ...(event.status === 'error' ? { error: true } : {}),
+          };
+          await copy({ result, from: `${event.messageID}/${event.id}` })
+            .then(steer)
+            .catch(fail);
+        } finally {
+          gate.resume(event.id);
+        }
       });
       return async () => {
         await before.dispose();
@@ -1054,7 +1134,7 @@ export const withOpenCode = async <T>(
             fail,
             workspace !== undefined,
           ),
-          permissionPlugin(ctx, approval, fail),
+          permissionPlugin(ctx, approval, fail, gate),
           ...(system ? [systemPlugin(system)] : []),
           // An outage OpenCode would stop retrying fails the attempt, as a tool's error does (never a refusal).
           retryPlugin(retry ?? {}, (error) => void fail(error)),
@@ -1144,7 +1224,8 @@ export const withOpenCode = async <T>(
             }),
           );
         }
-        const now = await settled(opened, messageId);
+        // The turn runs from its submit: the scope is open while it does, minus the tools' windows.
+        const now = await gate.turn(() => settled(opened, messageId));
         // A prompt the cancellation's interrupt ended fails with the cancellation.
         if (cancelled) throw cancelled;
         await copy();
@@ -1174,6 +1255,7 @@ export const withOpenCode = async <T>(
     return done;
   } finally {
     stop?.removeEventListener('abort', onStop);
+    gate.end();
     if (turn) live.delete(turn);
     if (booted) {
       const opened = await booted.catch(() => undefined);
