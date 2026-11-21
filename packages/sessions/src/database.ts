@@ -340,6 +340,8 @@ export class Connection extends Sql {
   private readonly running = new AsyncLocalStorage<OpenTransaction>();
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
+  /** The last transaction queued, until it has committed or rolled back: a call queued behind it fires it. */
+  private tail: Gate | undefined;
 
   queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
     return this.serial(() => this.request(() => this.native.queryColumns(sql, params)));
@@ -353,36 +355,45 @@ export class Connection extends Sql {
    * COMMIT rolls back.
    */
   transaction<T>(body: (tx: ConnectionTransaction) => Promise<T>): Promise<T> {
+    const gate = new Gate();
     return this.serial(async () => {
-      await this.request(() => this.native.begin());
-      const tx = new OpenTransaction(this.native, this.boundary);
-      let result: T;
       try {
-        result = await this.running.run(tx, () => body(tx));
-      } catch (error) {
-        await tx.end();
-        await this.rollback();
-        throw error;
-      }
-      const records = await tx.end();
-      // Its commit's sync runs what the body gave `withCommit`; one that
-      // wrote nothing synced nothing, and it runs after.
-      this.boundary.withSync = tx.commitRuns();
-      let unsynced: (() => void) | undefined;
-      try {
-        await this.boundary.alive(() => this.native.commit(records));
-      } catch (error) {
-        // A COMMIT that fails (a deferred constraint) leaves the transaction
-        // open: without the rollback, the calls after it would run inside it.
-        await this.rollback();
-        throw this.failure(error);
+        return await this.run(gate, body);
       } finally {
-        unsynced = this.boundary.withSync;
-        this.boundary.withSync = undefined;
+        if (this.tail === gate) this.tail = undefined;
       }
-      unsynced?.();
-      return result;
-    });
+    }, gate);
+  }
+
+  private async run<T>(gate: Gate, body: (tx: ConnectionTransaction) => Promise<T>): Promise<T> {
+    await this.request(() => this.native.begin());
+    const tx = new OpenTransaction(this.native, this.boundary, gate.promise);
+    let result: T;
+    try {
+      result = await this.running.run(tx, () => body(tx));
+    } catch (error) {
+      await tx.end();
+      await this.rollback();
+      throw error;
+    }
+    const records = await tx.end();
+    // Its commit's sync runs what the body gave `withCommit`; one that
+    // wrote nothing synced nothing, and it runs after.
+    this.boundary.withSync = tx.commitRuns();
+    let unsynced: (() => void) | undefined;
+    try {
+      await this.boundary.alive(() => this.native.commit(records));
+    } catch (error) {
+      // A COMMIT that fails (a deferred constraint) leaves the transaction
+      // open: without the rollback, the calls after it would run inside it.
+      await this.rollback();
+      throw this.failure(error);
+    } finally {
+      unsynced = this.boundary.withSync;
+      this.boundary.withSync = undefined;
+    }
+    unsynced?.();
+    return result;
   }
 
   /**
@@ -413,10 +424,14 @@ export class Connection extends Sql {
   }
 
   /** Run `call` once the calls before it have, unless it comes from the body of a transaction it would wait for. */
-  private serial<T>(call: () => Promise<T>): Promise<T> {
+  private serial<T>(call: () => Promise<T>, transaction?: Gate): Promise<T> {
     if (this.running.getStore()?.open) {
       return Promise.reject(new SqlError('inside a transaction, use the transaction handle its body gets'));
     }
+    // A call queued behind the last transaction tells it so; a transaction
+    // that is itself the last one queued from now on is told by the next.
+    this.tail?.fire();
+    if (transaction !== undefined) this.tail = transaction;
     const result = this.queue.then(call);
     this.queue = result.catch(() => {});
     return result;
@@ -452,6 +467,27 @@ export interface ConnectionTransaction extends DatabaseWriter {
    * transaction rolls back.
    */
   withCommit(run: () => void): void;
+  /**
+   * Settles, and never rejects, once another call to the connection has
+   * queued behind this transaction: it is waiting for the body to settle.
+   * A body that holds the transaction open for more work can return on it,
+   * so that the call costs one commit rather than a stall. A call made
+   * before the transaction began does not settle it, and neither does one
+   * made from the body, which is refused.
+   */
+  readonly queued: Promise<void>;
+}
+
+/** A promise that settles once {@link fire}d. */
+class Gate {
+  readonly promise: Promise<void>;
+  private resolve!: () => void;
+  constructor() {
+    this.promise = new Promise<void>((resolve) => (this.resolve = resolve));
+  }
+  fire(): void {
+    this.resolve();
+  }
 }
 
 /**
@@ -468,6 +504,12 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
   private ended = false;
+  readonly queued: Promise<void>;
+
+  constructor(native: NativeSession, boundary: Boundary, queued: Promise<void>) {
+    super(native, boundary);
+    this.queued = queued;
+  }
 
   /** Whether it is open: its body runs, and holds its session. */
   get open(): boolean {

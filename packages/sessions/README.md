@@ -225,6 +225,14 @@ you await them together, and so do a transaction's statements. A
 transaction holds `ctx.db` until it ends: inside its body, use `tx`, since a
 call to `ctx.db` is refused.
 
+A body that holds its transaction open for more work (a library that batches
+the commits of what it does) can ask whether another call is waiting:
+`tx.queued` is a promise that settles once a call to `ctx.db` has queued
+behind the transaction. A body that returns on it commits, and the waiting
+call runs after that commit and sees it, so that call waits for one commit
+and no more. A call made before the transaction began does not settle it, and
+a body that ignores it behaves as before.
+
 If a crash happens between two commits, the first one stays. Statements that
 must succeed or fail together belong in one transaction.
 

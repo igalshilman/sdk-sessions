@@ -54,6 +54,13 @@ export interface Transaction extends DatabaseWriter {
    * again is dropped.
    */
   readonly send: Send;
+  /**
+   * Settles, and never rejects, once another call to `ctx.db` waits for this
+   * transaction to end. A body that keeps the transaction open for more work
+   * can return when it settles, so that the other call waits for one commit
+   * and no more.
+   */
+  readonly queued: Promise<void>;
 }
 
 /** What the session needs of the handler's context. */
@@ -252,8 +259,8 @@ async function forHandler<T>(call: Promise<T>): Promise<T> {
 }
 
 /** The SQL of a transaction's body: `tx`'s, failing as {@link forHandler} does. */
-function forBody(tx: ConnectionTransaction): DatabaseWriter {
-  return sqlOver((sql, params) => forHandler(tx.queryColumns(sql, params)), handlerError);
+function forBody(tx: ConnectionTransaction): DatabaseWriter & { readonly queued: Promise<void> } {
+  return { ...sqlOver((sql, params) => forHandler(tx.queryColumns(sql, params)), handlerError), queued: tx.queued };
 }
 
 /**

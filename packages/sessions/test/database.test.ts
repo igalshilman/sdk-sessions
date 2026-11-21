@@ -283,6 +283,66 @@ test('a transaction holds the session: other calls wait until it ends', async ()
   await db.save();
 });
 
+test('a transaction learns that a call queued behind it', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+  const events: string[] = [];
+  let release!: () => void;
+  const held = db.transaction(async (tx) => {
+    await tx.execute('INSERT INTO t VALUES(1)');
+    // Nothing is queued: it does not settle.
+    const early = await Promise.race([tx.queued.then(() => true), new Promise((r) => setTimeout(() => r(false), 20))]);
+    assert.equal(early, false);
+    events.push('open');
+    await new Promise<void>((resolve) => (release = resolve));
+    await tx.queued;
+    events.push('queued');
+  });
+  await new Promise((r) => setTimeout(r, 40));
+  // A call behind it makes it settle, and the body returns on it: it commits, and the call sees that.
+  const read = db.values('SELECT id FROM t').then((rows) => {
+    events.push('read');
+    return rows;
+  });
+  release();
+  await held;
+  assert.deepEqual(await read, [[1]]);
+  assert.deepEqual(events, ['open', 'queued', 'read']);
+  await db.save();
+});
+
+test('a transaction ignoring what queued behind it changes nothing, and calls before it or in it do not signal', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+  // A call queued before the transaction began, and one made from its body (refused), do not settle it.
+  const before = db.values('SELECT 1');
+  let signalled = false;
+  const outcome = db.transaction(async (tx) => {
+    void tx.queued.then(() => (signalled = true));
+    await assert.rejects(db.values('SELECT 1'), /use the transaction handle/);
+    await tx.execute('INSERT INTO t VALUES(1)');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(signalled, false);
+    return 'done';
+  });
+  await before;
+  assert.equal(await outcome, 'done');
+  assert.deepEqual(await db.values('SELECT id FROM t'), [[1]]);
+  // A call queued behind it while it waits to begin settles it at once.
+  let seen = false;
+  const first = db.transaction(async () => {
+    await new Promise((r) => setTimeout(r, 10));
+  });
+  const second = db.transaction(async (tx) => {
+    void tx.queued.then(() => (seen = true));
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(seen, true);
+  });
+  const behind = db.values('SELECT 1');
+  await Promise.all([first, second, behind]);
+  await db.save();
+});
+
 test('a COMMIT that fails rolls the transaction back', async () => {
   const db = await open(fresh(), new Backend().request());
   await db.execute('PRAGMA foreign_keys=ON');
