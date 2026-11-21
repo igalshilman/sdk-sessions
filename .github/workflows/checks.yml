@@ -36,6 +36,12 @@ jobs:
       - run: pnpm build
       - run: pnpm lint
       - run: pnpm -r --workspace-concurrency=1 test
+      # pi's commits batched between effects (the `commits: 'effects'` option,
+      # not the default): the agents' tests again, with the option's mode as
+      # the default of the tests.
+      - run: pnpm --filter @restatedev/agents test
+        env:
+          PI_COMMITS: effects
       # Against the Restate server @restatedev/restate-server installs: the
       # explicit recovery VM, Restate's agent tools, steering, and the agents
       # and sessions through crashes (`test/faults.ts` aborts at the VM's
@@ -46,6 +52,13 @@ jobs:
       - run: pnpm --filter e2e steering
       - run: pnpm --filter e2e agentlib
       - run: pnpm --filter e2e crash
+      # The same two with pi's commits batched between effects.
+      - run: pnpm --filter e2e steering
+        env:
+          PI_COMMITS: effects
+      - run: pnpm --filter e2e crash
+        env:
+          PI_COMMITS: effects
       # A deployment that verifies request signatures, which every `connect` is.
       - run: pnpm --filter e2e identity
       # Session objects on the explicit recovery VM, and whether an attempt's

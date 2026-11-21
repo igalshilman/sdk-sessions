@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { call, signal } from '@restatedev/agents';
 import * as restate from '@restatedev/sessions';
-import { callOf, outcomes } from '../src/calls.ts';
+import { callOf, flushHeld, holding, outcomes } from '../src/calls.ts';
 import { waitFor } from '../src/tools.ts';
 
 const lookups = restate.service({ name: 'lookups', handlers: { lookup: async (_ctx, _about: unknown) => 'found' } });
@@ -206,5 +206,40 @@ describe("an attempt's call records", () => {
     const made = await callOf(ctx, 'lookups/lookup', {}, 'c1');
     await made.answered();
     expect(await outcomes(ctx, ['c1'])).toEqual(new Map([['c1', undefined]]));
+  });
+});
+
+describe('what is held back before anything visible (holding)', () => {
+  it('flushes every holder, in the order they were set, and a holder of the same slot replaces the other', async () => {
+    const { ctx } = attempt(new Map());
+    const flushed: string[] = [];
+    const hold = (name: string) => async () => void flushed.push(name);
+    await flushHeld(ctx);
+    expect(flushed).toEqual([]);
+    holding(ctx, hold('conversation'));
+    holding(ctx, hold('pi'), 'pi');
+    await flushHeld(ctx);
+    expect(flushed).toEqual(['conversation', 'pi']);
+    // The same slot: replaced, as one slot was before.
+    flushed.length = 0;
+    holding(ctx, hold('conversation again'));
+    await flushHeld(ctx);
+    expect(flushed).toEqual(['conversation again', 'pi']);
+    // A slot released: the other stays.
+    flushed.length = 0;
+    holding(ctx, undefined, 'pi');
+    await flushHeld(ctx);
+    expect(flushed).toEqual(['conversation again']);
+  });
+
+  it('fails with the error of a holder, and the holders after it are not flushed', async () => {
+    const { ctx } = attempt(new Map());
+    const flushed: string[] = [];
+    holding(ctx, async () => {
+      throw new Error('cannot write');
+    });
+    holding(ctx, async () => void flushed.push('pi'), 'pi');
+    await expect(flushHeld(ctx)).rejects.toThrow('cannot write');
+    expect(flushed).toEqual([]);
   });
 });

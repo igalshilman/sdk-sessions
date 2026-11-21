@@ -23,16 +23,35 @@ const REQUESTS = new Set<PropertyKey>([
 ]);
 
 /**
+ * What a request of the model does with pi's batched commits (storage.ts): it
+ * is an effect, so what pi committed before it is written, and its own
+ * commits are not batched until it is over.
+ */
+export interface Effects {
+  /** The request starts: commits are written at once until the returned function is called (once at most). */
+  started(): () => void;
+  /** Write what is batched. */
+  flush(): Promise<void>;
+}
+
+/**
  * `stream`, kept alive until its response is over: it ends or fails (its
  * `result()` settles: pi-ai ends a stream that is aborted with an error
- * event), its consumer leaves it early, or `signal` aborts.
+ * event), its consumer leaves it early, or `signal` aborts. Then `ended`
+ * is called too: the same events, and no more, so a stream that none of
+ * them reaches never ends its effect, and the batching stays off.
  */
 function keptStream(
   ctx: restate.SessionContext,
   stream: AssistantMessageEventStream,
   signal: AbortSignal | undefined,
+  ended: () => void,
 ): AssistantMessageEventStream {
-  const release = keepAlive(ctx);
+  const alive = keepAlive(ctx);
+  const release = () => {
+    alive();
+    ended();
+  };
   stream.result().then(release, release);
   signal?.addEventListener('abort', release, { once: true });
   if (signal?.aborted) release();
@@ -56,8 +75,13 @@ function keptStream(
   return stream;
 }
 
-/** `models`, each request of whose methods keeps the attempt of `ctx` alive as long as it is out. */
-export function keptModels<M extends Models>(ctx: restate.SessionContext, models: M): M {
+/**
+ * `models`, each request of whose methods keeps the attempt of `ctx` alive as
+ * long as it is out. With `effects`, each is also an effect: a stream's flush
+ * is started as the stream is made and not waited for (the request has no
+ * effect that must not repeat), a promise-returning method's is waited for.
+ */
+export function keptModels<M extends Models>(ctx: restate.SessionContext, models: M, effects?: Effects): M {
   return new Proxy(models, {
     get(target, property) {
       const member: unknown = Reflect.get(target, property, target);
@@ -66,10 +90,31 @@ export function keptModels<M extends Models>(ctx: restate.SessionContext, models
       if (STREAMS.has(property)) {
         return (...args: unknown[]) => {
           const options = args.at(-1) as { signal?: AbortSignal } | undefined;
-          return keptStream(ctx, method(...args) as AssistantMessageEventStream, options?.signal);
+          const ended = effects?.started() ?? (() => {});
+          // A failed flush fails the attempt itself (storage.ts), and is never this request's error.
+          void effects?.flush().catch(() => {});
+          let stream: AssistantMessageEventStream;
+          try {
+            stream = method(...args) as AssistantMessageEventStream;
+          } catch (error) {
+            ended();
+            throw error;
+          }
+          return keptStream(ctx, stream, options?.signal, ended);
         };
       }
-      if (REQUESTS.has(property)) return (...args: unknown[]) => ctx.working(() => method(...args) as Promise<unknown>);
+      if (REQUESTS.has(property)) {
+        if (!effects) return (...args: unknown[]) => ctx.working(() => method(...args) as Promise<unknown>);
+        return async (...args: unknown[]) => {
+          const ended = effects.started();
+          try {
+            await effects.flush();
+            return await ctx.working(() => method(...args) as Promise<unknown>);
+          } finally {
+            ended();
+          }
+        };
+      }
       return method;
     },
   });

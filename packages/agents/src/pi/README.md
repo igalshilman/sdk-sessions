@@ -17,16 +17,17 @@ const assistant = pi.agent({ name: 'assistant', system: 'Answer briefly.', tools
 await serve(assistant);
 ```
 
-| Option        | What                                                                                                                                                           |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`       | `provider/model-id`, of any provider pi-ai knows; or else `MODEL`, or else `openai/gpt-6-sol` (`OPENAI_API_KEY`)                                               |
-| `models`      | A pi-ai model registry, for a provider of your own                                                                                                             |
-| `system`      | The system prompt                                                                                                                                              |
-| `tools`       | `tool()`s and Restate's tools of `@restatedev/agents`, or pi-durable's `defineTool`s                                                                           |
-| `output`      | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers)) |
-| `workspace`   | A directory for pi-durable's coding tools (`read`, `write`, `edit`, `bash`), on the local file system; use a sandbox                                           |
-| `serviceTier` | OpenAI's service tier for each request: `fast` for its fast mode (priced higher), `flex`, and so on                                                            |
-| `retry`       | How pi asks the model again after a request failed for a reason that passes (an outage, a rate limit): by default without limit, 2 s to a minute apart         |
+| Option        | What                                                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`       | `provider/model-id`, of any provider pi-ai knows; or else `MODEL`, or else `openai/gpt-6-sol` (`OPENAI_API_KEY`)                                                   |
+| `models`      | A pi-ai model registry, for a provider of your own                                                                                                                 |
+| `system`      | The system prompt                                                                                                                                                  |
+| `tools`       | `tool()`s and Restate's tools of `@restatedev/agents`, or pi-durable's `defineTool`s                                                                               |
+| `output`      | A zod object: the answer as data, which the agent replies with as JSON, and `chat` answers with (see [Structured answers](../../README.md#structured-answers))     |
+| `workspace`   | A directory for pi-durable's coding tools (`read`, `write`, `edit`, `bash`), on the local file system; use a sandbox                                               |
+| `serviceTier` | OpenAI's service tier for each request: `fast` for its fast mode (priced higher), `flex`, and so on                                                                |
+| `retry`       | How pi asks the model again after a request failed for a reason that passes (an outage, a rate limit): by default without limit, 2 s to a minute apart             |
+| `commits`     | `'each'` (the default): each pi commit is one write to Restate; `'effects'`: one for all the commits between two effects (see [Through crashes](#through-crashes)) |
 
 For a session object of your own, `pi.chat(options)` is the handler and
 `pi.messages()` the view; `options` may be a function of the invocation's context, such as
@@ -56,9 +57,10 @@ model and persona in the object's database.
 
 ## Through crashes
 
-Each pi-durable commit is an SQL transaction in the object's database
-([`storage.ts`](storage.ts)), stored in order with everything else the
-handler does. A retried attempt opens the Harness again and carries on:
+By default (`commits: 'each'`), each pi-durable commit is an SQL transaction
+in the object's database ([`storage.ts`](storage.ts)), stored in order with
+everything else the handler does. A retried attempt opens the Harness again
+and carries on:
 
 - a prompt is submitted once, by its id (pi-durable's `requestId`, the
   invocation's id);
@@ -84,11 +86,40 @@ copies its new entries (the model's replies, the tools' results) into the
 agent's conversation of turns, in the same transaction: what `messages`
 shows ([docs/conversation.md](../../docs/conversation.md)). A commit that
 copied a reply with tool calls, or tools' results, is published once it is
-done, in a `chat` turn (pi commits each result on its own: one publish each;
-a `prompt()` in a handler of your own publishes nothing), and nothing else
+done, in a `chat` turn (with `commits: 'each'`, pi commits each result on its
+own: one publish each; a `prompt()` in a handler of your own publishes nothing), and nothing else
 is: a tool call's start publishes nothing, so a follower reads the calls
 once they are stored, and each output once it is. The views show
 each turn as it was asked and answered, not pi's summaries and handoffs.
+
+### One write for each effect
+
+A step of a turn makes several pi commits (the preparation, the request, the
+reply, the tool's start, its result), and each costs one round trip to
+Restate: a turn of four model requests and three tool calls makes 30. With
+`commits: 'effects'`, the commits between two effects (a model request, a
+tool call) share one write: the same turn makes 10 (the turn opening, each
+effect's start, the answer, the turn closing); in a `chat` turn that is
+followed, a publish after each round that reads what was steered to it adds
+one for each round. While an effect runs, its own commits (a model's
+progress, a tool's result) are written at once, as with `'each'`; so is
+everything outside a prompt (`work`, a compaction).
+
+What `'effects'` keeps: what pi committed before an effect starts is stored
+before it does, so a request or a tool call never runs ahead of its own
+history; and what anyone else can see (a publish, a Restate call, a send, the
+end of the handler, a `ctx.db` call of your own) comes after a write of all
+of it, never before. A failed pi commit still undoes only itself, and a
+`ctx.db` call from inside one is refused, as with `'each'`.
+
+What it gives up: what pi commits in the milliseconds between one effect's
+result and the next effect's start is lost in a crash, and the retried
+attempt does it again from the state that was stored. Tools that start together start
+after one write, and the results of tools that end together are stored in one
+commit, and published once. A `ctx.db` call of yours made while pi has
+commits to write costs one more write (for the commits, which it waits for),
+and no stall. A write of the commits that fails fails the attempt, as a
+failed commit does, though pi was told its commits were done.
 
 The files of a `workspace` are not in the database: they last as long as the
 disk does, and a coding tool a crash cut off is not run again (the model is

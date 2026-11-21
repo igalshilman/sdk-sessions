@@ -540,8 +540,11 @@ and its ask never settles, so the harness stores no decision.
 ### Today
 
 - **pi-durable's own storage**, its tables prefixed `restate_pi_`, over
-  `ctx.db` ([`src/pi/storage.ts`](../src/pi/storage.ts)): each pi commit is
-  one `ctx.db.transaction` (`storage.ts:54-56`), and pi applies its own
+  `ctx.db` ([`src/pi/storage.ts`](../src/pi/storage.ts)): by default
+  (`commits: 'each'`) each pi commit is one `ctx.db.transaction`; with
+  `commits: 'effects'` the commits between two effects (a model request, a
+  tool call) share one, each a savepoint in it (see the pi README, "One write
+  for each effect"). pi applies its own
   migrations (through chord, recorded in `restate_pi_durable_schema`).
 - **Tables**: `durable_metadata`, `record_ids`, `conversations`, `entries`
   (kinds `pi.user`, `pi.assistant`, `pi.system`, `pi.tool-result`,
@@ -588,7 +591,7 @@ and its ask never settles, so the harness stores no decision.
   says nothing. `reply(text)` makes an `AssistantMessage` (the current api,
   provider and model, no usage, `stopReason: 'stop'`), for the store only.
 - **Copy**: after each pi commit, in the storage adapter's own transaction
-  (`storage.ts:54-56`); never from `afterResponse`, which runs before pi's
+  (with `commits: 'effects'`, in the savepoint of the batch it joins); never from `afterResponse`, which runs before pi's
   commit. Entries made between turns (a `withPi` compaction or reset) are
   not copied.
 - **A spike first**, on three questions: can a dead run be aborted before
@@ -633,7 +636,8 @@ and its ask never settles, so the harness stores no decision.
   failure), which `answerOnce` closes. Asking again within the turn is a
   second submission, `<prompt id>:again`.
 - **The copy**: each pi commit is one transaction of the storage facade
-  (`SqlKvDatabase`), whose `onCommit` copies, in it, the root
+  (`SqlKvDatabase`; with `commits: 'effects'`, one savepoint of the transaction
+  a batch of commits shares), whose `onCommit` copies, in it, the root
   conversation's entries after the turn's user entry (its submission's
   `entry`) and after the last copied: `pi.assistant` and `pi.tool-result`,
   each item keeping its entry id.

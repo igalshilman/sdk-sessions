@@ -69,24 +69,38 @@ export const SCHEMA = new Schema('restate-agents.calls', [
 /** What the calls need of a handler's context. */
 type CallsContext = Pick<restate.SessionContext, 'db' | 'request'>;
 
-/** What writes the rows the conversation of the attempt's turn holds back, by its context. */
-const HELD = new ScopeKey<() => Promise<void>>('the held rows of the conversation');
+/** What writes what is held back before anything visible, by holder: the conversation's rows, pi's batch of commits. */
+const HELD = new ScopeKey<Map<string, () => Promise<void>>>('what the attempt holds back');
 
 /**
- * Have {@link flushHeld} write, with `flush`, the rows that the conversation
- * of the attempt's turn holds back (`Conversation.hold`): `answerOnce` does.
+ * Have {@link flushHeld} write, with `flush`, what a holder keeps back: by
+ * default the rows that the conversation of the attempt's turn holds back
+ * (`Conversation.hold`), which `answerOnce` sets. A holder of another `slot`
+ * (pi's storage, which holds its commits until an effect starts) coexists
+ * with it; one of the same slot replaces it, and without a `flush` the slot
+ * is released.
  */
-export const holding = (ctx: restate.SessionContext, flush: () => Promise<void>) => HELD.set(ctx, flush);
+export const holding = (
+  ctx: restate.SessionContext,
+  flush: (() => Promise<void>) | undefined,
+  slot = 'conversation',
+) => {
+  const held = HELD.of(ctx, () => new Map());
+  if (flush) held.set(slot, flush);
+  else held.delete(slot);
+};
 
 /**
- * Write the rows that the conversation of the attempt's turn holds back, if
- * any (see `Conversation.hold`). Call it before what another party sees, or
- * what outlives the attempt: a publish, a Restate call, send or wait. A held
- * row is lost in a crash, and the retried attempt makes it again; what was
- * seen or called must not depend on it.
+ * Write what the holders keep back, in the order they were set, one after
+ * the other: the rows that the conversation of the attempt's turn holds back,
+ * if any (see `Conversation.hold`), and pi's batched commits. Call it before
+ * what another party sees, or what outlives the attempt: a publish, a
+ * Restate call, send or wait. What is held is lost in a crash, and the
+ * retried attempt makes it again; what was seen or called must not depend
+ * on it.
  */
 export async function flushHeld(ctx: restate.SessionContext) {
-  await HELD.get(ctx)?.();
+  for (const flush of HELD.get(ctx)?.values() ?? []) await flush();
 }
 
 /**
