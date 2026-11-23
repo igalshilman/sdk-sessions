@@ -365,3 +365,29 @@ describe('the sends of a transaction', () => {
     expect(a.sent.map(decode)).toEqual(['book']);
   });
 });
+
+describe('a transaction that learns of a call waiting for it', () => {
+  it('commits when its body returns on `queued`, and the call then sees it', async () => {
+    const a = object().attempt();
+    const events: string[] = [];
+    await a.end(async () => {
+      await a.db.execute('CREATE TABLE t (v INTEGER)');
+      let release!: () => void;
+      const held = a.db.transaction(async (tx) => {
+        await tx.execute('INSERT INTO t VALUES (1)');
+        await new Promise<void>((resolve) => (release = resolve));
+        await tx.queued;
+        events.push('returned');
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      const read = a.db.values('SELECT v FROM t').then((rows) => {
+        events.push('read');
+        return rows;
+      });
+      release();
+      await held;
+      expect(await read).toEqual([[1]]);
+    });
+    expect(events).toEqual(['returned', 'read']);
+  });
+});

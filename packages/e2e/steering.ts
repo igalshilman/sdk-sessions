@@ -63,7 +63,11 @@ const options = {
   model: 'script/script',
   models,
   tools: [signal('approval', { description: 'Wait for a manager', input: z.object({}) })],
+  // PI_COMMITS=effects batches pi's commits between effects.
+  commits: process.env.PI_COMMITS === 'effects' ? ('effects' as const) : undefined,
 };
+
+console.log(`pi agents: commits '${options.commits ?? 'each'}'`);
 
 /** A pi agent, whose turns take steered messages at their steps. */
 const planner = pi.agent({ name: 'planner', ...options });

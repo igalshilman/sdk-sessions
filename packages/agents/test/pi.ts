@@ -16,6 +16,7 @@ import { defineTool, type ToolRegistration } from '@earendil-works/pi-durable';
 import { serveIfMain } from '@restatedev/sessions/test/faults';
 import { ledger } from '@restatedev/sessions/test/ledger';
 import * as pi from '@restatedev/agents/pi';
+import { commitsDefault } from '../src/pi/commits.ts';
 
 /** The bank tools of an invocation: they reach the ledger through `ctx`. */
 const transfer = (ctx: restate.SessionContext) =>
@@ -59,7 +60,11 @@ const audit = (ctx: restate.SessionContext) =>
 export const tools = (ctx: restate.SessionContext): [ToolRegistration, ToolRegistration] => [transfer(ctx), audit(ctx)];
 
 /** Answer a message, once per invocation. */
-export const prompt = pi.chat((ctx) => ({ tools: tools(ctx) }));
+// PI_COMMITS=effects serves it with batched commits (the tests against a Restate server, ../../e2e).
+const chosen = process.env.PI_COMMITS === 'effects' ? 'effects' : undefined;
+/** The mode the agent runs in, which the tests against a server log once as they serve it (../../e2e/serve.ts). */
+export const commits = chosen ?? commitsDefault.commits;
+export const prompt = pi.chat((ctx) => ({ tools: tools(ctx), commits: chosen }));
 
 export const agent = sessionObject({ name: 'Agent', handlers: { chat: prompt }, views: { messages: pi.messages() } });
 

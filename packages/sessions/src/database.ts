@@ -57,26 +57,88 @@ export interface DatabaseWriter extends DatabaseReader {
   execute(sql: string, params?: SqlParam[]): Promise<void>;
 }
 
+/**
+ * What the addon refuses as a parameter before it runs a call (its conversion
+ * of an SQL value): a failure here is the call's own, and nothing ran.
+ */
+function checkParams(params: SqlParam[] | undefined): void {
+  for (const param of params ?? []) {
+    const type = typeof param;
+    if (type === 'bigint' && ((param as bigint) > 2n ** 63n - 1n || (param as bigint) < -(2n ** 63n))) {
+      throw new Error('a bigint parameter exceeds 64 bits');
+    }
+    if (type === 'symbol' || type === 'function') {
+      throw new Error(`unsupported SQL value: ${type === 'symbol' ? 'Symbol' : 'Function'}`);
+    }
+    if (type === 'object' && param !== null && !(param instanceof Uint8Array)) {
+      throw new Error('unsupported SQL value: Object');
+    }
+  }
+}
+
+/** Nothing: what settles a queue's last call, and what `execute` resolves with. */
+const nothing = (): void => {};
+
 /** The rows of `result` as objects by column name; a column name twice is an {@link SqlError}. */
 function objects({ columns, rows }: SqlQueryResult): Row[] {
-  if (new Set(columns).size !== columns.length) {
-    const twice = columns.find((name, i) => columns.indexOf(name) !== i);
+  const names = columns.length;
+  let twice: string | undefined;
+  for (let i = 1; i < names && twice === undefined; i++) {
+    // A statement has a handful of columns: comparing them pairwise costs less than a Set.
+    for (let j = 0; j < i; j++) {
+      if (columns[j] === columns[i]) {
+        twice = columns[i];
+        break;
+      }
+    }
+  }
+  if (twice !== undefined) {
     throw new SqlError(`the column ${twice} is named twice: alias one (AS), or read the rows with values()`);
   }
-  return rows.map((row) => Object.fromEntries(columns.map((name, i) => [name, row[i]!])));
+  // A column named `__proto__` is an own property of the row, as `Object.fromEntries` makes it;
+  // assignment would set the row's prototype instead.
+  if (columns.includes('__proto__')) {
+    return rows.map((row) => Object.fromEntries(columns.map((name, i) => [name, row[i]!])));
+  }
+  const result: Row[] = [];
+  for (const row of rows) {
+    const object: Row = {};
+    for (let i = 0; i < names; i++) object[columns[i]!] = row[i]!;
+    result.push(object);
+  }
+  return result;
 }
+
+// `result` mapped, as a promise: a result that is ready is mapped now, and a failure of the mapping is a rejection.
+const mapped = <T>(result: Answer<SqlQueryResult>, map: (result: SqlQueryResult) => T): Promise<T> => {
+  if (result instanceof Promise) return result.then(map);
+  try {
+    return Promise.resolve(map(result));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+};
 
 /**
  * {@link DatabaseWriter} over `run`, which runs one call's SQL and returns
  * its rows with their columns, failing as `failure` makes its errors (as
- * `run` makes the engine's).
+ * `run` makes the engine's). `run` answers with the value itself when the
+ * call was ready at once, which only this package sees: each call returns a
+ * promise.
  */
 export function sqlOver(
-  run: (sql: string, params?: SqlParam[]) => Promise<SqlQueryResult>,
+  run: (sql: string, params?: SqlParam[]) => Answer<SqlQueryResult>,
   failure: (error: unknown) => unknown = (error) => error,
 ): DatabaseWriter {
-  const rowsOf = async (sql: string, params?: SqlParam[]) => {
-    const result = await run(sql, params);
+  // A `run` that throws is a rejection, as it was when each of these was an async function.
+  const start = (sql: string, params?: SqlParam[]): Answer<SqlQueryResult> => {
+    try {
+      return run(sql, params);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+  const rowsOf = (result: SqlQueryResult): Row[] => {
     try {
       return objects(result);
     } catch (error) {
@@ -84,10 +146,11 @@ export function sqlOver(
     }
   };
   return {
-    query: async <T>(sql: string, params?: SqlParam[]) => (await rowsOf(sql, params)) as T[],
-    get: async <T>(sql: string, params?: SqlParam[]) => (await rowsOf(sql, params))[0] as T | undefined,
-    values: async (sql, params) => (await run(sql, params)).rows,
-    execute: async (sql, params) => void (await run(sql, params)),
+    query: <T>(sql: string, params?: SqlParam[]) => mapped(start(sql, params), rowsOf) as Promise<T[]>,
+    get: <T>(sql: string, params?: SqlParam[]) =>
+      mapped(start(sql, params), (result) => rowsOf(result)[0] as T | undefined),
+    values: (sql, params) => mapped(start(sql, params), (result) => result.rows),
+    execute: (sql, params) => mapped(start(sql, params), nothing),
   };
 }
 
@@ -124,8 +187,11 @@ interface Addon {
  */
 interface NativeSession {
   queryColumns(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
+  /** `queryColumns`, after `before`'s statements in the same call; absent in an addon without it. */
+  queryColumnsAfter?(before: string[], sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
   begin(): Answer<void>;
-  commit(records: Record<string, Buffer>): Answer<void>;
+  /** `withCommit`: whether the transaction has work to run at the commit's sync (see `Boundary.sync`). */
+  commit(records: Record<string, Buffer>, withCommit?: boolean): Answer<void>;
   rollback(): Answer<void>;
   record(name: string): Answer<Buffer>;
   isUsable(): boolean;
@@ -230,6 +296,17 @@ class Boundary implements Store {
     });
   }
 
+  /**
+   * `call`'s value if it is ready (the addon answers at once): then no scope
+   * is opened, as nothing waited; a promise runs on in the attempt's `working`
+   * scope, which opens as the call returns it.
+   */
+  aliveNow<T>(call: () => Answer<T>): Answer<T> {
+    const result = call();
+    if (!(result instanceof Promise)) return result;
+    return this.working === undefined ? result : this.working(() => result);
+  }
+
   /** `call`, in the attempt's `working` scope if the database has one. */
   alive<T>(call: () => T | Promise<T>): Promise<T> {
     return this.working === undefined ? (async () => call())() : this.working(call);
@@ -252,33 +329,59 @@ class Boundary implements Store {
 
 /**
  * SQL on a session of the addon: {@link DatabaseWriter}'s `query` and `execute`
- * by way of its `queryColumns`.
+ * by way of its `queryColumnsNow`.
  */
 abstract class Sql implements DatabaseWriter {
   protected readonly native: NativeSession;
   protected readonly boundary: Boundary;
+  private readonly over: DatabaseWriter;
 
   constructor(native: NativeSession, boundary: Boundary) {
     this.native = native;
     this.boundary = boundary;
+    this.over = sqlOver((s, p) => this.queryColumnsNow(s, p));
   }
 
-  abstract queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult>;
+  /**
+   * The rows of one statement with their column names: the value itself if
+   * the addon answered at once (only the package's own code takes it so), else
+   * a promise of it. A failure is a rejection.
+   */
+  abstract queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
+
+  queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
+    const result = this.queryColumnsNow(sql, params);
+    return result instanceof Promise ? result : Promise.resolve(result);
+  }
 
   query<T = Row>(sql: string, params?: SqlParam[]): Promise<T[]> {
-    return sqlOver((s, p) => this.queryColumns(s, p)).query<T>(sql, params);
+    return this.over.query<T>(sql, params);
   }
 
   get<T = Row>(sql: string, params?: SqlParam[]): Promise<T | undefined> {
-    return sqlOver((s, p) => this.queryColumns(s, p)).get<T>(sql, params);
+    return this.over.get<T>(sql, params);
   }
 
   values(sql: string, params?: SqlParam[]): Promise<SqlValue[][]> {
-    return sqlOver((s, p) => this.queryColumns(s, p)).values(sql, params);
+    return this.over.values(sql, params);
   }
 
-  async execute(sql: string, params?: SqlParam[]): Promise<void> {
-    await this.queryColumns(sql, params);
+  execute(sql: string, params?: SqlParam[]): Promise<void> {
+    return this.over.execute(sql, params);
+  }
+
+  /** {@link request}, but the value itself if it is ready, and then without a scope or a promise. */
+  protected requestNow<T>(call: () => Answer<T>): Answer<T> {
+    let result: Answer<T>;
+    try {
+      result = this.boundary.aliveNow(call);
+    } catch (error) {
+      return Promise.reject(this.failure(error));
+    }
+    if (!(result instanceof Promise)) return result;
+    return result.catch((error: unknown) => {
+      throw this.failure(error);
+    });
   }
 
   /**
@@ -286,12 +389,16 @@ abstract class Sql implements DatabaseWriter {
    * addon throws as it is called (arguments it cannot convert, and the error
    * of a call that answers at once).
    */
-  protected async request<T>(call: () => Answer<T>): Promise<T> {
+  protected request<T>(call: () => Answer<T>): Promise<T> {
+    let alive: Promise<T>;
     try {
-      return await this.boundary.alive(call);
+      alive = this.boundary.alive(call);
     } catch (error) {
-      throw this.failure(error);
+      return Promise.reject(this.failure(error));
     }
+    return alive.catch((error: unknown) => {
+      throw this.failure(error);
+    });
   }
 
   /**
@@ -340,8 +447,23 @@ export class Connection extends Sql {
   private readonly running = new AsyncLocalStorage<OpenTransaction>();
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
+  /** The last transaction queued, until it has committed or rolled back: a call queued behind it fires it. */
+  private tail: Gate | undefined;
+  /** Calls queued and not settled: with none, a call that is ready runs at once, in order. */
+  private inflight = 0;
+  private readonly release = (): void => {
+    this.inflight--;
+  };
 
-  queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
+  queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult> {
+    if (this.inflight === 0 && this.running.getStore()?.open !== true) {
+      const result = this.requestNow(() => this.native.queryColumns(sql, params));
+      if (!(result instanceof Promise)) return result;
+      // Not ready: the calls after it queue behind it.
+      this.inflight++;
+      this.queue = result.then(this.release, this.release);
+      return result;
+    }
     return this.serial(() => this.request(() => this.native.queryColumns(sql, params)));
   }
 
@@ -353,36 +475,49 @@ export class Connection extends Sql {
    * COMMIT rolls back.
    */
   transaction<T>(body: (tx: ConnectionTransaction) => Promise<T>): Promise<T> {
+    const gate = new Gate();
     return this.serial(async () => {
-      await this.request(() => this.native.begin());
-      const tx = new OpenTransaction(this.native, this.boundary);
-      let result: T;
       try {
-        result = await this.running.run(tx, () => body(tx));
-      } catch (error) {
-        await tx.end();
-        await this.rollback();
-        throw error;
-      }
-      const records = await tx.end();
-      // Its commit's sync runs what the body gave `withCommit`; one that
-      // wrote nothing synced nothing, and it runs after.
-      this.boundary.withSync = tx.commitRuns();
-      let unsynced: (() => void) | undefined;
-      try {
-        await this.boundary.alive(() => this.native.commit(records));
-      } catch (error) {
-        // A COMMIT that fails (a deferred constraint) leaves the transaction
-        // open: without the rollback, the calls after it would run inside it.
-        await this.rollback();
-        throw this.failure(error);
+        return await this.run(gate, body);
       } finally {
-        unsynced = this.boundary.withSync;
-        this.boundary.withSync = undefined;
+        if (this.tail === gate) this.tail = undefined;
       }
-      unsynced?.();
-      return result;
-    });
+    }, gate);
+  }
+
+  private async run<T>(gate: Gate, body: (tx: ConnectionTransaction) => Promise<T>): Promise<T> {
+    await this.request(() => this.native.begin());
+    const tx = new OpenTransaction(this.native, this.boundary, gate.promise);
+    let result: T;
+    try {
+      result = await this.running.run(tx, () => body(tx));
+      await tx.drain();
+    } catch (error) {
+      await tx.end();
+      await this.rollback();
+      throw error;
+    }
+    const records = await tx.end();
+    // Its commit's sync runs what the body gave `withCommit`; one that
+    // wrote nothing synced nothing, and it runs after.
+    const runs = tx.commitRuns();
+    this.boundary.withSync = runs;
+    let unsynced: (() => void) | undefined;
+    try {
+      // Told whether there is work, the addon on the VM skips the call back
+      // that would only run it.
+      await this.boundary.alive(() => this.native.commit(records, runs !== undefined));
+    } catch (error) {
+      // A COMMIT that fails (a deferred constraint) leaves the transaction
+      // open: without the rollback, the calls after it would run inside it.
+      await this.rollback();
+      throw this.failure(error);
+    } finally {
+      unsynced = this.boundary.withSync;
+      this.boundary.withSync = undefined;
+    }
+    unsynced?.();
+    return result;
   }
 
   /**
@@ -413,12 +548,17 @@ export class Connection extends Sql {
   }
 
   /** Run `call` once the calls before it have, unless it comes from the body of a transaction it would wait for. */
-  private serial<T>(call: () => Promise<T>): Promise<T> {
+  private serial<T>(call: () => Promise<T>, transaction?: Gate): Promise<T> {
     if (this.running.getStore()?.open) {
       return Promise.reject(new SqlError('inside a transaction, use the transaction handle its body gets'));
     }
+    // A call queued behind the last transaction tells it so; a transaction
+    // that is itself the last one queued from now on is told by the next.
+    this.tail?.fire();
+    if (transaction !== undefined) this.tail = transaction;
+    this.inflight++;
     const result = this.queue.then(call);
-    this.queue = result.catch(() => {});
+    this.queue = result.then(this.release, this.release);
     return result;
   }
 
@@ -434,6 +574,8 @@ export class Connection extends Sql {
 export interface ConnectionTransaction extends DatabaseWriter {
   /** The rows of one statement, with their column names. */
   queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult>;
+  /** {@link queryColumns} for the package's own code: the value itself if the addon answered at once. */
+  queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
   /**
    * Set the record `name` to `value` with this transaction, in the same
    * write: a whole value kept beside the SQL, in no table, stored exactly
@@ -452,6 +594,43 @@ export interface ConnectionTransaction extends DatabaseWriter {
    * transaction rolls back.
    */
   withCommit(run: () => void): void;
+  /**
+   * Have `sql` (one statement, no parameters) run just before the next call
+   * of this transaction, in the same call to the addon: the statements are
+   * the ones a call of their own would run, in the order the calls are made,
+   * and the call fails with the error of the first that fails. It spares
+   * the crossing of a call. Returns false, and queues nothing, where the
+   * addon cannot (an addon without `queryColumnsAfter`): run the statement
+   * with {@link queryColumns}. One still queued as the body settles runs
+   * then, before the commit, and its failure fails the transaction.
+   */
+  defer(sql: string): boolean;
+  /**
+   * Take back the last `sql` that {@link defer} queued if no call has taken
+   * it yet: it never runs. Whether it did.
+   */
+  undefer(sql: string): boolean;
+  /**
+   * Settles, and never rejects, once another call to the connection has
+   * queued behind this transaction: it is waiting for the body to settle.
+   * A body that holds the transaction open for more work can return on it,
+   * so that the call costs one commit rather than a stall. A call made
+   * before the transaction began does not settle it, and neither does one
+   * made from the body, which is refused.
+   */
+  readonly queued: Promise<void>;
+}
+
+/** A promise that settles once {@link fire}d. */
+class Gate {
+  readonly promise: Promise<void>;
+  private resolve!: () => void;
+  constructor() {
+    this.promise = new Promise<void>((resolve) => (this.resolve = resolve));
+  }
+  fire(): void {
+    this.resolve();
+  }
 }
 
 /**
@@ -467,7 +646,19 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   private readonly withCommits: (() => void)[] = [];
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
+  private inflight = 0;
+  private readonly release = (): void => {
+    this.inflight--;
+  };
+  /** SQL that runs with the next call made (`defer`). */
+  private deferred: string[] = [];
   private ended = false;
+  readonly queued: Promise<void>;
+
+  constructor(native: NativeSession, boundary: Boundary, queued: Promise<void>) {
+    super(native, boundary);
+    this.queued = queued;
+  }
 
   /** Whether it is open: its body runs, and holds its session. */
   get open(): boolean {
@@ -484,8 +675,55 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
     return Object.fromEntries(this.records);
   }
 
-  queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
-    return this.serial(() => this.request(() => this.native.queryColumns(sql, params)));
+  queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult> {
+    if (this.ended) return Promise.reject(new SqlError('the transaction has ended'));
+    // The call fails before it runs anything if the addon cannot take its parameters: it must not have taken
+    // the deferred statements, which no call would then run (the addon's conversion is checked here, as it
+    // comes first there, and cannot be told from a failure of the SQL once it has run).
+    if (this.deferred.length > 0) {
+      try {
+        checkParams(params);
+      } catch (error) {
+        return Promise.reject(this.failure(error));
+      }
+    }
+    // Taken as the call is made, not as it runs: a call made before the deferral runs before it.
+    const before = this.deferred.splice(0);
+    const call = () =>
+      before.length === 0 ? this.native.queryColumns(sql, params) : this.native.queryColumnsAfter!(before, sql, params);
+    if (this.inflight === 0 && !this.ended) {
+      const result = this.requestNow(call);
+      if (!(result instanceof Promise)) return result;
+      this.inflight++;
+      this.queue = result.then(this.release, this.release);
+      return result;
+    }
+    return this.serial(() => this.request(call));
+  }
+
+  defer(sql: string): boolean {
+    if (this.ended || this.native.queryColumnsAfter === undefined) return false;
+    this.deferred.push(sql);
+    return true;
+  }
+
+  undefer(sql: string): boolean {
+    const at = this.deferred.lastIndexOf(sql);
+    if (at < 0) return false;
+    this.deferred.splice(at, 1);
+    return true;
+  }
+
+  /**
+   * Refuse calls from now on, and once those made have settled, run the SQL
+   * that no call took (`defer`): the body has settled, and the commit
+   * follows. Its failure fails the transaction, as the call that would have
+   * run it would have.
+   */
+  async drain(): Promise<void> {
+    this.ended = true;
+    await this.queue;
+    for (const sql of this.deferred.splice(0)) await this.request(() => this.native.queryColumns(sql));
   }
 
   setRecord(name: string, value: Uint8Array): void {
@@ -513,8 +751,9 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   /** Run `call`, made while the transaction is open, once the calls before it have. */
   private serial<T>(call: () => Promise<T>): Promise<T> {
     if (this.ended) return Promise.reject(new SqlError('the transaction has ended'));
+    this.inflight++;
     const result = this.queue.then(call);
-    this.queue = result.catch(() => {});
+    this.queue = result.then(this.release, this.release);
     return result;
   }
 

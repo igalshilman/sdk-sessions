@@ -16,7 +16,12 @@ const groups: Record<string, () => Promise<Services>> = {
     const { account, clock } = await import('@restatedev/sessions/test/bank');
     return [account, clock];
   },
-  agent: async () => [(await import('@restatedev/agents/test/pi')).agent],
+  agent: async () => {
+    const pi = await import('@restatedev/agents/test/pi');
+    // The service's log says which mode its pi agent runs in (PI_COMMITS=effects batches pi's commits).
+    console.error(`pi agent: commits '${pi.commits}'`);
+    return [pi.agent];
+  },
   langgraph: async () => [(await import('@restatedev/agents/test/langgraph')).agent],
   claude: async () => [(await import('@restatedev/agents/test/claude')).agent],
   deepseek: async () => [(await import('@restatedev/agents/test/deepseek')).agent],

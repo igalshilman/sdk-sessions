@@ -88,6 +88,7 @@ import {
   stopSignalOf,
   toolCallStarted,
 } from '../common.ts';
+import { holding } from '../calls.ts';
 import { answerOnce, invocationOf, type Items, type Parsed, type Turn } from '../conversation.ts';
 import { tookSteers } from '../steering.ts';
 import { conversationView } from '../messages.ts';
@@ -95,7 +96,8 @@ import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
 import { isTool, jsonSchemaOf, type Tool as AnyTool } from '../tools.ts';
 import type { z } from 'zod';
-import { openSqlKvStorage, SqlKvDatabase } from './storage.ts';
+import { commitsDefault } from './commits.ts';
+import { type Commits, openSqlKvStorage, SqlKvDatabase } from './storage.ts';
 
 /** What `work` gets: `prompt(text)`, the `conversation()`, and the `harness` and chord `context` for anything else. */
 export interface Pi {
@@ -283,11 +285,24 @@ export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undef
    */
   retry?: Partial<ConversationRetryPolicy>;
   /**
+   * How pi's commits are written: `'each'` (the default), one write to
+   * Restate each, or `'effects'`, one for all the commits between two effects
+   * (a model call, a tool call), so that a step of a turn costs about one
+   * write, not several. With `'effects'`, what pi commits in the milliseconds
+   * between one effect's result and the next effect's start is lost in a
+   * crash, and the retry does it again from the same stored state; what
+   * others see (a publish, a call, a send, the end of the handler) is
+   * written first.
+   */
+  commits?: Commits;
+  /**
    * The answer as data: a zod object, whose JSON the agent replies with
    * (checked), and `chat` and `prompt` answer with (see output.ts).
    */
   output?: O;
 }
+
+export type { Commits };
 
 /** OpenAI's service tiers (its Responses API's `service_tier`). */
 export type ServiceTier = 'auto' | 'default' | 'fast' | 'flex' | 'priority';
@@ -315,6 +330,9 @@ const native = (t: AnyTool, ctx: restate.SessionContext): ToolRegistration =>
     }),
   });
 
+/** Run an effect (a tool), after what pi committed before it is written, and without batching its own commits. */
+type Effect = <T>(run: () => Promise<T>) => Promise<T>;
+
 /**
  * The tools of an agent, `system` added to its system prompt, and, with a
  * `workspace`, pi's coding tools working there, with the environment they
@@ -326,6 +344,7 @@ async function extensions(
   workspace: string | undefined,
   afterTools: (conversation: ConversationId) => Promise<void>,
   ctx: restate.SessionContext,
+  effect: Effect,
 ) {
   const registry = createRegistry();
   registry.install(defineExtension({ name: 'tools', tools }));
@@ -346,7 +365,7 @@ async function extensions(
   // wait on Restate. Installed after theirs, which they wrap.
   const kept = (t: ToolRegistration): ToolRegistration => ({
     ...t,
-    execute: (args, api, context) => ctx.working(() => t.execute(args, api, context)),
+    execute: (args, api, context) => effect(() => ctx.working(() => t.execute(args, api, context))),
   });
   const wraps = (CodingTools.tools ?? []).map((t): Wrap => ({ tool: t.name, wrap: kept }));
   registry.install(defineExtension({ name: 'keepalive', wraps }));
@@ -392,7 +411,16 @@ function unanswered(id: string, why: string | null | undefined, detail: unknown,
  */
 export const withPi = async <T>(
   ctx: restate.SessionContext,
-  { model: named, models, system, tools = [], workspace, serviceTier, retry }: Options,
+  {
+    model: named,
+    models,
+    system,
+    tools = [],
+    workspace,
+    serviceTier,
+    retry,
+    commits = commitsDefault.commits,
+  }: Options,
   work: (pi: Pi) => Promise<T>,
 ): Promise<T> => {
   const model = modelOf(named);
@@ -448,10 +476,35 @@ export const withPi = async <T>(
   // Whether a tool of the round asks to end the run (`terminate`, a handoff): pi then ends the round at its final
   // boundary, which would start a run of its own for a message submitted there, outside the turn.
   let ending = false;
+  // pi's storage (storage.ts): with `commits: 'effects'` it batches pi's commits, which a failed commit loses
+  // (reported to pi as done): that fails the attempt, as a tool's error does.
+  const database = new SqlKvDatabase(ctx.db, {
+    commits,
+    failed: (error) => {
+      failed(error);
+      cancel(error);
+    },
+  });
+  // With 'each' none of this is there: the code is as it was, without a batch in the way.
+  const batching = commits === 'effects';
+  const effect: Effect = !batching
+    ? (run) => run()
+    : async (run) => {
+        const ended = database.effectStarted();
+        try {
+          await database.flush();
+          return await run();
+        } finally {
+          ended();
+        }
+      };
   const tracked = (t: ToolRegistration): ToolRegistration => ({
     ...t,
     execute: async (args, api, task) => {
+      // A tool is an effect: what pi committed before it is written first, and its own commits are not batched.
+      const ended = database.effectStarted();
       try {
+        if (batching) await database.flush();
         await toolCallStarted(ctx);
         const result = await t.execute(args, api, task);
         if (result.control?.terminate === true || result.control?.handoff !== undefined) ending = true;
@@ -460,6 +513,8 @@ export const withPi = async <T>(
         // The tool's error: never taken for the model's provider refusing (a tool may call a model API).
         fromTool(ctx, error);
         return stopped(error, task);
+      } finally {
+        ended();
       }
     },
   });
@@ -471,9 +526,15 @@ export const withPi = async <T>(
       // A round that may end the run takes no steered message: each waits for the turn's end, then is a turn of its own.
       const ends = ending;
       ending = false;
-      if (!ends) await steering?.(of);
+      if (ends) return;
+      // The round's results are published before the inbox is read: a message steered while its tools ran is
+      // told of by that publish (`INBOX`), and pi places it only if it is submitted now. A turn nobody can
+      // steer has nothing to read.
+      if (batching && inboxOf(ctx)) await database.flush();
+      await steering?.(of);
     },
     ctx,
+    effect,
   );
   const settings = {
     // A task that crashes is run again however often Restate retries the attempt (its retry policy decides):
@@ -487,13 +548,47 @@ export const withPi = async <T>(
     // pi-durable hands its stream settings to pi-ai's requests as they are: serviceTier is pi-ai's.
     ...(serviceTier ? { stream: { serviceTier } as ConversationStreamOptions } : {}),
   };
-  const database = new SqlKvDatabase(ctx.db);
   const harness = await Harness.open(
     await openSqlKvStorage(ctx.db, database),
-    // Each request of a model is kept alive, whoever made the registry (see keepalive.ts).
-    { models: keptModels(ctx, models), registry, env, settings },
+    // Each request of a model is kept alive, whoever made the registry (see keepalive.ts), and is an effect.
+    {
+      models: keptModels(
+        ctx,
+        models,
+        batching ? { started: () => database.effectStarted(), flush: () => database.flush() } : undefined,
+      ),
+      registry,
+      env,
+      settings,
+    },
     context,
   );
+  if (batching) await database.flush();
+
+  /**
+   * `run`, a prompt's run, with pi's commits batched between effects (`commits: 'effects'`), and written, however
+   * it ends, before it returns: what others see of the turn (its close, the next call) comes after.
+   */
+  const batched = <S, R>(run: (store: S) => Promise<R>): ((store: S) => Promise<R>) =>
+    !batching
+      ? run
+      : async (store: S): Promise<R> => {
+          database.armed = true;
+          holding(ctx, () => database.flush(), 'pi');
+          let ran = false;
+          try {
+            const result = await run(store);
+            ran = true;
+            return result;
+          } finally {
+            database.armed = false;
+            holding(ctx, undefined, 'pi');
+            // A failed write has failed the attempt already: it never hides the error the run ended with.
+            await database.flush().catch((error: unknown) => {
+              if (ran) throw error;
+            });
+          }
+        };
 
   const prompt = (text: string, check?: Check, reminder?: string) => {
     // 0.3.0's `prompt(text, id)` took a prompt's id: from JavaScript, it would
@@ -507,7 +602,7 @@ export const withPi = async <T>(
       ctx,
       text,
       items,
-      async (store) => {
+      batched(async (store) => {
         const current = store.turn;
         const id = current.id;
         const root = await conversation();
@@ -578,7 +673,7 @@ export const withPi = async <T>(
         const reply = entry?.model?.at(-1);
         if (!reply) throw new restate.TerminalError(`prompt ${id}: no answer entry`);
         return textOf(reply.content);
-      },
+      }),
       // pi keeps the model's history: the conversation reads only its latest turns.
       { check, reminder, ownHistory: true },
     );
@@ -600,6 +695,7 @@ export const withPi = async <T>(
   // invocation's own (a retried attempt's) goes on.
   const working = async () => {
     await abortLeft((r) => invocationOf(r) === ctx.request.id || r.startsWith('steer:'));
+    if (batching) await database.flush();
     return work({ harness, context, conversation, prompt });
   };
   try {

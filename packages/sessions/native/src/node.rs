@@ -23,8 +23,9 @@
 //! A call runs on the JavaScript thread as far as it can ([`answer`]): one
 //! that needs nothing from the store, such as SQL on cached pages or a
 //! statement inside a transaction, returns its value, or throws its error;
-//! one that waits for the store goes on in the runtime and returns a promise.
-//! The caller `await`s either.
+//! one that waits for the store goes on in the runtime as one task that
+//! settles the promise it returns. The caller `await`s either.
+use crate::call::answer;
 use crate::vm::{Vm, VmInner};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -41,7 +42,7 @@ use restate_sdk_shared_core::{NotificationHandle, Value as VmValue};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What a request to the store does: the store's method it calls.
@@ -261,6 +262,10 @@ struct VmStore {
     /// The writes issued, and how many of them an ack covers.
     issued: AtomicU64,
     synced: AtomicU64,
+    /// Whether the commit in flight has work for JavaScript to run at its sync
+    /// (`withCommit`): set by `Database::commit`, which JavaScript tells. A
+    /// commit with none skips the hop, which would only run an empty function.
+    hook: AtomicBool,
 }
 
 impl VmStore {
@@ -337,6 +342,9 @@ impl VmStore {
     /// What a commit runs on JavaScript before it waits for its ack: the
     /// committing transaction's sends.
     async fn committing(&self) -> io::Result<()> {
+        if !self.hook.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let promise = self
             .dispatch
             .call_async_catch((Op::Sync as u32, String::new(), None).into())
@@ -441,35 +449,23 @@ fn error(error: Box<dyn std::error::Error + Send + Sync>) -> Error {
     }
 }
 
+/// Sets the hook of a VM's store back to `true` (the hop is made) when it is
+/// dropped: as the commit it was set for ends, however it ends, even if the
+/// call panics or is dropped without running.
+struct HookReset(Option<Arc<VmStore>>);
+
+impl Drop for HookReset {
+    fn drop(&mut self) {
+        if let Some(store) = &self.0 {
+            store.hook.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// One session of a namespace's database (see [`sql::Database`]): every
 /// SQL commit is durable when its call resolves.
 #[napi]
-pub struct Database(Arc<sql::Database>);
-
-/// `call`'s value if it is ready at once, polled here on the JavaScript
-/// thread; else a promise of it, as it goes on in the runtime. Ready, a call
-/// spares two thread hops and a thread-safe function: what a call to the
-/// addon costs otherwise, several times the SQL it runs.
-///
-/// It is polled in the runtime's context, as it is there: a call that reads
-/// a pack in the object store makes its request here, and the request
-/// (reqwest's) takes its connection and its timers from the current runtime.
-fn answer<'env, T>(
-    env: &'env Env,
-    call: impl Future<Output = Result<T>> + Send + 'static,
-) -> Result<Either<T, PromiseRaw<'env, T>>>
-where
-    T: ToNapiValue + Send + 'static,
-{
-    use std::task::{Context, Poll, Waker};
-    let mut call = Box::pin(call);
-    let polled =
-        within_runtime_if_available(|| call.as_mut().poll(&mut Context::from_waker(Waker::noop())));
-    match polled {
-        Poll::Ready(result) => result.map(Either::A),
-        Poll::Pending => env.spawn_future(call).map(Either::B),
-    }
-}
+pub struct Database(Arc<sql::Database>, Option<Arc<VmStore>>);
 
 /// The page cache shared by the process's databases: 256 MiB of memory and
 /// 1 GiB of disk, in a file under the temporary directory, or the file
@@ -600,8 +596,9 @@ pub(crate) fn open_on_vm<'env>(
         reader: reader == Some(true),
         issued: AtomicU64::new(0),
         synced: AtomicU64::new(0),
+        hook: AtomicBool::new(true),
     });
-    open_with(env, namespace, store, reader)
+    open_with(env, namespace, store.clone(), Some(store), reader)
 }
 
 /// Open the database of `namespace` over `store` (see the module's doc),
@@ -625,7 +622,7 @@ pub(crate) fn open<'env>(
         dispatch,
         lists_keys,
     });
-    open_with(env, namespace, store, reader)
+    open_with(env, namespace, store, None, reader)
 }
 
 /// Open `namespace`'s database over `store`, kept warm in the process's page
@@ -634,6 +631,7 @@ fn open_with<'env>(
     env: &'env Env,
     namespace: String,
     store: Arc<dyn KvStore + Send + Sync>,
+    vm_store: Option<Arc<VmStore>>,
     reader: Option<bool>,
 ) -> Result<PromiseRaw<'env, Database>> {
     env.spawn_future(async move {
@@ -647,7 +645,7 @@ fn open_with<'env>(
         if reader == Some(true) {
             open = open.reader();
         }
-        Ok(Database(Arc::new(open.await.map_err(error)?)))
+        Ok(Database(Arc::new(open.await.map_err(error)?), vm_store))
     })
 }
 
@@ -667,16 +665,33 @@ impl Database {
         params: Option<Vec<SqlValue>>,
     ) -> Result<Either<QueryResult, PromiseRaw<'env, QueryResult>>> {
         let db = self.0.clone();
+        answer(env, async move { rows_of(&db, &sql, params).await })
+    }
+
+    /// [`Self::query_columns`] after `before`, SQL that runs first, each
+    /// statement as a call of its own would run it (no parameters), in the
+    /// same call to the addon: the rows are those of `sql`. A statement that
+    /// fails ends the call with its error, and the ones after it do not run.
+    /// Several calls in one spare their crossings of the addon and their
+    /// threads' hand-offs; the SQL run, and its order, are what the same calls
+    /// made one by one would run.
+    #[napi(
+        ts_args_type = "before: string[], sql: string, params?: SqlValue[]",
+        ts_return_type = "Answer<{ columns: string[]; rows: SqlValue[][] }>"
+    )]
+    pub fn query_columns_after<'env>(
+        &self,
+        env: &'env Env,
+        before: Vec<String>,
+        sql: String,
+        params: Option<Vec<SqlValue>>,
+    ) -> Result<Either<QueryResult, PromiseRaw<'env, QueryResult>>> {
+        let db = self.0.clone();
         answer(env, async move {
-            let params = params.map(|params| params.into_iter().map(|p| p.0).collect());
-            let (columns, rows) = db.query_columns(&sql, params).await.map_err(error)?;
-            Ok(QueryResult {
-                columns,
-                rows: rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(SqlValue).collect())
-                    .collect(),
-            })
+            for statement in &before {
+                db.query_columns(statement, None).await.map_err(error)?;
+            }
+            rows_of(&db, &sql, params).await
         })
     }
 
@@ -688,20 +703,35 @@ impl Database {
     }
 
     /// See [`sql::Database::commit`]: `records` by name.
+    ///
+    /// On the VM, `with_commit` says whether the committing transaction gave
+    /// `withCommit` work: without it (`false`) the commit does not call
+    /// JavaScript at its sync. Absent, it does.
     #[napi(
-        ts_args_type = "records?: Record<string, Buffer>",
+        ts_args_type = "records?: Record<string, Buffer>, withCommit?: boolean",
         ts_return_type = "Answer<void>"
     )]
     pub fn commit<'env>(
         &self,
         env: &'env Env,
         records: Option<HashMap<String, Buffer>>,
+        with_commit: Option<bool>,
     ) -> Result<Either<(), PromiseRaw<'env, ()>>> {
         let records: Vec<_> = (records.unwrap_or_default().into_iter())
             .map(|(name, value)| (name, Bytes::copy_from_slice(&value)))
             .collect();
         let db = self.0.clone();
-        answer(env, async move { db.commit(records).await.map_err(error) })
+        let vm_store = self.1.clone();
+        if let Some(store) = &vm_store {
+            store
+                .hook
+                .store(with_commit != Some(false), Ordering::SeqCst);
+        }
+        let reset = HookReset(vm_store);
+        answer(env, async move {
+            let _reset = reset;
+            db.commit(records).await.map_err(error)
+        })
     }
 
     /// See [`sql::Database::rollback`].
@@ -743,6 +773,23 @@ impl Database {
     pub async fn close(&self) {
         self.0.close().await
     }
+}
+
+/// `sql` run on `db`, with its parameters: its rows with their column names.
+async fn rows_of(
+    db: &sql::Database,
+    sql: &str,
+    params: Option<Vec<SqlValue>>,
+) -> Result<QueryResult> {
+    let params = params.map(|params| params.into_iter().map(|p| p.0).collect());
+    let (columns, rows) = db.query_columns(sql, params).await.map_err(error)?;
+    Ok(QueryResult {
+        columns,
+        rows: rows
+            .into_iter()
+            .map(|row| row.into_iter().map(SqlValue).collect())
+            .collect(),
+    })
 }
 
 /// Rows with the column names of their statement.

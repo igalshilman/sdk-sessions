@@ -8,6 +8,8 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     globals: true,
+    // PI_COMMITS=effects runs the pi suites with batched commits.
+    setupFiles: ['./test/commits-default.ts'],
     alias: { '@langchain/openai': fileURLToPath(new URL('./test/fakes/langgraph.ts', import.meta.url)) },
   },
 });

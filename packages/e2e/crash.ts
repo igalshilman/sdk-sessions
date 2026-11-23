@@ -1061,6 +1061,20 @@ console.error(`ledger: ${JSON.stringify(audit)}`);
 PROCESSES.forEach((p, i) => console.error(`${p.name} process started ${starts[i]} times`));
 PROCESSES.forEach((p, i) => assert.ok(p.perMille === 0 || (starts[i] ?? 0) > 1, `no abort happened in ${p.name}`));
 
+// The pi agent's service says, in its own log, which mode it ran in (serve.ts): the one the run asked for. Every
+// start of the process logs it, so each is checked.
+{
+  const mode = process.env.PI_COMMITS === 'effects' ? 'effects' : 'each';
+  const said = readFileSync(join(dir, 'agent.log'), 'utf8')
+    .split('\n')
+    .filter((l) => l.startsWith('pi agent:'));
+  assert.ok(said.length > 0, "the pi agent's service did not say which mode it runs in");
+  assert.ok(
+    said.every((l) => l === `pi agent: commits '${mode}'`),
+    `the pi agent's services ran in ${said.join(', ')}`,
+  );
+  console.error(`pi agent: commits '${mode}' (${said.length} starts)`);
+}
 // Whatever the turns and transfers waited for, none was suspended on its cancel signal alone.
 console.error(`suspensions: ${await assertNoneSuspendedOnCancellationAlone(ADMIN)}`);
 await Promise.all(services.map((s) => s.stop()));

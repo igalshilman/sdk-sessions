@@ -14,11 +14,30 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import * as claude from '@restatedev/agents/claude';
 import * as langgraph from '@restatedev/agents/langgraph';
+import * as pi from '@restatedev/agents/pi';
 import { followingOf, handlerOf, type PromptHandler, sqlAttempt } from './support.ts';
 import { reply as tellerReply, teller } from './fakes/claude.ts';
 import { Teller } from './fakes/langgraph.ts';
 
 vi.mock('@anthropic-ai/sdk', () => import('./fakes/claude.ts'));
+
+// pi's model, by the plan (`nextCalls`): the default model's provider, OpenAI's.
+vi.mock('@earendil-works/pi-ai/providers/all', async () => {
+  const { fakeProvider, callTools, say } = await import('./fakes/pi.ts');
+  return {
+    builtinProviders: () => [
+      fakeProvider('openai', 'gpt-6-sol', () => {
+        const calls = nextCalls();
+        return calls
+          ? callTools(
+              calls.map(({ name }) => [name, {}]),
+              'On it.',
+            )
+          : say('Done');
+      }),
+    ],
+  };
+});
 
 type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 
@@ -338,5 +357,32 @@ describe('a commit cancelled as it waits for Restate', () => {
     expect(failed).toBeInstanceOf(restate.CancelledError);
     expect(turns).toEqual([['answered', 'Done']]);
     expect(shown(items).at(-1)).toBe('Done');
+  });
+});
+
+/** The commits of a key's second turn of `r` model requests with one tool call each round, on `object`'s agent. */
+const second = async (commits: 'each' | 'effects', r: number, object?: { readonly name: string }) =>
+  (await costs(pi.chat({ tools: tools(), commits }), r, 1, { object }))[1]!.commits;
+
+describe("a pi turn's commits", () => {
+  // Not followed: no publishes to wait for, and no one to steer it.
+  const unwatched = pi.agent({ name: 'unwatched', background: true });
+
+  it('are 30 for 4 requests and 3 tool calls, a commit each: pi stores each step in several', async () => {
+    expect(await second('each', 4, unwatched)).toBe(30);
+  });
+
+  it('are 10 with `effects`: the turn opens, each effect starts (4 requests, 3 tools), the answer, the turn closes', async () => {
+    expect(await second('effects', 4, unwatched)).toBe(10);
+  });
+
+  it('are 13 with `effects` in a turn that is followed: a publish after each round reads what was steered to it', async () => {
+    expect(await second('each', 4)).toBe(30);
+    expect(await second('effects', 4)).toBe(13);
+  });
+
+  it('are fewer with `effects` whatever the length of the turn', async () => {
+    for (const r of [1, 2, 3])
+      expect(await second('effects', r, unwatched)).toBeLessThan(await second('each', r, unwatched));
   });
 });

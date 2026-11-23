@@ -15,6 +15,7 @@ import { createModels } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import type { Models } from '@earendil-works/pi-ai';
 import { keptModels } from '../src/pi/keepalive.ts';
+import { commitsDefault } from '../src/pi/commits.ts';
 import { callTools, fakeProvider, say, textOf, unavailable } from './fakes/pi.ts';
 import { AttemptEnded } from '../src/common.ts';
 import { Conversation } from '../src/conversation.ts';
@@ -314,16 +315,28 @@ describe('pi.chat', () => {
   it('publishes a round of tool calls once its reply is stored and once each result is, not as the calls start', async () => {
     const { answer, published, seen } = await followedRound((tools) => pi.chat({ tools }), pi.messages());
     expect(answer).toBe('result of t1\nresult of t2\nresult of t3');
-    // pi stores each result in a commit of its own: each is published after it, as is the reply with the calls.
-    expect(seen).toEqual([
-      [],
-      [null, null, null],
-      ['result of t1', null, null],
-      ['result of t1', 'result of t2', null],
-      ['result of t1', 'result of t2', 'result of t3'],
-    ]);
-    // Those publishes, and the turn's close.
-    expect(published).toBe(6);
+    // With `commits: 'effects'` the results of tools that end together are stored in one commit, and published
+    // once after it, so a round has one publish for its results, not one for each: the start's, the reply's, the
+    // results', and the turn's close. With a commit each, pi stores each result in a commit of its own, and each
+    // is published after it, as is the reply with the calls: those publishes, and the turn's close.
+    const batched = commitsDefault.commits === 'effects';
+    expect({ seen, published }).toEqual(
+      batched
+        ? {
+            seen: [[], [null, null, null], ['result of t1', 'result of t2', 'result of t3']],
+            published: 4,
+          }
+        : {
+            seen: [
+              [],
+              [null, null, null],
+              ['result of t1', null, null],
+              ['result of t1', 'result of t2', null],
+              ['result of t1', 'result of t2', 'result of t3'],
+            ],
+            published: 6,
+          },
+    );
   });
 
   it('in the background, publishes only the end of a turn', async () => {
