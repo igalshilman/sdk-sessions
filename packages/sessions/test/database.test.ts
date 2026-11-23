@@ -113,6 +113,11 @@ test('rows come back as objects by column name, or as arrays from values', async
     [1, 1],
     [2, 2],
   ]);
+  // A column named __proto__ is a column of the row, not its prototype.
+  const odd = await db.get<Record<string, unknown>>('SELECT 7 AS "__proto__", 8 AS other');
+  assert.equal(Object.getPrototypeOf(odd), Object.prototype);
+  assert.deepEqual(Object.keys(odd!), ['__proto__', 'other']);
+  assert.equal(Object.getOwnPropertyDescriptor(odd, '__proto__')?.value, 7);
   assert.equal(db.isUsable(), true);
 
   assert.deepEqual(

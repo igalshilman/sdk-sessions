@@ -57,13 +57,37 @@ export interface DatabaseWriter extends DatabaseReader {
   execute(sql: string, params?: SqlParam[]): Promise<void>;
 }
 
+/** Nothing: what settles a queue's last call, and what `execute` resolves with. */
+const nothing = (): void => {};
+
 /** The rows of `result` as objects by column name; a column name twice is an {@link SqlError}. */
 function objects({ columns, rows }: SqlQueryResult): Row[] {
-  if (new Set(columns).size !== columns.length) {
-    const twice = columns.find((name, i) => columns.indexOf(name) !== i);
+  const names = columns.length;
+  let twice: string | undefined;
+  for (let i = 1; i < names && twice === undefined; i++) {
+    // A statement has a handful of columns: comparing them pairwise costs less than a Set.
+    for (let j = 0; j < i; j++) {
+      if (columns[j] === columns[i]) {
+        twice = columns[i];
+        break;
+      }
+    }
+  }
+  if (twice !== undefined) {
     throw new SqlError(`the column ${twice} is named twice: alias one (AS), or read the rows with values()`);
   }
-  return rows.map((row) => Object.fromEntries(columns.map((name, i) => [name, row[i]!])));
+  // A column named `__proto__` is an own property of the row, as `Object.fromEntries` makes it;
+  // assignment would set the row's prototype instead.
+  if (columns.includes('__proto__')) {
+    return rows.map((row) => Object.fromEntries(columns.map((name, i) => [name, row[i]!])));
+  }
+  const result: Row[] = [];
+  for (const row of rows) {
+    const object: Row = {};
+    for (let i = 0; i < names; i++) object[columns[i]!] = row[i]!;
+    result.push(object);
+  }
+  return result;
 }
 
 /**
@@ -75,8 +99,15 @@ export function sqlOver(
   run: (sql: string, params?: SqlParam[]) => Promise<SqlQueryResult>,
   failure: (error: unknown) => unknown = (error) => error,
 ): DatabaseWriter {
-  const rowsOf = async (sql: string, params?: SqlParam[]) => {
-    const result = await run(sql, params);
+  // A `run` that throws is a rejection, as it was when each of these was an async function.
+  const start = (sql: string, params?: SqlParam[]): Promise<SqlQueryResult> => {
+    try {
+      return run(sql, params);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+  const rowsOf = (result: SqlQueryResult): Row[] => {
     try {
       return objects(result);
     } catch (error) {
@@ -84,10 +115,11 @@ export function sqlOver(
     }
   };
   return {
-    query: async <T>(sql: string, params?: SqlParam[]) => (await rowsOf(sql, params)) as T[],
-    get: async <T>(sql: string, params?: SqlParam[]) => (await rowsOf(sql, params))[0] as T | undefined,
-    values: async (sql, params) => (await run(sql, params)).rows,
-    execute: async (sql, params) => void (await run(sql, params)),
+    query: <T>(sql: string, params?: SqlParam[]) => start(sql, params).then(rowsOf) as Promise<T[]>,
+    get: <T>(sql: string, params?: SqlParam[]) =>
+      start(sql, params).then((result) => rowsOf(result)[0] as T | undefined),
+    values: (sql, params) => start(sql, params).then((result) => result.rows),
+    execute: (sql, params) => start(sql, params).then(nothing),
   };
 }
 
@@ -257,24 +289,26 @@ class Boundary implements Store {
 abstract class Sql implements DatabaseWriter {
   protected readonly native: NativeSession;
   protected readonly boundary: Boundary;
+  private readonly over: DatabaseWriter;
 
   constructor(native: NativeSession, boundary: Boundary) {
     this.native = native;
     this.boundary = boundary;
+    this.over = sqlOver((s, p) => this.queryColumns(s, p));
   }
 
   abstract queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult>;
 
   query<T = Row>(sql: string, params?: SqlParam[]): Promise<T[]> {
-    return sqlOver((s, p) => this.queryColumns(s, p)).query<T>(sql, params);
+    return this.over.query<T>(sql, params);
   }
 
   get<T = Row>(sql: string, params?: SqlParam[]): Promise<T | undefined> {
-    return sqlOver((s, p) => this.queryColumns(s, p)).get<T>(sql, params);
+    return this.over.get<T>(sql, params);
   }
 
   values(sql: string, params?: SqlParam[]): Promise<SqlValue[][]> {
-    return sqlOver((s, p) => this.queryColumns(s, p)).values(sql, params);
+    return this.over.values(sql, params);
   }
 
   async execute(sql: string, params?: SqlParam[]): Promise<void> {
@@ -286,12 +320,16 @@ abstract class Sql implements DatabaseWriter {
    * addon throws as it is called (arguments it cannot convert, and the error
    * of a call that answers at once).
    */
-  protected async request<T>(call: () => Answer<T>): Promise<T> {
+  protected request<T>(call: () => Answer<T>): Promise<T> {
+    let alive: Promise<T>;
     try {
-      return await this.boundary.alive(call);
+      alive = this.boundary.alive(call);
     } catch (error) {
-      throw this.failure(error);
+      return Promise.reject(this.failure(error));
     }
+    return alive.catch((error: unknown) => {
+      throw this.failure(error);
+    });
   }
 
   /**
@@ -433,7 +471,7 @@ export class Connection extends Sql {
     this.tail?.fire();
     if (transaction !== undefined) this.tail = transaction;
     const result = this.queue.then(call);
-    this.queue = result.catch(() => {});
+    this.queue = result.then(undefined, nothing);
     return result;
   }
 
@@ -556,7 +594,7 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   private serial<T>(call: () => Promise<T>): Promise<T> {
     if (this.ended) return Promise.reject(new SqlError('the transaction has ended'));
     const result = this.queue.then(call);
-    this.queue = result.catch(() => {});
+    this.queue = result.then(undefined, nothing);
     return result;
   }
 

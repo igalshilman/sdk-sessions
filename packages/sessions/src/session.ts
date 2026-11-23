@@ -250,12 +250,10 @@ function handlerError(error: unknown): unknown {
 }
 
 /** `call`'s result, or the error the handler fails with (see {@link handlerError}). */
-async function forHandler<T>(call: Promise<T>): Promise<T> {
-  try {
-    return await call;
-  } catch (error) {
+function forHandler<T>(call: Promise<T>): Promise<T> {
+  return call.catch((error: unknown) => {
     throw handlerError(error);
-  }
+  });
 }
 
 /** The SQL of a transaction's body: `tx`'s, failing as {@link forHandler} does. */
