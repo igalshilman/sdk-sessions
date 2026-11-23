@@ -380,7 +380,10 @@ impl Vm {
                 let _ = vm.route();
                 receiver
             });
-            let scheduler = vm.scheduler.clone();
+            // Asked for once until it runs, as `issue_and_discard` does: a
+            // tick that is pending writes this command's output too, and the
+            // next command asks anew once it has begun.
+            let scheduler = Self::wanted(&mut vm);
             (result, scheduler)
         };
         Self::schedule(scheduler);
