@@ -23,8 +23,9 @@
 //! A call runs on the JavaScript thread as far as it can ([`answer`]): one
 //! that needs nothing from the store, such as SQL on cached pages or a
 //! statement inside a transaction, returns its value, or throws its error;
-//! one that waits for the store goes on in the runtime and returns a promise.
-//! The caller `await`s either.
+//! one that waits for the store goes on in the runtime as one task that
+//! settles the promise it returns. The caller `await`s either.
+use crate::call::answer;
 use crate::vm::{Vm, VmInner};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -465,31 +466,6 @@ impl Drop for HookReset {
 /// SQL commit is durable when its call resolves.
 #[napi]
 pub struct Database(Arc<sql::Database>, Option<Arc<VmStore>>);
-
-/// `call`'s value if it is ready at once, polled here on the JavaScript
-/// thread; else a promise of it, as it goes on in the runtime. Ready, a call
-/// spares two thread hops and a thread-safe function: what a call to the
-/// addon costs otherwise, several times the SQL it runs.
-///
-/// It is polled in the runtime's context, as it is there: a call that reads
-/// a pack in the object store makes its request here, and the request
-/// (reqwest's) takes its connection and its timers from the current runtime.
-fn answer<'env, T>(
-    env: &'env Env,
-    call: impl Future<Output = Result<T>> + Send + 'static,
-) -> Result<Either<T, PromiseRaw<'env, T>>>
-where
-    T: ToNapiValue + Send + 'static,
-{
-    use std::task::{Context, Poll, Waker};
-    let mut call = Box::pin(call);
-    let polled =
-        within_runtime_if_available(|| call.as_mut().poll(&mut Context::from_waker(Waker::noop())));
-    match polled {
-        Poll::Ready(result) => result.map(Either::A),
-        Poll::Pending => env.spawn_future(call).map(Either::B),
-    }
-}
 
 /// The page cache shared by the process's databases: 256 MiB of memory and
 /// 1 GiB of disk, in a file under the temporary directory, or the file
