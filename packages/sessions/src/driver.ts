@@ -171,9 +171,21 @@ export class AttemptDriver {
    */
   private carriedCancellation = false;
   private readonly cancelledPromise: Promise<void>;
-  private heartbeats: ReturnType<typeof setInterval> | undefined;
+  /**
+   * The one timer of the heartbeats, armed for `beatDue`. It outlives a run of
+   * scopes, so the database's scopes (one a statement) do not start and clear
+   * a timer each: it fires, finds no scope open, and is not armed again.
+   */
+  private heartbeats: ReturnType<typeof setTimeout> | undefined;
+  private beatDue = 0;
   /** The `working` scopes open: the attempt heartbeats while there is one. */
   private scopes = 0;
+  /** The run of scopes now open: when the first opened, and its interval. */
+  private runEvery = 0;
+  /** When the run's next heartbeat is due. */
+  private nextBeat = 0;
+  /** The heartbeat interval, read from the environment on first use. */
+  private beatEvery: number | undefined;
   /** When the attempt last wrote to Restate, which restarts Restate's inactivity timer. */
   private wroteAt = Date.now();
   private readonly aborter = new AbortController();
@@ -569,20 +581,51 @@ export class AttemptDriver {
    * otherwise the scopes the database opens for each of its calls would each
    * send one.
    */
-  async working<T>(fn: () => T | Promise<T>, everyMs = heartbeatMs()): Promise<T> {
+  async working<T>(fn: () => T | Promise<T>, everyMs = (this.beatEvery ??= heartbeatMs())): Promise<T> {
     if (this.scopes++ === 0) this.startHeartbeats(everyMs);
     try {
       return await fn();
     } finally {
-      if (--this.scopes === 0) this.stopHeartbeats();
+      this.scopes--;
     }
   }
 
+  /**
+   * A run of scopes opens. Its beats are `everyMs` after it opened, and every
+   * `everyMs` while a scope stays open: the timer is armed for the first, and
+   * on firing it beats if the run it finds is that old, waits out the rest if
+   * a run that opened later is younger, and is let go if no scope is open.
+   */
   private startHeartbeats(everyMs: number): void {
     if (this.ended !== undefined) return;
-    if (Date.now() - this.wroteAt >= everyMs) this.heartbeat();
-    this.heartbeats = setInterval(() => this.heartbeat(), everyMs);
+    const now = Date.now();
+    if (now - this.wroteAt >= everyMs) this.heartbeat();
+    this.runEvery = everyMs;
+    this.nextBeat = now + everyMs;
+    this.arm(this.nextBeat);
+  }
+
+  /** Arm the timer for `due`, unless it is armed for that or earlier. */
+  private arm(due: number): void {
+    if (this.heartbeats !== undefined) {
+      if (this.beatDue <= due) return;
+      clearTimeout(this.heartbeats);
+    }
+    this.beatDue = due;
+    this.heartbeats = setTimeout(() => this.beat(), Math.max(0, due - Date.now()));
     this.heartbeats.unref?.();
+  }
+
+  /** The timer fired. */
+  private beat(): void {
+    this.heartbeats = undefined;
+    if (this.ended !== undefined || this.scopes === 0) return;
+    const now = Date.now();
+    if (now >= this.nextBeat) {
+      this.heartbeat();
+      this.nextBeat = now + this.runEvery;
+    }
+    this.arm(this.nextBeat);
   }
 
   private heartbeat(): void {
@@ -596,7 +639,7 @@ export class AttemptDriver {
 
   private stopHeartbeats(): void {
     if (this.heartbeats === undefined) return;
-    clearInterval(this.heartbeats);
+    clearTimeout(this.heartbeats);
     this.heartbeats = undefined;
   }
 

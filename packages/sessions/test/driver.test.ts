@@ -2,7 +2,7 @@
 // side played by wire bytes. What the selector had to fake — several promises
 // awaited at once, each waiting on Restate — falls out of the VM here: an
 // action returns a handle, and the tick settles the promise of that handle.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AttemptDriver, AttemptShutDown } from '../src/driver.ts';
 import { frame, uint, field } from './wire.ts';
 import { drain, messages, startedVm, TYPE, types, value } from './vm-support.ts';
@@ -308,6 +308,50 @@ describe('an attempt on the explicit recovery VM', () => {
     expect(beats()).toBe(after);
     r.answerCall(0, { result: '"1"' });
     await waiting;
+  });
+
+  it('beats a run of scopes at its own interval, though an earlier run left the timer armed', async () => {
+    // Fake timers: the margins are exact, whatever else the machine is doing.
+    vi.useFakeTimers();
+    try {
+      const r = attempt();
+      const beats = () => types(Buffer.concat(r.written)).filter((t) => t === TYPE.awaitingOn).length;
+      // A short run arms the timer for 100 ms from now, and ends.
+      await r.attempt.working(async () => {}, 100);
+      await vi.advanceTimersByTimeAsync(60);
+      // A longer run opens 60 ms in: its first beat is due 100 ms after it opened, not when the timer fires.
+      const release = Promise.withResolvers<void>();
+      const working = r.attempt.working(() => release.promise, 100);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(beats()).toBe(0);
+      await vi.advanceTimersByTimeAsync(120);
+      expect(beats()).toBeGreaterThan(0);
+      release.resolve();
+      await working;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads the heartbeat interval once, when the attempt first needs it', async () => {
+    const before = process.env.RESTATE_SESSIONS_HEARTBEAT;
+    try {
+      process.env.RESTATE_SESSIONS_HEARTBEAT = '20';
+      const r = attempt();
+      const beats = () => types(Buffer.concat(r.written)).filter((t) => t === TYPE.awaitingOn).length;
+      await r.attempt.working(async () => {});
+      // The environment changes: the attempt keeps the interval it read.
+      process.env.RESTATE_SESSIONS_HEARTBEAT = '100000';
+      const release = Promise.withResolvers<void>();
+      const working = r.attempt.working(() => release.promise);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(beats()).toBeGreaterThan(0);
+      release.resolve();
+      await working;
+    } finally {
+      if (before === undefined) delete process.env.RESTATE_SESSIONS_HEARTBEAT;
+      else process.env.RESTATE_SESSIONS_HEARTBEAT = before;
+    }
   });
 
   it('opens a working scope right after writing without a heartbeat of its own', async () => {
