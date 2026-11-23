@@ -1,6 +1,6 @@
 {
   "name": "@restatedev/sessions-linux-arm64-gnu",
-  "version": "0.10.3",
+  "version": "0.11.0",
   "description": "@restatedev/sessions addon for Linux on arm64, glibc 2.35 or later: installed with @restatedev/sessions, on that platform alone",
   "license": "MIT",
   "repository": {

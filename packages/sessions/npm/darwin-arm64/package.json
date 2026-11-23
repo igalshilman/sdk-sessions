@@ -1,6 +1,6 @@
 {
   "name": "@restatedev/sessions-darwin-arm64",
-  "version": "0.10.3",
+  "version": "0.11.0",
   "description": "@restatedev/sessions addon for macOS on Apple silicon: installed with @restatedev/sessions, on that platform alone",
   "license": "MIT",
   "repository": {
