@@ -20,7 +20,9 @@ napi-derive = "3"
 # directory.
 # 8.7.1: a cancellation resumes an invocation shut down while it waits for a
 # call (sdk-shared-core#120).
-restate-sdk-shared-core = { version = "8.7.1", features = [
+# 8.7.3: a SQL call polled outside a task runs in place; compiled statements
+# are shared between the sessions of one schema (sdk-shared-core#123).
+restate-sdk-shared-core = { version = "8.7.3", features = [
   "sql",
   "object_store_aws",
   "object_store_gcp",
