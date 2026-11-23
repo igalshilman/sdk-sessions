@@ -90,17 +90,29 @@ function objects({ columns, rows }: SqlQueryResult): Row[] {
   return result;
 }
 
+// `result` mapped, as a promise: a result that is ready is mapped now, and a failure of the mapping is a rejection.
+const mapped = <T>(result: Answer<SqlQueryResult>, map: (result: SqlQueryResult) => T): Promise<T> => {
+  if (result instanceof Promise) return result.then(map);
+  try {
+    return Promise.resolve(map(result));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+};
+
 /**
  * {@link DatabaseWriter} over `run`, which runs one call's SQL and returns
  * its rows with their columns, failing as `failure` makes its errors (as
- * `run` makes the engine's).
+ * `run` makes the engine's). `run` answers with the value itself when the
+ * call was ready at once, which only this package sees: each call returns a
+ * promise.
  */
 export function sqlOver(
-  run: (sql: string, params?: SqlParam[]) => Promise<SqlQueryResult>,
+  run: (sql: string, params?: SqlParam[]) => Answer<SqlQueryResult>,
   failure: (error: unknown) => unknown = (error) => error,
 ): DatabaseWriter {
   // A `run` that throws is a rejection, as it was when each of these was an async function.
-  const start = (sql: string, params?: SqlParam[]): Promise<SqlQueryResult> => {
+  const start = (sql: string, params?: SqlParam[]): Answer<SqlQueryResult> => {
     try {
       return run(sql, params);
     } catch (error) {
@@ -115,11 +127,11 @@ export function sqlOver(
     }
   };
   return {
-    query: <T>(sql: string, params?: SqlParam[]) => start(sql, params).then(rowsOf) as Promise<T[]>,
+    query: <T>(sql: string, params?: SqlParam[]) => mapped(start(sql, params), rowsOf) as Promise<T[]>,
     get: <T>(sql: string, params?: SqlParam[]) =>
-      start(sql, params).then((result) => rowsOf(result)[0] as T | undefined),
-    values: (sql, params) => start(sql, params).then((result) => result.rows),
-    execute: (sql, params) => start(sql, params).then(nothing),
+      mapped(start(sql, params), (result) => rowsOf(result)[0] as T | undefined),
+    values: (sql, params) => mapped(start(sql, params), (result) => result.rows),
+    execute: (sql, params) => mapped(start(sql, params), nothing),
   };
 }
 
@@ -263,6 +275,17 @@ class Boundary implements Store {
     });
   }
 
+  /**
+   * `call`'s value if it is ready (the addon answers at once): then no scope
+   * is opened, as nothing waited; a promise runs on in the attempt's `working`
+   * scope, which opens as the call returns it.
+   */
+  aliveNow<T>(call: () => Answer<T>): Answer<T> {
+    const result = call();
+    if (!(result instanceof Promise)) return result;
+    return this.working === undefined ? result : this.working(() => result);
+  }
+
   /** `call`, in the attempt's `working` scope if the database has one. */
   alive<T>(call: () => T | Promise<T>): Promise<T> {
     return this.working === undefined ? (async () => call())() : this.working(call);
@@ -285,7 +308,7 @@ class Boundary implements Store {
 
 /**
  * SQL on a session of the addon: {@link DatabaseWriter}'s `query` and `execute`
- * by way of its `queryColumns`.
+ * by way of its `queryColumnsNow`.
  */
 abstract class Sql implements DatabaseWriter {
   protected readonly native: NativeSession;
@@ -295,10 +318,20 @@ abstract class Sql implements DatabaseWriter {
   constructor(native: NativeSession, boundary: Boundary) {
     this.native = native;
     this.boundary = boundary;
-    this.over = sqlOver((s, p) => this.queryColumns(s, p));
+    this.over = sqlOver((s, p) => this.queryColumnsNow(s, p));
   }
 
-  abstract queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult>;
+  /**
+   * The rows of one statement with their column names: the value itself if
+   * the addon answered at once (only the package's own code takes it so), else
+   * a promise of it. A failure is a rejection.
+   */
+  abstract queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
+
+  queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
+    const result = this.queryColumnsNow(sql, params);
+    return result instanceof Promise ? result : Promise.resolve(result);
+  }
 
   query<T = Row>(sql: string, params?: SqlParam[]): Promise<T[]> {
     return this.over.query<T>(sql, params);
@@ -312,8 +345,22 @@ abstract class Sql implements DatabaseWriter {
     return this.over.values(sql, params);
   }
 
-  async execute(sql: string, params?: SqlParam[]): Promise<void> {
-    await this.queryColumns(sql, params);
+  execute(sql: string, params?: SqlParam[]): Promise<void> {
+    return this.over.execute(sql, params);
+  }
+
+  /** {@link request}, but the value itself if it is ready, and then without a scope or a promise. */
+  protected requestNow<T>(call: () => Answer<T>): Answer<T> {
+    let result: Answer<T>;
+    try {
+      result = this.boundary.aliveNow(call);
+    } catch (error) {
+      return Promise.reject(this.failure(error));
+    }
+    if (!(result instanceof Promise)) return result;
+    return result.catch((error: unknown) => {
+      throw this.failure(error);
+    });
   }
 
   /**
@@ -381,8 +428,21 @@ export class Connection extends Sql {
   private queue: Promise<unknown> = Promise.resolve();
   /** The last transaction queued, until it has committed or rolled back: a call queued behind it fires it. */
   private tail: Gate | undefined;
+  /** Calls queued and not settled: with none, a call that is ready runs at once, in order. */
+  private inflight = 0;
+  private readonly release = (): void => {
+    this.inflight--;
+  };
 
-  queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
+  queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult> {
+    if (this.inflight === 0 && this.running.getStore()?.open !== true) {
+      const result = this.requestNow(() => this.native.queryColumns(sql, params));
+      if (!(result instanceof Promise)) return result;
+      // Not ready: the calls after it queue behind it.
+      this.inflight++;
+      this.queue = result.then(this.release, this.release);
+      return result;
+    }
     return this.serial(() => this.request(() => this.native.queryColumns(sql, params)));
   }
 
@@ -474,8 +534,9 @@ export class Connection extends Sql {
     // that is itself the last one queued from now on is told by the next.
     this.tail?.fire();
     if (transaction !== undefined) this.tail = transaction;
+    this.inflight++;
     const result = this.queue.then(call);
-    this.queue = result.then(undefined, nothing);
+    this.queue = result.then(this.release, this.release);
     return result;
   }
 
@@ -491,6 +552,8 @@ export class Connection extends Sql {
 export interface ConnectionTransaction extends DatabaseWriter {
   /** The rows of one statement, with their column names. */
   queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult>;
+  /** {@link queryColumns} for the package's own code: the value itself if the addon answered at once. */
+  queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
   /**
    * Set the record `name` to `value` with this transaction, in the same
    * write: a whole value kept beside the SQL, in no table, stored exactly
@@ -545,6 +608,10 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   private readonly withCommits: (() => void)[] = [];
   /** Settles once the last call queued so far has: the next call runs after it. */
   private queue: Promise<unknown> = Promise.resolve();
+  private inflight = 0;
+  private readonly release = (): void => {
+    this.inflight--;
+  };
   private ended = false;
   readonly queued: Promise<void>;
 
@@ -568,7 +635,14 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
     return Object.fromEntries(this.records);
   }
 
-  queryColumns(sql: string, params?: SqlParam[]): Promise<SqlQueryResult> {
+  queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult> {
+    if (this.inflight === 0 && !this.ended) {
+      const result = this.requestNow(() => this.native.queryColumns(sql, params));
+      if (!(result instanceof Promise)) return result;
+      this.inflight++;
+      this.queue = result.then(this.release, this.release);
+      return result;
+    }
     return this.serial(() => this.request(() => this.native.queryColumns(sql, params)));
   }
 
@@ -597,8 +671,9 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   /** Run `call`, made while the transaction is open, once the calls before it have. */
   private serial<T>(call: () => Promise<T>): Promise<T> {
     if (this.ended) return Promise.reject(new SqlError('the transaction has ended'));
+    this.inflight++;
     const result = this.queue.then(call);
-    this.queue = result.then(undefined, nothing);
+    this.queue = result.then(this.release, this.release);
     return result;
   }
 

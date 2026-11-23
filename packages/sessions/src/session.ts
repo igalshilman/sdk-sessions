@@ -256,9 +256,17 @@ function forHandler<T>(call: Promise<T>): Promise<T> {
   });
 }
 
+/** {@link forHandler} of a call that answers with its value when it is ready: then it is the value, which only this package takes so. */
+function forHandlerNow<T>(call: T | Promise<T>): T | Promise<T> {
+  return call instanceof Promise ? forHandler(call) : call;
+}
+
 /** The SQL of a transaction's body: `tx`'s, failing as {@link forHandler} does. */
 function forBody(tx: ConnectionTransaction): DatabaseWriter & { readonly queued: Promise<void> } {
-  return { ...sqlOver((sql, params) => forHandler(tx.queryColumns(sql, params)), handlerError), queued: tx.queued };
+  return {
+    ...sqlOver((sql, params) => forHandlerNow(tx.queryColumnsNow(sql, params)), handlerError),
+    queued: tx.queued,
+  };
 }
 
 /**
@@ -268,7 +276,7 @@ function forBody(tx: ConnectionTransaction): DatabaseWriter & { readonly queued:
  */
 export function asDatabase(connection: Connection): Database {
   const db: Database = {
-    ...sqlOver((sql, params) => connection.queryColumns(sql, params)),
+    ...sqlOver((sql, params) => connection.queryColumnsNow(sql, params)),
     transaction: (body) => connection.transaction((tx) => body({ ...forBody(tx), send: refusedSend })),
   };
   return ensuring(db, (schemas) => apply(connection, schemas));
@@ -417,6 +425,10 @@ class Session {
   /** A call failed on it once a failure ended it: the next call opens another. */
   retired = false;
   private connection: Connection | undefined;
+  /** Its connection, once its open settled. */
+  get opened(): Connection | undefined {
+    return this.connection;
+  }
   private failed = false;
   private release: () => void = () => {};
 
@@ -478,6 +490,8 @@ export class Attempt {
   private readonly databases = new Map<string, Attempt>();
   /** The session, from its first use on. */
   private session: Session | undefined;
+  /** The calls made on the session that have not reached its connection yet: see {@link call}. */
+  private unhanded = 0;
   /** The ids of the outbox's transactions this attempt made the sends of. */
   private readonly made = new Set<string>();
   /** The schemas this attempt's database has all the steps of. */
@@ -490,7 +504,10 @@ export class Attempt {
     this.name = name;
     this.hasOutbox = !ctx.shared && name === undefined;
     this.db = {
-      ...sqlOver((sql, params) => this.asked(() => this.call((db) => db.queryColumns(sql, params))), handlerError),
+      ...sqlOver(
+        (sql, params) => this.askedNow(() => this.callNow((db) => db.queryColumnsNow(sql, params))),
+        handlerError,
+      ),
       transaction: (body) => this.asked(() => this.transaction(body)),
     };
     ensuring(this.db, (schemas) => this.asked(() => this.call((db) => this.ensureSchemas(db, schemas))));
@@ -521,6 +538,12 @@ export class Attempt {
    * to what the handler awaits next.
    */
   private asked<T>(call: () => Promise<T>): Promise<T> {
+    if (this.ctx.takeCancellation?.()) return Promise.reject(new CancelledError());
+    return call();
+  }
+
+  /** {@link asked} for a call that answers with its value when it is ready ({@link callNow}). */
+  private askedNow<T>(call: () => T | Promise<T>): T | Promise<T> {
     if (this.ctx.takeCancellation?.()) return Promise.reject(new CancelledError());
     return call();
   }
@@ -603,12 +626,53 @@ export class Attempt {
    */
   private async call<T>(call: (db: Connection) => Promise<T>): Promise<T> {
     const session = this.current();
+    // Counted until it reaches the connection, which orders it from there on.
+    this.unhanded++;
+    let counted = true;
+    const handed = () => {
+      if (counted) this.unhanded--;
+      counted = false;
+    };
     try {
-      return await call(await session.ready);
+      const db = await session.ready;
+      handed();
+      return await call(db);
     } catch (error) {
+      handed();
       if (session.ended) session.retired = true;
       throw handlerError(error);
     }
+  }
+
+  /**
+   * {@link call} for a call that answers with its value when it is ready: it
+   * is the value, without a promise, which only this package takes so. That
+   * is for a session that is open, and with no call before it still to reach
+   * the connection (a call made before it, which waits for the session, must
+   * run first): anything else is {@link call}.
+   */
+  private callNow<T>(call: (db: Connection) => T | Promise<T>): T | Promise<T> {
+    const session = this.session;
+    const db = session?.opened;
+    if (this.unhanded > 0 || session === undefined || db === undefined || session.retired || this.ended) {
+      return this.call(async (connection) => call(connection));
+    }
+    // As `call` fails: a session that a failure ended is retired by the call that fails on it.
+    const failure = (error: unknown): unknown => {
+      if (session.ended) session.retired = true;
+      return handlerError(error);
+    };
+    let result: T | Promise<T>;
+    try {
+      result = call(db);
+    } catch (error) {
+      return Promise.reject(failure(error));
+    }
+    return result instanceof Promise
+      ? result.catch((error: unknown) => {
+          throw failure(error);
+        })
+      : result;
   }
 
   /** The session, opening one if there is none, or the one there is was retired. */
