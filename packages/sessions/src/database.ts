@@ -57,6 +57,25 @@ export interface DatabaseWriter extends DatabaseReader {
   execute(sql: string, params?: SqlParam[]): Promise<void>;
 }
 
+/**
+ * What the addon refuses as a parameter before it runs a call (its conversion
+ * of an SQL value): a failure here is the call's own, and nothing ran.
+ */
+function checkParams(params: SqlParam[] | undefined): void {
+  for (const param of params ?? []) {
+    const type = typeof param;
+    if (type === 'bigint' && ((param as bigint) > 2n ** 63n - 1n || (param as bigint) < -(2n ** 63n))) {
+      throw new Error('a bigint parameter exceeds 64 bits');
+    }
+    if (type === 'symbol' || type === 'function') {
+      throw new Error(`unsupported SQL value: ${type === 'symbol' ? 'Symbol' : 'Function'}`);
+    }
+    if (type === 'object' && param !== null && !(param instanceof Uint8Array)) {
+      throw new Error('unsupported SQL value: Object');
+    }
+  }
+}
+
 /** Nothing: what settles a queue's last call, and what `execute` resolves with. */
 const nothing = (): void => {};
 
@@ -168,6 +187,8 @@ interface Addon {
  */
 interface NativeSession {
   queryColumns(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
+  /** `queryColumns`, after `before`'s statements in the same call; absent in an addon without it. */
+  queryColumnsAfter?(before: string[], sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
   begin(): Answer<void>;
   /** `withCommit`: whether the transaction has work to run at the commit's sync (see `Boundary.sync`). */
   commit(records: Record<string, Buffer>, withCommit?: boolean): Answer<void>;
@@ -470,6 +491,7 @@ export class Connection extends Sql {
     let result: T;
     try {
       result = await this.running.run(tx, () => body(tx));
+      await tx.drain();
     } catch (error) {
       await tx.end();
       await this.rollback();
@@ -573,6 +595,22 @@ export interface ConnectionTransaction extends DatabaseWriter {
    */
   withCommit(run: () => void): void;
   /**
+   * Have `sql` (one statement, no parameters) run just before the next call
+   * of this transaction, in the same call to the addon: the statements are
+   * the ones a call of their own would run, in the order the calls are made,
+   * and the call fails with the error of the first that fails. It spares
+   * the crossing of a call. Returns false, and queues nothing, where the
+   * addon cannot (an addon without `queryColumnsAfter`): run the statement
+   * with {@link queryColumns}. One still queued as the body settles runs
+   * then, before the commit, and its failure fails the transaction.
+   */
+  defer(sql: string): boolean;
+  /**
+   * Take back the last `sql` that {@link defer} queued if no call has taken
+   * it yet: it never runs. Whether it did.
+   */
+  undefer(sql: string): boolean;
+  /**
    * Settles, and never rejects, once another call to the connection has
    * queued behind this transaction: it is waiting for the body to settle.
    * A body that holds the transaction open for more work can return on it,
@@ -612,6 +650,8 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   private readonly release = (): void => {
     this.inflight--;
   };
+  /** SQL that runs with the next call made (`defer`). */
+  private deferred: string[] = [];
   private ended = false;
   readonly queued: Promise<void>;
 
@@ -636,14 +676,54 @@ class OpenTransaction extends Sql implements ConnectionTransaction {
   }
 
   queryColumnsNow(sql: string, params?: SqlParam[]): Answer<SqlQueryResult> {
+    if (this.ended) return Promise.reject(new SqlError('the transaction has ended'));
+    // The call fails before it runs anything if the addon cannot take its parameters: it must not have taken
+    // the deferred statements, which no call would then run (the addon's conversion is checked here, as it
+    // comes first there, and cannot be told from a failure of the SQL once it has run).
+    if (this.deferred.length > 0) {
+      try {
+        checkParams(params);
+      } catch (error) {
+        return Promise.reject(this.failure(error));
+      }
+    }
+    // Taken as the call is made, not as it runs: a call made before the deferral runs before it.
+    const before = this.deferred.splice(0);
+    const call = () =>
+      before.length === 0 ? this.native.queryColumns(sql, params) : this.native.queryColumnsAfter!(before, sql, params);
     if (this.inflight === 0 && !this.ended) {
-      const result = this.requestNow(() => this.native.queryColumns(sql, params));
+      const result = this.requestNow(call);
       if (!(result instanceof Promise)) return result;
       this.inflight++;
       this.queue = result.then(this.release, this.release);
       return result;
     }
-    return this.serial(() => this.request(() => this.native.queryColumns(sql, params)));
+    return this.serial(() => this.request(call));
+  }
+
+  defer(sql: string): boolean {
+    if (this.ended || this.native.queryColumnsAfter === undefined) return false;
+    this.deferred.push(sql);
+    return true;
+  }
+
+  undefer(sql: string): boolean {
+    const at = this.deferred.lastIndexOf(sql);
+    if (at < 0) return false;
+    this.deferred.splice(at, 1);
+    return true;
+  }
+
+  /**
+   * Refuse calls from now on, and once those made have settled, run the SQL
+   * that no call took (`defer`): the body has settled, and the commit
+   * follows. Its failure fails the transaction, as the call that would have
+   * run it would have.
+   */
+  async drain(): Promise<void> {
+    this.ended = true;
+    await this.queue;
+    for (const sql of this.deferred.splice(0)) await this.request(() => this.native.queryColumns(sql));
   }
 
   setRecord(name: string, value: Uint8Array): void {

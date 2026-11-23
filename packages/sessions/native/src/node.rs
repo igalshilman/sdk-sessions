@@ -665,16 +665,33 @@ impl Database {
         params: Option<Vec<SqlValue>>,
     ) -> Result<Either<QueryResult, PromiseRaw<'env, QueryResult>>> {
         let db = self.0.clone();
+        answer(env, async move { rows_of(&db, &sql, params).await })
+    }
+
+    /// [`Self::query_columns`] after `before`, SQL that runs first, each
+    /// statement as a call of its own would run it (no parameters), in the
+    /// same call to the addon: the rows are those of `sql`. A statement that
+    /// fails ends the call with its error, and the ones after it do not run.
+    /// Several calls in one spare their crossings of the addon and their
+    /// threads' hand-offs; the SQL run, and its order, are what the same calls
+    /// made one by one would run.
+    #[napi(
+        ts_args_type = "before: string[], sql: string, params?: SqlValue[]",
+        ts_return_type = "Answer<{ columns: string[]; rows: SqlValue[][] }>"
+    )]
+    pub fn query_columns_after<'env>(
+        &self,
+        env: &'env Env,
+        before: Vec<String>,
+        sql: String,
+        params: Option<Vec<SqlValue>>,
+    ) -> Result<Either<QueryResult, PromiseRaw<'env, QueryResult>>> {
+        let db = self.0.clone();
         answer(env, async move {
-            let params = params.map(|params| params.into_iter().map(|p| p.0).collect());
-            let (columns, rows) = db.query_columns(&sql, params).await.map_err(error)?;
-            Ok(QueryResult {
-                columns,
-                rows: rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(SqlValue).collect())
-                    .collect(),
-            })
+            for statement in &before {
+                db.query_columns(statement, None).await.map_err(error)?;
+            }
+            rows_of(&db, &sql, params).await
         })
     }
 
@@ -756,6 +773,23 @@ impl Database {
     pub async fn close(&self) {
         self.0.close().await
     }
+}
+
+/// `sql` run on `db`, with its parameters: its rows with their column names.
+async fn rows_of(
+    db: &sql::Database,
+    sql: &str,
+    params: Option<Vec<SqlValue>>,
+) -> Result<QueryResult> {
+    let params = params.map(|params| params.into_iter().map(|p| p.0).collect());
+    let (columns, rows) = db.query_columns(sql, params).await.map_err(error)?;
+    Ok(QueryResult {
+        columns,
+        rows: rows
+            .into_iter()
+            .map(|row| row.into_iter().map(SqlValue).collect())
+            .collect(),
+    })
 }
 
 /// Rows with the column names of their statement.

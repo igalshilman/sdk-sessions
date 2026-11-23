@@ -8,7 +8,10 @@ import { defineTool } from '@earendil-works/pi-durable';
 import { obj } from '@earendil-works/pi-schema';
 import * as pi from '@restatedev/agents/pi';
 import { SqlKvDatabase, type Commits } from '@restatedev/agents/pi/storage';
+import type { SqliteExecutor } from '@earendil-works/pi-durable/storage/sqlite';
+import { createRequire } from 'node:module';
 import { describe, expect, it, vi } from 'vitest';
+import { platform } from '../../sessions/src/platform.ts';
 import { callTools, fakeProvider, say, textOf, unavailable } from './fakes/pi.ts';
 import { handlerOf, sqlAttempt, withoutIds } from './support.ts';
 
@@ -866,4 +869,240 @@ describe('a batch that is open as the invocation is cancelled or its attempt end
       expect(effects.parts).toEqual(each.parts);
     },
   );
+});
+
+/**
+ * The calls the addon gets from the session while `during` runs, as `entry` and the SQL it runs (what a call
+ * carries before its own statement first): the session's crossings of the addon.
+ */
+async function crossings<T>(during: () => Promise<T>) {
+  const addon = createRequire(import.meta.resolve('@restatedev/sessions/internal'))(
+    `@restatedev/sessions-${platform()}`,
+  ) as { Database: { prototype: Record<string, (...a: unknown[]) => unknown> } };
+  const proto = addon.Database.prototype;
+  const calls: { entry: string; sql: string[] }[] = [];
+  const originals = new Map<string, (...a: unknown[]) => unknown>();
+  for (const entry of ['queryColumns', 'queryColumnsAfter', 'begin', 'commit', 'rollback']) {
+    const original = proto[entry];
+    if (original === undefined) continue; // an addon without the entry
+    originals.set(entry, original);
+    proto[entry] = function (this: unknown, ...args: unknown[]) {
+      const [before, sql] = entry === 'queryColumnsAfter' ? [args[0] as string[], args[1]] : [[], args[0]];
+      calls.push({ entry, sql: [...before, ...(typeof sql === 'string' ? [sql] : [])] });
+      return original.apply(this, args);
+    };
+  }
+  try {
+    const result = await during();
+    return { result, calls, sql: calls.flatMap((c) => c.sql) };
+  } finally {
+    for (const [entry, original] of originals) proto[entry] = original;
+  }
+}
+
+const SAVEPOINT = 'SAVEPOINT restate_pi';
+const RELEASE = 'RELEASE restate_pi';
+
+describe("the adapter's savepoints ride with pi's statements", () => {
+  it('costs one crossing a statement: a savepoint with its first, a release with the next call, none at the end', async () => {
+    const { database, run } = adapter();
+    await run(async () => {
+      await database.exec('CREATE TABLE t (n INTEGER PRIMARY KEY)');
+      database.armed = true;
+      const { calls, sql } = await crossings(async () => {
+        for (const n of [1, 2, 3]) {
+          await database.transaction(async (tx) => {
+            await tx.run('INSERT INTO t VALUES (?)', n * 10);
+            await tx.run('INSERT INTO t VALUES (?)', n * 10 + 1);
+          });
+        }
+        await database.flush();
+      });
+      expect(calls.map((c) => [c.entry, c.sql.length])).toEqual([
+        ['begin', 0],
+        ['queryColumnsAfter', 2], // the savepoint, and the first statement
+        ['queryColumns', 1],
+        ['queryColumnsAfter', 3], // the release of the commit before, the savepoint, the first statement
+        ['queryColumns', 1],
+        ['queryColumnsAfter', 3],
+        ['queryColumns', 1],
+        ['commit', 0],
+      ]);
+      // The statements are those of one call each, in the order of the calls, but for the last release.
+      expect(sql.filter((s) => s.includes('restate_pi'))).toEqual([SAVEPOINT, RELEASE, SAVEPOINT, RELEASE, SAVEPOINT]);
+      expect(await database.all('SELECT n FROM t ORDER BY n')).toEqual([
+        { n: 10 },
+        { n: 11 },
+        { n: 20 },
+        { n: 21 },
+        { n: 30 },
+        { n: 31 },
+      ]);
+    });
+  });
+
+  it('puts the release on a read of the batch, which runs after it', async () => {
+    const { database, run } = adapter();
+    await run(async () => {
+      await database.exec('CREATE TABLE t (n INTEGER PRIMARY KEY)');
+      database.armed = true;
+      const { sql } = await crossings(async () => {
+        await database.transaction(async (tx) => tx.run('INSERT INTO t VALUES (1)'));
+        expect(await database.all('SELECT n FROM t')).toEqual([{ n: 1 }]);
+        await database.transaction(async (tx) => tx.run('INSERT INTO t VALUES (2)'));
+        await database.flush();
+      });
+      expect(sql).toEqual([
+        SAVEPOINT,
+        'INSERT INTO t VALUES (1)',
+        RELEASE,
+        'SELECT n FROM t',
+        SAVEPOINT,
+        'INSERT INTO t VALUES (2)',
+      ]);
+    });
+  });
+
+  it('runs neither savepoint nor release for a pi commit that runs no statement', async () => {
+    const { database, run } = adapter();
+    await run(async () => {
+      await database.exec('CREATE TABLE t (n INTEGER PRIMARY KEY)');
+      database.armed = true;
+      const { sql } = await crossings(async () => {
+        await database.transaction(async () => 'nothing');
+        await database.transaction(async (tx) => tx.run('INSERT INTO t VALUES (1)'));
+        await database.transaction(async () => 'nothing');
+        await database.flush();
+      });
+      expect(sql).toEqual([SAVEPOINT, 'INSERT INTO t VALUES (1)']);
+      expect(await database.all('SELECT n FROM t')).toEqual([{ n: 1 }]);
+    });
+  });
+
+  it.each([
+    [
+      'its first statement',
+      async (tx: SqliteExecutor) => {
+        await tx.run('INSERT INTO missing VALUES (1)');
+        await tx.run('INSERT INTO t VALUES (100)');
+      },
+      /no such table/,
+    ],
+    [
+      'its last statement',
+      async (tx: SqliteExecutor) => {
+        await tx.run('INSERT INTO t VALUES (100)');
+        await tx.run('INSERT INTO t VALUES (101)');
+        await tx.run('INSERT INTO t VALUES (101)');
+      },
+      /UNIQUE/,
+    ],
+    [
+      'a statement between two',
+      async (tx: SqliteExecutor) => {
+        await tx.run('INSERT INTO t VALUES (100)');
+        await tx.run('INSERT INTO missing VALUES (1)');
+        await tx.run('INSERT INTO t VALUES (101)');
+      },
+      /no such table/,
+    ],
+    [
+      'pi itself, after its statements',
+      async (tx: SqliteExecutor) => {
+        await tx.run('INSERT INTO t VALUES (100)');
+        await tx.run('INSERT INTO t VALUES (101)');
+        throw new Error('the commit failed');
+      },
+      /the commit failed/,
+    ],
+    [
+      'pi itself, before any statement',
+      async () => {
+        throw new Error('the commit failed');
+      },
+      /the commit failed/,
+    ],
+  ])('undoes exactly the commit that fails in %s, and the commits around it stay', async (_, failing, error) => {
+    const { database, counted, run } = adapter();
+    const told: string[] = [];
+    await run(async () => {
+      await database.exec('CREATE TABLE t (n INTEGER PRIMARY KEY)');
+      database.armed = true;
+      const commit = (name: string, body: (tx: SqliteExecutor) => Promise<unknown>) => {
+        database.afterCommit = async () => void told.push(name);
+        return database.transaction(body);
+      };
+      await commit('one', async (tx) => tx.run('INSERT INTO t VALUES (1)'));
+      await commit('two', async (tx) => {
+        await tx.run('INSERT INTO t VALUES (2)');
+        await tx.run('INSERT INTO t VALUES (3)');
+      });
+      await expect(commit('failing', failing)).rejects.toThrow(error);
+      await commit('after', async (tx) => tx.run('INSERT INTO t VALUES (9)'));
+      // The failed one's rows are gone, the others' stay, in the batch and once it is written.
+      expect(await database.all('SELECT n FROM t ORDER BY n')).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }, { n: 9 }]);
+      await database.flush();
+      expect(counted.commits).toBe(2); // the table, and the batch
+      expect(told).toEqual(['one', 'two', 'after']);
+      expect(await database.all('SELECT n FROM t ORDER BY n')).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }, { n: 9 }]);
+      // The session goes on, and nothing of the batch's savepoints is left in it.
+      await database.run('INSERT INTO t VALUES (10)');
+      await database.transaction(async (tx) => tx.run('INSERT INTO t VALUES (11)'));
+      await database.flush();
+      expect(await database.all('SELECT n FROM t WHERE n > 9 ORDER BY n')).toEqual([{ n: 10 }, { n: 11 }]);
+    });
+  });
+
+  it('rolls back to the savepoint of the failing commit alone, however the release of the one before is placed', async () => {
+    const { database, run } = adapter();
+    await run(async () => {
+      await database.exec('CREATE TABLE t (n INTEGER PRIMARY KEY)');
+      database.armed = true;
+      await database.transaction(async (tx) => tx.run('INSERT INTO t VALUES (1)'));
+      // The release of the first is still queued; the failing commit has no statement before the failure.
+      await expect(
+        database.transaction(async () => {
+          throw new Error('early');
+        }),
+      ).rejects.toThrow('early');
+      expect(await database.all('SELECT n FROM t')).toEqual([{ n: 1 }]);
+      await database.flush();
+      expect(await database.all('SELECT n FROM t')).toEqual([{ n: 1 }]);
+    });
+  });
+
+  it('takes the statements as the session gives them when its transactions cannot defer: a call each, as before', async () => {
+    const map = new Map<string, Uint8Array>();
+    const sql = sqlAttempt({ map });
+    // A transaction of a database of another kind has no way to defer.
+    const plain = {
+      ...sql.db,
+      transaction: <T>(body: (tx: restate.Transaction) => Promise<T>) => sql.db.transaction((tx) => body({ ...tx })),
+    };
+    const database = new SqlKvDatabase(plain, { commits: 'effects' });
+    await sql.end(async () => {
+      await database.exec('CREATE TABLE t (n INTEGER PRIMARY KEY)');
+      database.armed = true;
+      const { sql: calls } = await crossings(async () => {
+        await database.transaction(async (tx) => tx.run('INSERT INTO t VALUES (1)'));
+        await expect(
+          database.transaction(async (tx) => {
+            await tx.run('INSERT INTO t VALUES (2)');
+            throw new Error('no');
+          }),
+        ).rejects.toThrow('no');
+        await database.flush();
+      });
+      expect(calls).toEqual([
+        SAVEPOINT,
+        'INSERT INTO t VALUES (1)',
+        RELEASE,
+        SAVEPOINT,
+        'INSERT INTO t VALUES (2)',
+        'ROLLBACK TO restate_pi',
+        RELEASE,
+      ]);
+      expect(await database.all('SELECT n FROM t')).toEqual([{ n: 1 }]);
+    });
+  });
 });

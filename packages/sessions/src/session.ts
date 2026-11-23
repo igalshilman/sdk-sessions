@@ -269,6 +269,26 @@ function forBody(tx: ConnectionTransaction): DatabaseWriter & { readonly queued:
   };
 }
 
+/** The connection's transaction behind a `tx` of a body, for the SQL it defers ({@link deferSql}). */
+const DEFERRED = new Link<ConnectionTransaction>('deferred sql');
+
+/**
+ * Have `sql` (one statement, no parameters) run just before the next call of
+ * the transaction `tx`, in the same crossing of the addon: the statement and
+ * its order are those of a call made now, and what it spares is the call.
+ * Its failure is the next call's (or the commit's, if none comes). Returns
+ * false, queuing nothing, if the transaction cannot (a `tx` of another
+ * kind, or an addon without it): run the statement with `tx.execute`.
+ */
+export function deferSql(tx: Transaction, sql: string): boolean {
+  return DEFERRED.of(tx)?.defer(sql) ?? false;
+}
+
+/** Take back the last `sql` that {@link deferSql} queued on `tx` and no call has taken: it never runs. Whether it was taken back. */
+export function undeferSql(tx: Transaction, sql: string): boolean {
+  return DEFERRED.of(tx)?.undefer(sql) ?? false;
+}
+
 /**
  * `connection`, opened without the SDK (`open`), as a handler's `ctx.db`:
  * for a library's tests, and tools. Its transactions send nothing, and a
@@ -277,7 +297,7 @@ function forBody(tx: ConnectionTransaction): DatabaseWriter & { readonly queued:
 export function asDatabase(connection: Connection): Database {
   const db: Database = {
     ...sqlOver((sql, params) => connection.queryColumnsNow(sql, params)),
-    transaction: (body) => connection.transaction((tx) => body({ ...forBody(tx), send: refusedSend })),
+    transaction: (body) => connection.transaction((tx) => body(DEFERRED.on({ ...forBody(tx), send: refusedSend }, tx))),
   };
   return ensuring(db, (schemas) => apply(connection, schemas));
 }
@@ -588,6 +608,7 @@ export class Attempt {
         const sends = this.hasOutbox ? new Sends() : undefined;
         const tx: Transaction = { ...forBody(handle), send: sends?.send ?? refusedSend };
         // A view's writes stay in its session: it has nothing to reset.
+        DEFERRED.on(tx, handle);
         if (!this.ctx.shared) RESET.on(tx, () => this.reset(handle));
         let result: T;
         try {

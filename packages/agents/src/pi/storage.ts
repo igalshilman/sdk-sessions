@@ -18,6 +18,7 @@
 // storage's `prefix`), apart from the tables of yours in the same database.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseWriter, Database, Transaction } from '@restatedev/sessions';
+import { deferSql, undeferSql } from '@restatedev/sessions/internal';
 import {
   SqliteStorage,
   type SqliteDatabase,
@@ -52,6 +53,10 @@ class Executor implements SqliteExecutor {
     return this.db.query<T>(sql, params);
   }
 }
+
+/** The savepoint of a pi commit in a batch, and its end. */
+const SAVEPOINT = 'SAVEPOINT restate_pi';
+const RELEASE = 'RELEASE restate_pi';
 
 /** What runs at the end of each pi commit, in its transaction: the copy of its entries (index.ts). */
 export type OnCommit = (tx: Transaction) => Promise<void>;
@@ -318,7 +323,10 @@ export class SqlKvDatabase extends Executor implements SqliteDatabase {
   ): Promise<T> {
     const { tx, run } = await this.#opened();
     const held = this.#batch!;
-    await tx.execute('SAVEPOINT restate_pi');
+    // The savepoint goes with the first statement of the commit, and the release that ended the one before it
+    // (queued below), in the same crossing, in order. A session that cannot defer runs it at once.
+    const deferred = deferSql(tx, SAVEPOINT);
+    if (!deferred) await tx.execute(SAVEPOINT);
     // Whether this commit sent something. A send is recorded on the held transaction, and its real commit
     // makes it whatever a savepoint did: rolling the savepoint back does not take it back. So a commit that
     // sent and then failed cannot be undone alone; the whole batch is (below).
@@ -334,7 +342,11 @@ export class SqlKvDatabase extends Executor implements SqliteDatabase {
           return done;
         }),
       );
-      await tx.execute('RELEASE restate_pi');
+      // A savepoint still queued had no statement run in it: with nothing to undo, it and its release are
+      // no-ops, and neither is run. Otherwise the release rides with the next statement of the batch, or goes
+      // with the batch's end (see `#closeBatch`).
+      if (!deferred) await tx.execute(RELEASE);
+      else if (!undeferSql(tx, SAVEPOINT) && !deferSql(tx, RELEASE)) await tx.execute(RELEASE);
     } catch (error) {
       if (sent) {
         await this.#abandon(held, error);
@@ -342,7 +354,7 @@ export class SqlKvDatabase extends Executor implements SqliteDatabase {
       }
       try {
         await tx.execute('ROLLBACK TO restate_pi');
-        await tx.execute('RELEASE restate_pi');
+        await tx.execute(RELEASE);
       } catch {
         // The session failed too: the error of the commit is what the caller gets, and the next call fails.
       }
@@ -393,6 +405,9 @@ export class SqlKvDatabase extends Executor implements SqliteDatabase {
     const held = this.#batch;
     if (!held) return;
     this.#batch = undefined;
+    // The release of the last commit's savepoint, if nothing ran after it, is not run: the commit ends every
+    // savepoint of its transaction.
+    undeferSql(held.batch.tx, RELEASE);
     held.batch.release();
     try {
       await held.done;

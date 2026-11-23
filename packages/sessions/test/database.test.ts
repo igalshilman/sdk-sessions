@@ -698,3 +698,210 @@ test("a store's error that ends the session is what its calls fail with, as it w
   assert.equal(db.isUsable(), false);
   await db.close();
 });
+
+/** The addon's calls of a session, by entry, while `during` runs: `queryColumnsAfter`'s carry what it ran first. */
+async function crossings<T>(
+  during: () => Promise<T>,
+): Promise<{ result: T; calls: { entry: string; sql: string[] }[] }> {
+  const { addon } = await import('../src/addon.ts');
+  const proto = (addon as unknown as { Database: { prototype: Record<string, (...a: unknown[]) => unknown> } }).Database
+    .prototype;
+  const calls: { entry: string; sql: string[] }[] = [];
+  const originals = new Map<string, (...a: unknown[]) => unknown>();
+  for (const entry of ['queryColumns', 'queryColumnsAfter', 'begin', 'commit', 'rollback']) {
+    const original = proto[entry];
+    if (original === undefined) continue; // an addon without the entry
+    originals.set(entry, original);
+    proto[entry] = function (this: unknown, ...args: unknown[]) {
+      const [before, sql] = entry === 'queryColumnsAfter' ? [args[0] as string[], args[1]] : [[], args[0]];
+      calls.push({ entry, sql: [...before, ...(typeof sql === 'string' ? [sql] : [])] });
+      return original.apply(this, args);
+    };
+  }
+  try {
+    return { result: await during(), calls };
+  } finally {
+    for (const [entry, original] of originals) proto[entry] = original;
+  }
+}
+
+test('SQL deferred in a transaction runs with its next call, in one crossing, in the order of the calls', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  const { calls } = await crossings(() =>
+    db.transaction(async (tx) => {
+      assert.equal(tx.defer('INSERT INTO t VALUES (1)'), true);
+      assert.equal(tx.defer('INSERT INTO t VALUES (2)'), true);
+      // The deferred statements ran before it, in order: it sees both.
+      assert.deepEqual(await tx.values('SELECT n FROM t ORDER BY rowid'), [[1], [2]]);
+      // A call made before a deferral runs before it, though it is not awaited first.
+      const before = tx.values('SELECT count(*) FROM t');
+      assert.equal(tx.defer('INSERT INTO t VALUES (3)'), true);
+      const after = tx.values('SELECT count(*) FROM t');
+      assert.deepEqual([await before, await after], [[[2]], [[3]]]);
+    }),
+  );
+  assert.deepEqual(calls, [
+    { entry: 'begin', sql: [] },
+    {
+      entry: 'queryColumnsAfter',
+      sql: ['INSERT INTO t VALUES (1)', 'INSERT INTO t VALUES (2)', 'SELECT n FROM t ORDER BY rowid'],
+    },
+    { entry: 'queryColumns', sql: ['SELECT count(*) FROM t'] },
+    { entry: 'queryColumnsAfter', sql: ['INSERT INTO t VALUES (3)', 'SELECT count(*) FROM t'] },
+    { entry: 'commit', sql: [] },
+  ]);
+  assert.deepEqual(await db.values('SELECT count(*) FROM t'), [[3]]);
+  await db.close();
+});
+
+test('deferred SQL that fails fails the call that carries it, and what is after it does not run', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  await db.transaction(async (tx) => {
+    // The first of two deferred statements fails: the second and the call are not run.
+    tx.defer('INSERT INTO missing VALUES (1)');
+    tx.defer('INSERT INTO t VALUES (10)');
+    await assert.rejects(tx.execute('INSERT INTO t VALUES (11)'), /no such table/);
+    assert.deepEqual(await tx.values('SELECT n FROM t'), []);
+    // The carried call fails: what was deferred before it stands, as one made by itself would.
+    tx.defer('INSERT INTO t VALUES (20)');
+    await assert.rejects(tx.execute('INSERT INTO missing VALUES (21)'), /no such table/);
+    assert.deepEqual(await tx.values('SELECT n FROM t'), [[20]]);
+    assert.equal(db.isUsable(), true);
+  });
+  assert.deepEqual(await db.values('SELECT n FROM t'), [[20]]);
+  await db.close();
+});
+
+test('a call the addon cannot take runs nothing, and the SQL deferred for it is still there for the next', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  await db.transaction(async (tx) => {
+    assert.equal(tx.defer('SAVEPOINT s'), true);
+    // Parameters it cannot convert: the call fails before it runs anything, with the savepoint still deferred.
+    for (const bad of [{}, Symbol('x'), () => 1, 2n ** 64n]) {
+      await assert.rejects(tx.execute('SELECT ?', [bad as never]), /unsupported SQL value|exceeds 64 bits/);
+    }
+    assert.equal(tx.undefer('SAVEPOINT s'), true, 'the savepoint is still queued');
+    tx.defer('SAVEPOINT s');
+    await assert.rejects(tx.queryColumns('SELECT ?', [{} as never]), /unsupported SQL value/);
+    // The next call takes it, and the release rides with the one after.
+    await tx.execute('INSERT INTO t VALUES (1)');
+    assert.equal(tx.defer('RELEASE s'), true);
+    await assert.rejects(tx.values('SELECT ?', [{} as never]), /unsupported SQL value/);
+    await tx.execute('INSERT INTO t VALUES (2)');
+    assert.deepEqual(await tx.values('SELECT n FROM t ORDER BY n'), [[1], [2]]);
+    // The same through a call queued behind another that has not settled.
+    const slow = tx.values('SELECT 1');
+    tx.defer('SAVEPOINT u');
+    await assert.rejects(tx.execute('SELECT ?', [{} as never]), /unsupported SQL value/);
+    await slow;
+    await tx.execute('INSERT INTO t VALUES (3)');
+    await tx.execute('ROLLBACK TO u');
+    await tx.execute('RELEASE u');
+  });
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[1], [2]]);
+  assert.equal(db.isUsable(), true);
+  await db.close();
+});
+
+test('a deferred statement that fails in the middle of a pair is spent, with the ones after it, and the call did not run', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  await db.transaction(async (tx) => {
+    await tx.execute('INSERT INTO t VALUES (1)');
+    // What pi's storage defers at the next commit: the release of the last one, then a savepoint.
+    tx.defer('RELEASE gone');
+    tx.defer('SAVEPOINT s');
+    await assert.rejects(tx.execute('INSERT INTO t VALUES (2)'), /no such savepoint/);
+    // Both are spent, though only the first ran: the call did not, and nothing is queued.
+    assert.equal(tx.undefer('SAVEPOINT s'), false);
+    assert.deepEqual(await tx.values('SELECT n FROM t'), [[1]]);
+    // The savepoint was never made, and the transaction goes on.
+    await assert.rejects(tx.execute('RELEASE s'), /no such savepoint/);
+    await tx.execute('INSERT INTO t VALUES (3)');
+    assert.equal(db.isUsable(), true);
+  });
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[1], [3]]);
+  await db.close();
+});
+
+test('deferred SQL that no call took runs before the commit, and its failure rolls the transaction back', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  const { calls } = await crossings(() =>
+    db.transaction(async (tx) => {
+      await tx.execute('INSERT INTO t VALUES (1)');
+      assert.equal(tx.defer('INSERT INTO t VALUES (2)'), true);
+    }),
+  );
+  assert.deepEqual(
+    calls.map((c) => c.sql.join(';')),
+    ['', 'INSERT INTO t VALUES (1)', 'INSERT INTO t VALUES (2)', ''],
+  );
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[1], [2]]);
+  await assert.rejects(
+    db.transaction(async (tx) => {
+      await tx.execute('INSERT INTO t VALUES (3)');
+      tx.defer('INSERT INTO missing VALUES (4)');
+    }),
+    /no such table/,
+  );
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[1], [2]]);
+  assert.equal(db.isUsable(), true);
+  // Deferred and not run when the body fails: the rollback takes what it did.
+  await assert.rejects(
+    db.transaction(async (tx) => {
+      await tx.execute('INSERT INTO t VALUES (5)');
+      tx.defer('INSERT INTO t VALUES (6)');
+      throw new Error('no');
+    }),
+    /no/,
+  );
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[1], [2]]);
+  await db.close();
+});
+
+test('undefer takes back SQL no call has taken, and only that', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  await db.transaction(async (tx) => {
+    tx.defer('INSERT INTO t VALUES (1)');
+    assert.equal(tx.undefer('INSERT INTO t VALUES (1)'), true);
+    assert.equal(tx.undefer('INSERT INTO t VALUES (1)'), false);
+    tx.defer('INSERT INTO t VALUES (2)');
+    await tx.execute('INSERT INTO t VALUES (3)');
+    // Taken by the call above: it is not queued any more.
+    assert.equal(tx.undefer('INSERT INTO t VALUES (2)'), false);
+  });
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[2], [3]]);
+  // Not in a body that has ended.
+  let kept: ConnectionTransaction | undefined;
+  await db.transaction(async (tx) => void (kept = tx));
+  assert.equal(kept!.defer('SELECT 1'), false);
+  await db.close();
+});
+
+test('a savepoint deferred with its statement, rolled back to, and released with the next: the commit ends the rest', async () => {
+  const db = await open(fresh(), new Backend().request());
+  await db.execute('CREATE TABLE t(n INTEGER)');
+  await db.transaction(async (tx) => {
+    tx.defer('SAVEPOINT s');
+    await tx.execute('INSERT INTO t VALUES (1)');
+    tx.defer('RELEASE s');
+    tx.defer('SAVEPOINT s');
+    await tx.execute('INSERT INTO t VALUES (2)');
+    await tx.execute('ROLLBACK TO s');
+    assert.deepEqual(await tx.values('SELECT n FROM t'), [[1]]);
+    // Not released: the commit ends it.
+    await tx.execute('INSERT INTO t VALUES (3)');
+  });
+  assert.deepEqual(await db.values('SELECT n FROM t ORDER BY n'), [[1], [3]]);
+  // No savepoint is left over in the session: the next transaction does not find it.
+  await db.transaction(async (tx) => {
+    await assert.rejects(tx.execute('ROLLBACK TO s'), /savepoint/i);
+    await assert.rejects(tx.execute('RELEASE s'), /savepoint/i);
+  });
+  await db.close();
+});
