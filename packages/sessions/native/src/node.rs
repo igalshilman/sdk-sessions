@@ -41,7 +41,7 @@ use restate_sdk_shared_core::{NotificationHandle, Value as VmValue};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What a request to the store does: the store's method it calls.
@@ -261,6 +261,10 @@ struct VmStore {
     /// The writes issued, and how many of them an ack covers.
     issued: AtomicU64,
     synced: AtomicU64,
+    /// Whether the commit in flight has work for JavaScript to run at its sync
+    /// (`withCommit`): set by `Database::commit`, which JavaScript tells. A
+    /// commit with none skips the hop, which would only run an empty function.
+    hook: AtomicBool,
 }
 
 impl VmStore {
@@ -337,6 +341,9 @@ impl VmStore {
     /// What a commit runs on JavaScript before it waits for its ack: the
     /// committing transaction's sends.
     async fn committing(&self) -> io::Result<()> {
+        if !self.hook.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let promise = self
             .dispatch
             .call_async_catch((Op::Sync as u32, String::new(), None).into())
@@ -441,10 +448,23 @@ fn error(error: Box<dyn std::error::Error + Send + Sync>) -> Error {
     }
 }
 
+/// Sets the hook of a VM's store back to `true` (the hop is made) when it is
+/// dropped: as the commit it was set for ends, however it ends, even if the
+/// call panics or is dropped without running.
+struct HookReset(Option<Arc<VmStore>>);
+
+impl Drop for HookReset {
+    fn drop(&mut self) {
+        if let Some(store) = &self.0 {
+            store.hook.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// One session of a namespace's database (see [`sql::Database`]): every
 /// SQL commit is durable when its call resolves.
 #[napi]
-pub struct Database(Arc<sql::Database>);
+pub struct Database(Arc<sql::Database>, Option<Arc<VmStore>>);
 
 /// `call`'s value if it is ready at once, polled here on the JavaScript
 /// thread; else a promise of it, as it goes on in the runtime. Ready, a call
@@ -600,8 +620,9 @@ pub(crate) fn open_on_vm<'env>(
         reader: reader == Some(true),
         issued: AtomicU64::new(0),
         synced: AtomicU64::new(0),
+        hook: AtomicBool::new(true),
     });
-    open_with(env, namespace, store, reader)
+    open_with(env, namespace, store.clone(), Some(store), reader)
 }
 
 /// Open the database of `namespace` over `store` (see the module's doc),
@@ -625,7 +646,7 @@ pub(crate) fn open<'env>(
         dispatch,
         lists_keys,
     });
-    open_with(env, namespace, store, reader)
+    open_with(env, namespace, store, None, reader)
 }
 
 /// Open `namespace`'s database over `store`, kept warm in the process's page
@@ -634,6 +655,7 @@ fn open_with<'env>(
     env: &'env Env,
     namespace: String,
     store: Arc<dyn KvStore + Send + Sync>,
+    vm_store: Option<Arc<VmStore>>,
     reader: Option<bool>,
 ) -> Result<PromiseRaw<'env, Database>> {
     env.spawn_future(async move {
@@ -647,7 +669,7 @@ fn open_with<'env>(
         if reader == Some(true) {
             open = open.reader();
         }
-        Ok(Database(Arc::new(open.await.map_err(error)?)))
+        Ok(Database(Arc::new(open.await.map_err(error)?), vm_store))
     })
 }
 
@@ -688,20 +710,35 @@ impl Database {
     }
 
     /// See [`sql::Database::commit`]: `records` by name.
+    ///
+    /// On the VM, `with_commit` says whether the committing transaction gave
+    /// `withCommit` work: without it (`false`) the commit does not call
+    /// JavaScript at its sync. Absent, it does.
     #[napi(
-        ts_args_type = "records?: Record<string, Buffer>",
+        ts_args_type = "records?: Record<string, Buffer>, withCommit?: boolean",
         ts_return_type = "Answer<void>"
     )]
     pub fn commit<'env>(
         &self,
         env: &'env Env,
         records: Option<HashMap<String, Buffer>>,
+        with_commit: Option<bool>,
     ) -> Result<Either<(), PromiseRaw<'env, ()>>> {
         let records: Vec<_> = (records.unwrap_or_default().into_iter())
             .map(|(name, value)| (name, Bytes::copy_from_slice(&value)))
             .collect();
         let db = self.0.clone();
-        answer(env, async move { db.commit(records).await.map_err(error) })
+        let vm_store = self.1.clone();
+        if let Some(store) = &vm_store {
+            store
+                .hook
+                .store(with_commit != Some(false), Ordering::SeqCst);
+        }
+        let reset = HookReset(vm_store);
+        answer(env, async move {
+            let _reset = reset;
+            db.commit(records).await.map_err(error)
+        })
     }
 
     /// See [`sql::Database::rollback`].

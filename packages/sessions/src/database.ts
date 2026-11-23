@@ -157,7 +157,8 @@ interface Addon {
 interface NativeSession {
   queryColumns(sql: string, params?: SqlParam[]): Answer<SqlQueryResult>;
   begin(): Answer<void>;
-  commit(records: Record<string, Buffer>): Answer<void>;
+  /** `withCommit`: whether the transaction has work to run at the commit's sync (see `Boundary.sync`). */
+  commit(records: Record<string, Buffer>, withCommit?: boolean): Answer<void>;
   rollback(): Answer<void>;
   record(name: string): Answer<Buffer>;
   isUsable(): boolean;
@@ -417,10 +418,13 @@ export class Connection extends Sql {
     const records = await tx.end();
     // Its commit's sync runs what the body gave `withCommit`; one that
     // wrote nothing synced nothing, and it runs after.
-    this.boundary.withSync = tx.commitRuns();
+    const runs = tx.commitRuns();
+    this.boundary.withSync = runs;
     let unsynced: (() => void) | undefined;
     try {
-      await this.boundary.alive(() => this.native.commit(records));
+      // Told whether there is work, the addon on the VM skips the call back
+      // that would only run it.
+      await this.boundary.alive(() => this.native.commit(records, runs !== undefined));
     } catch (error) {
       // A COMMIT that fails (a deferred constraint) leaves the transaction
       // open: without the rollback, the calls after it would run inside it.
