@@ -105,9 +105,11 @@ one for each round. While an effect runs, its own commits (a model's
 progress, a tool's result) are written at once, as with `'each'`; so is
 everything outside a prompt (`work`, a compaction).
 
-What `'effects'` keeps: what pi committed before an effect starts is stored
-before it does, so a request or a tool call never runs ahead of its own
-history; and what anyone else can see (a publish, a Restate call, a send, the
+What `'effects'` keeps: what pi committed before a tool call, or a model call
+that returns a promise, starts is stored before it does, so it never runs
+ahead of its own history (a streamed model request starts while that write is
+in flight, which is harmless: a retry only repeats the request); and what
+anyone else can see (a publish, a Restate call, a send, the
 end of the handler, a `ctx.db` call of your own) comes after a write of all
 of it, never before. A failed pi commit still undoes only itself, and a
 `ctx.db` call from inside one is refused, as with `'each'`.
