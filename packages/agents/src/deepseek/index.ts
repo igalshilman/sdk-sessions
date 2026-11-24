@@ -17,9 +17,13 @@
 //
 // The handler is not replayed: a retried attempt (a crash, a lost connection)
 // boots the harness again and resumes the session from the stored log.
-// - The harness's session checkpoint policy stores the log before each model
-//   request and before each tool body: a tool runs only once its call is
-//   stored.
+// - The log is stored before each model request and before each tool body:
+//   a tool runs only once its call is stored. The harness's session
+//   checkpoint policy flushes there, but its flushes are soft (persistence.ts)
+//   once the adapter's own barriers are in place (barriers.ts): they store
+//   what the harness queued right before each of those effects, before each
+//   Restate effect and publish, and when the run ends. So back-to-back flushes
+//   with no effect between them are one commit.
 // - A crash leaves the turn open. Resuming closes it, and gives each tool
 //   call that was stored without a result an error result saying its outcome
 //   is unknown; the handler then asks the agent to continue. The model sees
@@ -85,6 +89,9 @@ import { type Answer, withChecked } from '../output.ts';
 import { type Definition, sessionObject } from '../object.ts';
 import { type Approval, isTool, jsonSchemaOf, type Tool as AnyTool, waitFor } from '../tools.ts';
 import type { z } from 'zod';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { holding } from '../calls.ts';
+import { guardModelRequests } from './barriers.ts';
 import { SqlSessionPersistence } from './persistence.ts';
 
 export { SqlSessionPersistence };
@@ -309,7 +316,8 @@ const decided = (value: unknown): ApprovalOutcome => (approves(value) ? 'allowed
  * person is asked once. The wait is an approval (`approval`): a stopped
  * turn does not report its call as done because it was approved. An error
  * of the wait fails the attempt (`fail`), and its ask never ends: the
- * harness does not go on without a decision.
+ * harness does not go on without a decision. The wait stores nothing queued
+ * (the call's reply), unlike other Restate effects (see `UNSTORED`).
  */
 function approving(agentCtx: Context, ctx: restate.SessionContext, approval: Approval, fail: (error: unknown) => void) {
   const needs = typeof approval === 'function' ? approval : ({ name }: { name: string }) => approval.includes(name);
@@ -329,8 +337,13 @@ function approving(agentCtx: Context, ctx: restate.SessionContext, approval: App
     try {
       // The calls whose results are stored are forgotten first: an earlier
       // attempt's call with the same arguments, approved and done, is not this one.
-      await toolCallStarted(ctx);
-      return decided(await waitFor(ctx, callId, APPROVAL, call, { approval: true, rejoin: true }));
+      // Forgetting one is a write, which stores nothing queued either (`UNSTORED`).
+      return decided(
+        await UNSTORED.run(true, async () => {
+          await toolCallStarted(ctx);
+          return waitFor(ctx, callId, APPROVAL, call, { approval: true, rejoin: true });
+        }),
+      );
     } catch (error) {
       fromTool(ctx, error);
       fail(error);
@@ -338,6 +351,14 @@ function approving(agentCtx: Context, ctx: restate.SessionContext, approval: App
     }
   });
 }
+
+/**
+ * Where the writes before a Restate effect (`holding`) are not made: a publish
+ * right after a write (`flushed`), which has nothing more to show, and an
+ * approval's wait, whose tool call is not stored until the person decides (see
+ * {@link approving}).
+ */
+const UNSTORED = new AsyncLocalStorage<true>();
 
 /** An agent's options: `chat` and `prompt` take them. */
 export interface Options<O extends z.ZodObject | undefined = z.ZodObject | undefined> {
@@ -514,6 +535,8 @@ const runOf =
     stop?.addEventListener('abort', onStop, { once: true });
     let agent: Agent | undefined;
     let unlisten: (() => void) | undefined;
+    // Whether the tools are registered behind a barrier (`tracked`), once `setup` has.
+    let toolsGuarded = false;
     // The turn asked again (its output's check, say): the harness is asked that, and answers it.
     const asked = turn.latestAsk();
     const again = asked !== turn.prompt;
@@ -522,10 +545,12 @@ const runOf =
     let from: number | undefined;
     try {
       const sessionId = SessionId(ctx.key);
+      const stored = () => persistence.writeNow(sessionId);
       const options = {
         agentOptions: route,
         setup: (agentCtx: Context) => {
-          for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail));
+          for (const t of tools) agentCtx.tools.register(tracked(isTool(t) ? native(t, ctx) : t, ctx, fail, stored));
+          toolsGuarded = true;
           if (approval !== undefined) approving(agentCtx, ctx, approval, fail);
         },
       };
@@ -534,6 +559,11 @@ const runOf =
         ? await harness.agents.resume({ resumeSessionId: sessionId, ...options })
         : await harness.agents.create({ sessionId, ...options });
       agent = started.agent;
+      // The harness's flushes are soft only with every barrier in place: the tools' (`tracked`), the model
+      // requests' (the innermost `llm/stream` listener), and what is stored before each Restate effect and
+      // publish (`holding`). Any one missing, they stay writes.
+      holding(ctx, async () => (UNSTORED.getStore() ? undefined : stored()), 'deepseek');
+      persistence.barriered = guardModelRequests(harness, persistence) && toolsGuarded;
       const found = agent.session.snapshotEvents().length;
       from = agent.session.snapshotEvents().find((e) => e.type === 'user/message' && e.data.id === id)?.seq;
       // A flush that copied steps (a reply with tool calls, tools' results) is published once it is stored,
@@ -563,7 +593,7 @@ const runOf =
         if (!copiedSteps) return;
         copiedSteps = false;
         // Failing, it fails the attempt, as a tool's error does: never the flush, which is done.
-        await turn.stepsCommitted().catch(fail);
+        await UNSTORED.run(true, () => turn.stepsCommitted()).catch(fail);
       };
       // The messages steered to the turn, handed to the harness's step inbox as a publish lists them: only
       // once a reply with tool calls or a result is stored, so that a step after them places them, in this turn.
@@ -593,14 +623,15 @@ const runOf =
         const ask = again ? message(id, textOf(asked.item)) : promptOf(turn, before);
         agent.followup(end.asked ? message(`continue:${events.length}`, CONTINUE) : ask);
         await Promise.race([agent.whenIdle(), failed]);
-        await harness.sessions.flush(agent.session);
+        await stored();
       }
     } catch (e) {
       // A cancelled invocation cancels the agent's turn, which the log keeps.
-      if (e instanceof restate.CancelledError && agent) await cancelTurn(harness, agent);
+      if (e instanceof restate.CancelledError && agent) await cancelTurn(agent, persistence, SessionId(ctx.key));
       else persistence.abandon();
       throw e;
     } finally {
+      holding(ctx, undefined, 'deepseek');
       unlisten?.();
       stop?.removeEventListener('abort', onStop);
       await harness.fiber.dispose();
@@ -608,25 +639,29 @@ const runOf =
   };
 
 /** Cancel `agent`'s turn, and store it cancelled. */
-async function cancelTurn(harness: Context, agent: Agent) {
+async function cancelTurn(agent: Agent, persistence: SqlSessionPersistence, sessionId: SessionId) {
   agent.cancel({ kind: 'user' });
   await agent.whenIdle();
-  await harness.sessions.flush(agent.session);
+  await persistence.writeNow(sessionId);
 }
 
 /**
  * `definition`, the calls whose results are stored forgotten as each of its
  * calls starts (its call and its result are published once a flush stores
- * them, `runOf`); its error failing the attempt.
+ * them, `runOf`); its error failing the attempt. What the harness has queued
+ * is stored (`barrier`) before its body runs: the harness's flush before it is soft.
  */
 const tracked = (
   definition: ToolDefinition,
   ctx: restate.SessionContext,
   fail: (error: unknown) => void,
+  barrier: () => Promise<void>,
 ): ToolDefinition => ({
   ...definition,
   execute: async (args, exec) => {
     try {
+      // The last thing before the body, nested calls too: what is queued is stored, or the body does not run.
+      await barrier();
       await toolCallStarted(ctx);
       return await definition.execute(args, exec);
     } catch (error) {

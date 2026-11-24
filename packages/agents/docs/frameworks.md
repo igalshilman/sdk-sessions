@@ -95,14 +95,14 @@ background agent takes none.
 
 ### At a glance, the target
 
-|                     | Claude                         | LangGraph (built-in agent)    | DeepSeek Harness                          | pi                                   | OpenCode                                                              |
-| ------------------- | ------------------------------ | ----------------------------- | ----------------------------------------- | ------------------------------------ | --------------------------------------------------------------------- |
-| The model's history | turn projection (`history()`)  | turn projection (`history()`) | its own (the harness's event log)         | its own (pi-durable's entries)       | its own (its database)                                                |
-| An item             | a `BetaMessageParam`           | a LangChain `BaseMessage`     | a dsh-llm `Message`, with its harness seq | a pi-ai `Message`, with its entry id | an OpenCode message                                                   |
-| Steps stored from   | the run loop, before tools run | the graph's nodes             | each flush, in its transaction            | each pi commit, in its transaction   | each OpenCode commit, copied after it, in a transaction of its own    |
-| Long conversations  | our summaries (`compact`)      | our summaries (`compact`)     | `dsh-compaction-basic`, mounted           | pi's own compaction                  | OpenCode's own compaction                                             |
-| A turn carries      | nothing                        | nothing                       | nothing (in its log)                      | nothing (in pi's documents)          | nothing (in its database)                                             |
-| Order in the plan   | step 4                         | step 5                        | step 6                                    | step 7, after a spike                | step 8, after a spike: dropped, then back ([its return](opencode.md)) |
+|                     | Claude                         | LangGraph (built-in agent)    | DeepSeek Harness                                | pi                                   | OpenCode                                                              |
+| ------------------- | ------------------------------ | ----------------------------- | ----------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------- |
+| The model's history | turn projection (`history()`)  | turn projection (`history()`) | its own (the harness's event log)               | its own (pi-durable's entries)       | its own (its database)                                                |
+| An item             | a `BetaMessageParam`           | a LangChain `BaseMessage`     | a dsh-llm `Message`, with its harness seq       | a pi-ai `Message`, with its entry id | an OpenCode message                                                   |
+| Steps stored from   | the run loop, before tools run | the graph's nodes             | each write before an effect, in its transaction | each pi commit, in its transaction   | each OpenCode commit, copied after it, in a transaction of its own    |
+| Long conversations  | our summaries (`compact`)      | our summaries (`compact`)     | `dsh-compaction-basic`, mounted                 | pi's own compaction                  | OpenCode's own compaction                                             |
+| A turn carries      | nothing                        | nothing                       | nothing (in its log)                            | nothing (in pi's documents)          | nothing (in its database)                                             |
+| Order in the plan   | step 4                         | step 5                        | step 6                                          | step 7, after a spike                | step 8, after a spike: dropped, then back ([its return](opencode.md)) |
 
 ### What all five do today
 
@@ -386,11 +386,17 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 1.8.0, without the API's me
   `restate_deepseek_sessions(id PK, header, inherited)`, one session, whose id
   is `ctx.key` (`index.ts:306`); `restate_deepseek_events(session, seq, event)`,
   one harness `SessionEvent` per row, its seq contiguous from 0.
-- **Writes**: events go to an in-memory list; a flush stores them in one
-  transaction (`persistence.ts:243-276`). Flushes come from the harness's
-  checkpoint policy (before each model request, before each tool's body, at
-  each pre-step) and from the integration (after the harness goes idle,
-  `index.ts:347-348`; on cancel, `:363-367`). After `abandon()` a failed
+- **Writes**: events go to an in-memory list; a write stores them in one
+  transaction (`persistence.ts`). The harness's checkpoint policy flushes
+  (before each model request, before each tool's body, at each pre-step), but
+  those flushes are soft once the adapter's barriers are in place
+  (`barriers.ts`, `tracked` of `index.ts`): the adapter writes right before
+  each model request (the innermost `llm/stream` listener) and each tool body
+  (the wrapper of the registered tool), before each Restate effect and
+  publish (`holding`, `calls.ts`), after the harness goes idle, on cancel and
+  at the end of the run, so back-to-back flushes with no effect between them
+  are one commit (10 on a turn of 4 requests and 3 tool calls). If
+  a barrier is missing, every flush is a write. After `abandon()` a failed
   attempt stores nothing more.
 - **Once**: the harness's user message for a prompt has the id
   `prompt:<id>` (`index.ts:149`, `:346`). Every attempt boots a fresh harness

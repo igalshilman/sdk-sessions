@@ -107,15 +107,29 @@ cancelled: its approval is not its outcome.
 
 The persistence ([`persistence.ts`](persistence.ts),
 `SqlSessionPersistence`) keeps each session's header, and its event log, one
-row per event; a flush, the harness's durability barrier, stores what was
-appended before it in one SQL transaction. The handler is not replayed: a
+row per event; a write stores what was appended before it in one SQL
+transaction. The harness's flushes, its durability barrier, are soft here:
+the adapter does the writing, right before each effect (below). The handler is not replayed: a
 retried attempt boots the harness again and resumes the session from the
 stored log. The harness does not resume an interrupted turn: resuming closes
 it, and leaves the model to decide what to do about it. So:
 
 - **A tool runs only once its call is stored.** The harness's checkpoint
   policy flushes the session before each model request, each tool body and
-  each step.
+  each step, but those flushes store nothing once the adapter's own barriers
+  are in place ([`barriers.ts`](barriers.ts)). The adapter stores everything
+  queued right before each model request (the innermost listener of the
+  harness's `llm/stream`, checked to be the last on each request) and each
+  tool body (the wrapper of each tool it registers), before each Restate
+  effect and publish, and when the run ends, and it does not start the
+  request or the body if the write fails. So a flush at a step and the one
+  before its request are one commit: a turn of 4 model requests and 3 tool
+  calls commits the ask, one write before each effect, the final flush and
+  the answer. If a barrier cannot be installed, every flush stays a write.
+  A crash loses what was queued since the last write, which nothing has
+  acted on; the tool's result of a body that ran is then unknown to the retry,
+  as below. The wait for an approval is the exception: it opens with the
+  tool call not stored, as before.
 - **A tool call stored without a result has an unknown outcome.** Resuming
   gives each such call an error result that says so, and tells the model to
   retry only an idempotent operation; the handler then asks the agent to
@@ -145,8 +159,8 @@ transaction: what `messages` shows
 reply with tool calls, or tools' results, is published once it is stored,
 in a `chat` turn (a `prompt()` in a handler of your own publishes nothing),
 and nothing else is: a tool call's start publishes nothing. The tools of a
-reply run one after another, and each result is flushed with the next call,
-before its tool runs (the checkpoint policy's barrier): one commit, and one
+reply run one after another, and each result is written with the next call,
+before its tool runs (the adapter's barrier): one commit, and one
 publish, per tool call. The harness's input
 stays within the model's context window: as it nears the window (or
 overflows it), the harness condenses the oldest history into a summary, one
@@ -177,6 +191,11 @@ which makes a fresh tool call id for every call, as a model does
   through a crash, at any state request, and cancelled); and
   `messages`. Without the checkpoint policy four of its tests fail, and with
   a transfer tool that ignores `retryOf` three do.
+- [`test/deepseek-commits.test.ts`](../../test/deepseek-commits.test.ts) and
+  [`test/deepseek-barriers.test.ts`](../../test/deepseek-barriers.test.ts):
+  the commits of a turn, what is stored before each effect, a follower's
+  publishes, a turn that condenses, a crash before a result is written, and
+  the barriers (and a turn without them).
 - [`test/deepseek.ts`](../../test/deepseek.ts): the
   bank agent, whose `transfer` uses `retryOf`, or its own call id, as the
   transfer id, through crashes in [the crash test](../../../e2e/crash.ts)
