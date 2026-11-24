@@ -5,7 +5,7 @@
 // budget.
 import * as restate from '@restatedev/sessions';
 import { cancelCalls, cancelled, definitionOf, Link, ScopeKey } from '@restatedev/sessions/internal';
-import { flushHeld, settleCalls } from './calls.ts';
+import { flushCalls, flushHeld, settleCalls } from './calls.ts';
 import { companionHere, type Published, type Steer } from './companion.ts';
 
 /**
@@ -487,6 +487,9 @@ export async function answering<T>(ctx: restate.SessionContext, stored: Stored, 
     } finally {
       if (outer) ANSWERING.set(ctx, outer);
       else ANSWERING.delete(ctx);
+      // What rides the next commit is written if none is to come: after a turn that answered, the commit that
+      // stored its answer wrote it, and this does nothing. A failed attempt's own error is not this write's.
+      await (failed ? flushCalls(ctx).catch(() => {}) : flushCalls(ctx));
     }
   }
 }

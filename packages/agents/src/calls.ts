@@ -19,6 +19,18 @@
 // terminal error is its result too. Once stored, the model has its result,
 // and an identical call it makes later is a call of its own.
 //
+// Only the record of a new call commits of its own, before the call is made.
+// That a call answered rides a commit that is under way or starts at once
+// ({@link rideCommit}): the one that stores the call's result, so that the
+// transcript never has a result of a call that is not recorded as answered;
+// if none does (a slow tool of the round is still running, another call
+// waits), it is written on its own at the end of that macrotask, so it is
+// never left unrecorded for long. That its record is forgotten rides the next
+// commit, whenever it comes. A crash in the few moments before an answer is
+// written reads the call as one that did not answer, as a crash just before
+// a commit of its own would have: made again, under the same key, and cut off
+// for a stopped turn that another invocation closes.
+//
 // A framework's own wait ({@link waitFor} of tools.ts) is its tool call's
 // alone: the framework stored its tool call before it waits, so a retried
 // attempt waits again under the same id, and a new call with the same input
@@ -26,7 +38,7 @@
 // a tool call waited for is not the call: a stopped turn does not report the
 // call as done because its approval returned ({@link outcomes}).
 import type * as restate from '@restatedev/sessions';
-import { Schema, ScopeKey } from '@restatedev/sessions/internal';
+import { flushRiders, rideCommit, Schema, ScopeKey } from '@restatedev/sessions/internal';
 import { randomUUID } from 'node:crypto';
 
 /** A tool's call: the tool, its input as JSON, the ids it was made with (the first is its own), and the attempt that last made it. */
@@ -103,17 +115,40 @@ export async function flushHeld(ctx: restate.SessionContext) {
   for (const flush of HELD.get(ctx)?.values() ?? []) await flush();
 }
 
+const UPSERT = 'INSERT OR REPLACE INTO restate_agent_calls (row, invocation, calls) VALUES (0, ?, ?)';
+
+/** The slot of the calls' write that rides the next commit ({@link ride}). */
+const RIDER = 'restate-agents.calls';
+
 /**
  * Store `calls`, committed before the call they record is made. The rows the
  * conversation holds back are written first: the call outlives the attempt,
- * and what led to it must too.
+ * and what led to it must too. It is the whole row: what rides the next
+ * commit is written, and no longer pending.
  */
 async function store(ctx: restate.SessionContext, { invocation, calls }: Calls) {
   await flushHeld(ctx);
-  await ctx.db.execute('INSERT OR REPLACE INTO restate_agent_calls (row, invocation, calls) VALUES (0, ?, ?)', [
-    invocation,
-    JSON.stringify(calls),
-  ]);
+  rideCommit(ctx.db, RIDER, undefined);
+  await ctx.db.execute(UPSERT, [invocation, JSON.stringify(calls)]);
+}
+
+/**
+ * Store `state` with the next commit of the database, rather than commit it
+ * (see the top of this file), as it is then: a later change replaces it, and
+ * the latest state is written. An `urgent` one (an answer) is written on its
+ * own unless a commit is under way to write it; one pending that is urgent
+ * stays so. A database that cannot ride (a view's) commits it at once.
+ */
+async function ride(ctx: restate.SessionContext, state: Calls, urgent = false) {
+  const written = rideCommit(
+    ctx.db,
+    RIDER,
+    (tx) => tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]),
+    {
+      urgent,
+    },
+  );
+  if (!written) await store(ctx, state);
 }
 
 /** The calls of `invocation`, as stored: none if the row is another invocation's. */
@@ -136,7 +171,7 @@ const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls> }>('the calls 
  * cancelled, say) is not kept: the next asks again, so that a stopped turn's
  * close reads the calls as stored, rather than fail on the load it found.
  */
-function attemptOf(ctx: restate.SessionContext): { id: string; calls: Promise<Calls> } {
+function attemptOf(ctx: restate.SessionContext) {
   const attempt = ATTEMPT.of(ctx, () => ({ id: randomUUID() }));
   if (attempt.calls === undefined) {
     const calls = load(ctx, ctx.request.id);
@@ -145,7 +180,7 @@ function attemptOf(ctx: restate.SessionContext): { id: string; calls: Promise<Ca
       if (attempt.calls === calls) attempt.calls = undefined;
     });
   }
-  return attempt as { id: string; calls: Promise<Calls> };
+  return attempt as typeof attempt & { calls: Promise<Calls> };
 }
 
 /** `value` as JSON with its objects' keys sorted: the same input, however its keys came, is the same call. */
@@ -220,11 +255,21 @@ export async function callOf(
     /**
      * It answered, with `failed` if a terminal error answered it: kept until
      * the transcript has its result.
+     *
+     * It rides a commit that is under way (the one that stores the call's
+     * result, when the framework's write has started), and is otherwise
+     * written on its own at once ({@link ride}): a call that answered must
+     * not stay unrecorded while something else runs (a slow tool of the same
+     * round, a call that waits for a signal). A crash before it is written
+     * reads the call as one that did not answer, as a crash just before a
+     * commit of its own would have: made again under the same key, and cut off
+     * for a stopped turn that another invocation closes ({@link outcomes} reads
+     * the stored row; the attempt's own turn reads its state).
      */
     async answered(failed?: string) {
       made.done = true;
       if (failed !== undefined) made.failed = failed;
-      await store(ctx, state);
+      await ride(ctx, state, true);
     },
   };
 }
@@ -243,7 +288,7 @@ export async function settleCalls(ctx: restate.SessionContext, stored: (id: stri
   const kept = state.calls.filter((c) => !c.done || !stored(c.ids.at(-1)!, c.failed));
   if (kept.length === state.calls.length) return;
   state.calls = kept;
-  await store(ctx, state);
+  await ride(ctx, state);
 }
 
 /**
@@ -277,3 +322,9 @@ export async function outcomes(
   }
   return found;
 }
+
+/**
+ * Write what rides the next commit ({@link ride}) now, if it is pending: at
+ * the end of a turn, when no commit follows that would.
+ */
+export const flushCalls = (ctx: restate.SessionContext) => flushRiders(ctx.db);

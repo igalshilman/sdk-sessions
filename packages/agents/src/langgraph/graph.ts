@@ -370,7 +370,10 @@ async function runGraph(
     signal: stopSignalOf(ctx),
     callbacks: [kept],
   };
-  if (asked && snapshot.next.length === 0) {
+  // `next` leaves out the tasks whose writes are stored, so a step whose writes were stored before its checkpoint
+  // (a crash between them) has no `next` but still has tasks: that run goes on, from those writes, without running
+  // the tasks again. A finished run has no tasks.
+  if (asked && snapshot.tasks.length === 0) {
     // The run had finished, but its answer was not stored: that is the answer, rather than run again.
     await copied(turn, known, messages, promptId);
     await saver.prune([THREAD_ID]);

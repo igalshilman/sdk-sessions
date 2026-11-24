@@ -4,13 +4,21 @@
 //
 // The harness writes a session through a handle: `append` accepts a batch,
 // and `flush` is the durability barrier. Here an append is kept in memory and
-// a flush stores everything appended before it in one SQL transaction; a new
-// session's header is stored with its first flush, so a session that crashed
+// a write stores everything appended before it in one SQL transaction; a new
+// session's header is stored with its first write, so a session that crashed
 // before then never existed. The session checkpoint policy
 // (dsh-session-checkpoint-policy) flushes before each model request, before
-// each tool body, and before each step; so the events a tool's call follows
-// from are stored before the tool runs, and a crash loses only events that
-// nothing has acted on.
+// each tool body, and before each step.
+//
+// A write is a commit to Restate, so the harness's flushes are soft once the
+// adapter has put its own barriers in place (`barriered`, set by index.ts
+// only when it has): a soft flush stores nothing and resolves, leaving the
+// events queued. The adapter's barriers (`writeNow`) store everything queued
+// right before each model request and each tool body, before each Restate
+// effect and publish, and at the end of the run. So the events a tool's call
+// follows from are stored before the tool runs, and a crash loses only
+// events that nothing has acted on. Without the barriers every flush is a
+// write.
 import type { Context } from '@deepseek-ai/cordis';
 import { SessionLogOffset, type SessionEvent, type SessionHeader, type SessionId } from '@deepseek-ai/dsh-session';
 import {
@@ -59,6 +67,12 @@ export class SqlSessionPersistence extends SessionPersistence {
   handles = new Set<SqlSessionHandle>();
   abandoned = false;
   /**
+   * Whether the harness's flushes are soft: set by the code that installs the
+   * adapter's barriers (index.ts), once every one of them is in place. Unset,
+   * each flush stores what is queued.
+   */
+  barriered = false;
+  /**
    * What each flush's events are copied into beside the log, in the flush's
    * transaction: the conversation of turns (index.ts), so that the copy and
    * the log commit together.
@@ -74,7 +88,7 @@ export class SqlSessionPersistence extends SessionPersistence {
     // The live session's events go to its write handle; its flushes and its
     // disposal reach the handle too.
     ctx.on('session/event', (session, event) => this.writers.get(session.id)?.enqueue(event));
-    ctx.on('session/flush', (session) => this.writers.get(session.id)?.flush());
+    ctx.on('session/flush', (session) => this.writers.get(session.id)?.harnessFlush());
     ctx.on('session/disposed', (session) => void this.writers.get(session.id)?.close());
     ctx.effect(
       () => async () => {
@@ -136,6 +150,11 @@ export class SqlSessionPersistence extends SessionPersistence {
     this.handles.add(handle);
     if (access === 'write') this.writers.set(handle.id, handle);
     return handle;
+  }
+
+  /** Store everything queued for session `id` now, or throw: the adapter's barrier before an effect (see the top). */
+  async writeNow(id: SessionId): Promise<void> {
+    await this.writers.get(id)?.writeNow();
   }
 
   async flush(): Promise<void> {
@@ -238,6 +257,28 @@ class SqlSessionHandle implements SessionHandle {
   enqueue(event: SessionEvent) {
     if (this.#closed || event.seq < this.#end) return;
     this.#pending.push(...materializeAppendBatch([event]));
+  }
+
+  /**
+   * The harness's flush (`session/flush`): a write, unless the adapter's
+   * barriers cover the effects (`barriered`), when the events stay queued for
+   * the next barrier.
+   */
+  harnessFlush(): Promise<void> {
+    if (!this.#store.barriered) return this.flush();
+    this.#check('flush');
+    if (this.access !== 'write') throw new SessionReadOnlyError(this.id, 'flush');
+    return Promise.resolve();
+  }
+
+  /** Store every event appended before the call, or throw if one is not stored. */
+  async writeNow(): Promise<void> {
+    const end = this.#end;
+    await this.flush();
+    // Events appended while it stored are for the next write; none before may be left.
+    if (this.#stored < end || this.#store.created.has(this.id)) {
+      throw new Error(`sql session persistence: the events of session ${this.id} are not stored`);
+    }
   }
 
   /** Store every event appended so far, in one transaction. */

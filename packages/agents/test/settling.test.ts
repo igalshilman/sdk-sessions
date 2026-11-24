@@ -23,8 +23,7 @@ vi.mock('../src/calls.ts', async (importOriginal) => {
     ...actual,
     settleCalls: async (ctx: restate.SessionContext, stored: (id: string, failed?: string) => boolean) => {
       await actual.settleCalls(ctx, stored);
-      const row = await ctx.db.get<{ calls: string }>('SELECT calls FROM restate_agent_calls');
-      events.push(`settle(${row ? (JSON.parse(row.calls) as unknown[]).length : 0})`);
+      events.push('settle');
     },
   };
 });
@@ -80,23 +79,14 @@ const chat = chatHandler(prompt);
  * A turn of two rounds, as before the chat turn took over publishing: per
  * round, the reply with its call commits, and settles (`commitSettles`, then
  * `publish`, in a followed turn); the tool call starts, and settles; the call
- * record and the result commit, and the result's commit settles (and
- * publishes). Then the answer commits, and the turn's end settles.
+ * record commits before the call, and the result's commit (which also has
+ * that the call answered) settles (and publishes). What a settle forgets
+ * rides the next commit, so the answer's commit writes the last. Then the
+ * answer commits, and the turn's end settles.
  */
 const turnOf = (commitSettles: string[], publish: string[]) => {
-  const round = [
-    'commit',
-    ...commitSettles,
-    ...publish,
-    'settle(0)',
-    'commit',
-    'commit',
-    'commit',
-    'commit',
-    ...commitSettles,
-    ...publish,
-  ];
-  return [...round, ...round, 'commit', 'settle(0)'];
+  const round = ['commit', ...commitSettles, ...publish, 'settle', 'commit', 'commit', ...commitSettles, ...publish];
+  return [...round, ...round, 'commit', 'settle'];
 };
 
 /**
@@ -106,9 +96,9 @@ const turnOf = (commitSettles: string[], publish: string[]) => {
  * before (it published nothing, and so settled at a tool call's start only).
  */
 const EXPECTED = {
-  chat: ['publish', 'commit', ...turnOf(['settle(0)'], ['publish'])],
-  background: ['commit', ...turnOf(['settle(0)'], [])],
-  outside: ['commit', ...turnOf(['settle(0)'], [])],
+  chat: ['publish', 'commit', ...turnOf(['settle'], ['publish'])],
+  background: ['commit', ...turnOf(['settle'], [])],
+  outside: ['commit', ...turnOf(['settle'], [])],
 };
 
 afterAll(() => {

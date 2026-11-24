@@ -50,6 +50,15 @@ What the core gives an integration, once ported:
   publishes there; a turn outside one (a handler of your own that calls
   `prompt()`) makes nothing, and no integration publishes by hand.
   `toolCallStarted` settles the call records before a tool makes its own.
+  A call's record commits of its own only before the call is made; that
+  it answered, and that it is forgotten, ride a commit of `ctx.db`
+  (`rideCommit`: the one that stores the call's result, whichever framework
+  makes it), and `answering` writes what is still pending as the turn ends.
+  An answer rides only a commit that is under way (an urgent rider): if none
+  is, it is written on its own at the end of that macrotask.
+  OpenCode's transcript is in a database of its own, which a commit of
+  `ctx.db` does not reach: its answer is written before the tool hands its
+  result over (`native`, `src/opencode/index.ts`).
 - **Steering**: `takeSteers(ctx, conversation)` at each step, or, for a
   framework that keeps its own history, `inboxOf(ctx).listen` and
   `tookSteers` as it copies the messages its own inbox placed
@@ -86,14 +95,14 @@ background agent takes none.
 
 ### At a glance, the target
 
-|                     | Claude                         | LangGraph (built-in agent)    | DeepSeek Harness                          | pi                                   | OpenCode                                                              |
-| ------------------- | ------------------------------ | ----------------------------- | ----------------------------------------- | ------------------------------------ | --------------------------------------------------------------------- |
-| The model's history | turn projection (`history()`)  | turn projection (`history()`) | its own (the harness's event log)         | its own (pi-durable's entries)       | its own (its database)                                                |
-| An item             | a `BetaMessageParam`           | a LangChain `BaseMessage`     | a dsh-llm `Message`, with its harness seq | a pi-ai `Message`, with its entry id | an OpenCode message                                                   |
-| Steps stored from   | the run loop, before tools run | the graph's nodes             | each flush, in its transaction            | each pi commit, in its transaction   | each OpenCode commit, copied after it, in a transaction of its own    |
-| Long conversations  | our summaries (`compact`)      | our summaries (`compact`)     | `dsh-compaction-basic`, mounted           | pi's own compaction                  | OpenCode's own compaction                                             |
-| A turn carries      | nothing                        | nothing                       | nothing (in its log)                      | nothing (in pi's documents)          | nothing (in its database)                                             |
-| Order in the plan   | step 4                         | step 5                        | step 6                                    | step 7, after a spike                | step 8, after a spike: dropped, then back ([its return](opencode.md)) |
+|                     | Claude                         | LangGraph (built-in agent)    | DeepSeek Harness                                | pi                                   | OpenCode                                                              |
+| ------------------- | ------------------------------ | ----------------------------- | ----------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------- |
+| The model's history | turn projection (`history()`)  | turn projection (`history()`) | its own (the harness's event log)               | its own (pi-durable's entries)       | its own (its database)                                                |
+| An item             | a `BetaMessageParam`           | a LangChain `BaseMessage`     | a dsh-llm `Message`, with its harness seq       | a pi-ai `Message`, with its entry id | an OpenCode message                                                   |
+| Steps stored from   | the run loop, before tools run | the graph's nodes             | each write before an effect, in its transaction | each pi commit, in its transaction   | each OpenCode commit, copied after it, in a transaction of its own    |
+| Long conversations  | our summaries (`compact`)      | our summaries (`compact`)     | `dsh-compaction-basic`, mounted                 | pi's own compaction                  | OpenCode's own compaction                                             |
+| A turn carries      | nothing                        | nothing                       | nothing (in its log)                            | nothing (in pi's documents)          | nothing (in its database)                                             |
+| Order in the plan   | step 4                         | step 5                        | step 6                                          | step 7, after a spike                | step 8, after a spike: dropped, then back ([its return](opencode.md)) |
 
 ### What all five do today
 
@@ -383,11 +392,17 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 1.8.0, without the API's me
   `restate_deepseek_sessions(id PK, header, inherited)`, one session, whose id
   is `ctx.key` (`index.ts:306`); `restate_deepseek_events(session, seq, event)`,
   one harness `SessionEvent` per row, its seq contiguous from 0.
-- **Writes**: events go to an in-memory list; a flush stores them in one
-  transaction (`persistence.ts:243-276`). Flushes come from the harness's
-  checkpoint policy (before each model request, before each tool's body, at
-  each pre-step) and from the integration (after the harness goes idle,
-  `index.ts:347-348`; on cancel, `:363-367`). After `abandon()` a failed
+- **Writes**: events go to an in-memory list; a write stores them in one
+  transaction (`persistence.ts`). The harness's checkpoint policy flushes
+  (before each model request, before each tool's body, at each pre-step), but
+  those flushes are soft once the adapter's barriers are in place
+  (`barriers.ts`, `tracked` of `index.ts`): the adapter writes right before
+  each model request (the innermost `llm/stream` listener) and each tool body
+  (the wrapper of the registered tool), before each Restate effect and
+  publish (`holding`, `calls.ts`), after the harness goes idle, on cancel and
+  at the end of the run, so back-to-back flushes with no effect between them
+  are one commit (10 on a turn of 4 requests and 3 tool calls). If
+  a barrier is missing, every flush is a write. After `abandon()` a failed
   attempt stores nothing more.
 - **Once**: the harness's user message for a prompt has the id
   `prompt:<id>` (`index.ts:149`, `:346`). Every attempt boots a fresh harness
