@@ -517,3 +517,55 @@ describe('two calls at once', () => {
     expect(await turn).toBe('Done');
   });
 });
+
+describe('two calls and a slow tool in one round', () => {
+  it('record the second answer that comes while the first answer is being written, before the slow tool ends', async () => {
+    const hang = tool({
+      name: 'hang',
+      description: 'hangs',
+      input: z.object({}),
+      run: () => new Promise<never>(() => {}),
+    });
+    teller.reply = (messages: MessageParam[]) => {
+      const message = tellerReply(messages);
+      message.content = [
+        { type: 'tool_use', id: 'c1', name: 't1', input: {} },
+        { type: 'tool_use', id: 'c2', name: 't2', input: {} },
+        { type: 'tool_use', id: 'c3', name: 'hang', input: {} },
+      ];
+      message.stop_reason = 'tool_use';
+      return message;
+    };
+    const map = new Map<string, Uint8Array>();
+    const gate = Promise.withResolvers<void>();
+    let firstAnswered = false;
+    let released = false;
+    const sql = sqlAttempt({
+      map,
+      key: 'k',
+      id: 'inv1',
+      route: async (c) => {
+        if (c.method === 't2') await gate.promise;
+        else firstAnswered = true;
+        return `result of ${c.method}`;
+      },
+      // The second call answers while the commit of the first's answer syncs.
+      onSync: async () => {
+        if (firstAnswered && !released) {
+          released = true;
+          gate.resolve();
+        }
+      },
+    });
+    const chat = handlerOf(claude.chat({ tools: [...tools().slice(0, 2), hang] }));
+    const turn = sql.end(() => chat(sql.ctx, 'go')).catch((error: unknown) => error);
+    await vi.waitFor(async () =>
+      expect(await recordsOf(map)).toMatchObject([
+        { tool: 'callee/t1', done: true },
+        { tool: 'callee/t2', done: true },
+      ]),
+    );
+    sql.cancel();
+    expect(await turn).toBeInstanceOf(restate.CancelledError);
+  });
+});

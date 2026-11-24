@@ -347,4 +347,41 @@ describe('an urgent rider', () => {
       expect(await rows(db)).toEqual([]);
     });
   });
+
+  // One that comes while the timer's own commit is syncing: its timer fires with that transaction under way, so
+  // the commit's end is what must set it again (agents answer in one slot, each answer replacing the last).
+  it.each([
+    ['of another slot', 'b'],
+    ['of the same slot, replacing the one being written', 'a'],
+  ])(
+    'registered while the commit that writes the one before it syncs, %s, is written after it',
+    async (_name, slot) => {
+      const map = new Map<string, Uint8Array>();
+      let during: (() => void) | undefined;
+      syncs = 0;
+      const sql = sqlAttempt({
+        map,
+        onSync: async () => {
+          syncs++;
+          const run = during;
+          during = undefined;
+          run?.();
+        },
+      });
+      await sql.end(async () => {
+        const { db } = sql;
+        await db.execute('CREATE TABLE t(x)');
+        syncs = 0;
+        during = () => rideCommit(db, slot, insert('second'), { urgent: true });
+        rideCommit(db, 'a', insert('first'), { urgent: true });
+        await vi.waitFor(async () => expect(await rows(db)).toEqual([['first'], ['second']]));
+        // One commit each, and nothing armed after: no more commits by themselves.
+        expect(syncs).toBe(2);
+        await tick();
+        await tick();
+        await tick();
+        expect(syncs).toBe(2);
+      });
+    },
+  );
 });

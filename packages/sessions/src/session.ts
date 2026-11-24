@@ -619,8 +619,12 @@ export class Attempt {
       this.urgentTimer = undefined;
       // A transaction under way writes them, or re-arms as it ends.
       if (this.ended || this.active > 0) return;
-      // Once: a failure leaves them pending, for the next commit or the flush.
-      this.transaction(async () => {}, false).catch(() => {});
+      // A failure leaves them pending, for the next commit or the flush, and is not tried again by a timer. After a
+      // success, one that came while it committed (its own timer found it under way) is set now.
+      this.transaction(async () => {}, false).then(
+        () => this.arm(),
+        () => {},
+      );
     });
   }
 
