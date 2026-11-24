@@ -21,12 +21,12 @@ function banking() {
 }
 
 describe('a graph of your own, through crashes', () => {
-  for (const stride of [1, 2, 3]) {
-    it(`answers a message once after a crash at any of its state requests (every ${stride}th)`, async () => {
-      const chat = langgraph.chat({ graph: banking() });
-      expect(await crashedAnywhere(chat, langgraph.messages(), { stride })).toEqual([]);
-    }, 600_000);
-  }
+  it('answers a message once after a crash at any of its state requests', async () => {
+    const chat = langgraph.chat({ graph: banking() });
+    // Every request by default, as the failing crash points are spread: CRASH_STRIDE for a faster run.
+    const stride = Number(process.env.CRASH_STRIDE ?? 1);
+    expect(await crashedAnywhere(chat, langgraph.messages(), { stride })).toEqual([]);
+  }, 600_000);
 
   it('goes on from the writes of a step whose checkpoint was not stored, without running its tasks again', async () => {
     const ran: string[] = [];
