@@ -385,3 +385,59 @@ describe('an urgent rider', () => {
     },
   );
 });
+
+describe('flushRiders with a transaction under way', () => {
+  it('waits for it, which writes the rider as it commits: written once, and no commit of its own', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      rideCommit(db, 'a', insert('rode'));
+      const release = Promise.withResolvers<void>();
+      const opened = Promise.withResolvers<void>();
+      const held = db.transaction(async (tx) => {
+        await tx.execute("INSERT INTO t VALUES ('own')");
+        opened.resolve();
+        await release.promise;
+      });
+      await opened.promise;
+      syncs = 0;
+      let flushed = false;
+      const flushing = flushRiders(db).then(() => (flushed = true));
+      await tick();
+      await tick();
+      expect(flushed).toBe(false);
+      release.resolve();
+      await held;
+      await flushing;
+      expect(syncs).toBe(1);
+      expect(await rows(db)).toEqual([['own'], ['rode']]);
+    });
+  });
+
+  it('writes the rider itself when that transaction rolls back', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      rideCommit(db, 'a', insert('rode'));
+      const release = Promise.withResolvers<void>();
+      const opened = Promise.withResolvers<void>();
+      const held = db.transaction(async (tx) => {
+        await tx.execute("INSERT INTO t VALUES ('lost')");
+        opened.resolve();
+        await release.promise;
+        throw new Error('rolled back');
+      });
+      held.catch(() => {});
+      await opened.promise;
+      syncs = 0;
+      const flushing = flushRiders(db);
+      release.resolve();
+      await expect(held).rejects.toThrow('rolled back');
+      await flushing;
+      expect(syncs).toBe(1);
+      expect(await rows(db)).toEqual([['rode']]);
+    });
+  });
+});
