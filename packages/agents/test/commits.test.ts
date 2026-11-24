@@ -417,16 +417,19 @@ describe("a turn's Restate calls", () => {
     teller.reply = tellerReply;
   });
 
-  // Each Restate tool call keeps a record in the key's database (calls.ts). Its first write, before the call is
-  // made, is a commit of its own; that the call answered and that its record is forgotten ride the commits that
+  // Each Restate tool call keeps a record in the key's database (calls.ts). Its first write is committed before the
+  // call is made, by a transaction under way that carries it or else one of its own; that the call answered and that its record is forgotten ride the commits that
   // happen anyway, the one that stores the call's result and the one that stores the answer.
   it.each(agentsOf(restateTools))(
-    'cost one commit each, before the call, over a turn of plain tools: %s',
+    'cost one commit each, before the call, over a turn of plain tools (fewer where a transaction under way carries it): %s',
     async (name, chat) => {
       // The reference turn: 4 requests, 3 tool calls.
       const plain = (await costs(agentsOf(tools).find(([n]) => n === name)![1](), 4, 1))[1]!.commits;
       const restated = (await costs(chat(), 4, 1, { route: answered }))[1]!.commits;
-      expect(restated - plain).toBe(3);
+      // A graph of your own commits its checkpoints as its nodes run: a record written while one of those
+      // transactions is under way is written by it, as it commits (calls.ts `store`), so some calls cost no
+      // commit of their own there.
+      expect(restated - plain).toBe(name === 'a LangGraph graph of your own' ? 1 : 3);
     },
   );
 

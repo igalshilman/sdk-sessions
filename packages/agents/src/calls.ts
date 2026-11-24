@@ -19,7 +19,8 @@
 // terminal error is its result too. Once stored, the model has its result,
 // and an identical call it makes later is a call of its own.
 //
-// Only the record of a new call commits of its own, before the call is made.
+// Only the record of a new call commits of its own, before the call is made,
+// and that commit also carries what was pending: an answer is never behind it.
 // That a call answered rides a commit that is under way or starts at once
 // ({@link rideCommit}): the one that stores the call's result, so that the
 // transcript never has a result of a call that is not recorded as answered;
@@ -38,6 +39,7 @@
 // a tool call waited for is not the call: a stopped turn does not report the
 // call as done because its approval returned ({@link outcomes}).
 import type * as restate from '@restatedev/sessions';
+import type { Transaction } from '@restatedev/sessions';
 import { flushRiders, rideCommit, Schema, ScopeKey } from '@restatedev/sessions/internal';
 import { randomUUID } from 'node:crypto';
 
@@ -120,16 +122,24 @@ const UPSERT = 'INSERT OR REPLACE INTO restate_agent_calls (row, invocation, cal
 /** The slot of the calls' write that rides the next commit ({@link ride}). */
 const RIDER = 'restate-agents.calls';
 
+/** The write of `state`, as it is when it runs: the row, whole. */
+const writing = (state: Calls) => (tx: Transaction) =>
+  tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]);
+
 /**
  * Store `calls`, committed before the call they record is made. The rows the
  * conversation holds back are written first: the call outlives the attempt,
- * and what led to it must too. It is the whole row: what rides the next
- * commit is written, and no longer pending.
+ * and what led to it must too. It is the whole row, and it is written by a
+ * commit that also carries what was pending (an answer): the state is
+ * registered as the pending write, and flushed. A transaction under way (a
+ * framework storing an earlier call's result) writes it as it commits, so that
+ * the result is never committed beside an answer that is not recorded; with
+ * none, it is a transaction of its own.
  */
-async function store(ctx: restate.SessionContext, { invocation, calls }: Calls) {
+async function store(ctx: restate.SessionContext, state: Calls) {
   await flushHeld(ctx);
-  rideCommit(ctx.db, RIDER, undefined);
-  await ctx.db.execute(UPSERT, [invocation, JSON.stringify(calls)]);
+  if (rideCommit(ctx.db, RIDER, writing(state))) await flushRiders(ctx.db);
+  else await ctx.db.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]);
 }
 
 /**
@@ -140,14 +150,7 @@ async function store(ctx: restate.SessionContext, { invocation, calls }: Calls) 
  * stays so. A database that cannot ride (a view's) commits it at once.
  */
 async function ride(ctx: restate.SessionContext, state: Calls, urgent = false) {
-  const written = rideCommit(
-    ctx.db,
-    RIDER,
-    (tx) => tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]),
-    {
-      urgent,
-    },
-  );
+  const written = rideCommit(ctx.db, RIDER, writing(state), { urgent });
   if (!written) await store(ctx, state);
 }
 

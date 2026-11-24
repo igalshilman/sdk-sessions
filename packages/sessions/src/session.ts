@@ -440,7 +440,11 @@ export function rideCommit(
   return ATTEMPT.of(db)?.ride(slot, write, urgent) ?? false;
 }
 
-/** Write what is pending ({@link rideCommit}) in a transaction of its own: nothing, if nothing is. */
+/**
+ * Write what is pending ({@link rideCommit}) in a transaction of its own, and resolve once it is stored. A
+ * transaction under way that commits first writes it, and this commits nothing; one that rolls back leaves
+ * it, and this writes it. Nothing, if nothing is pending.
+ */
 export async function flushRiders(db: Database): Promise<void> {
   await ATTEMPT.of(db)?.flushRiders();
 }
@@ -630,7 +634,19 @@ export class Attempt {
 
   /** {@link flushRiders}, as a transaction of `db`: its commit writes them. */
   async flushRiders() {
-    if (this.riders.size > 0) await this.db.transaction(async () => {});
+    if (this.riders.size === 0) return;
+    // Queued behind a transaction under way, which writes them as it commits: then there is nothing to write,
+    // and this one rolls back, which commits nothing.
+    let nothing = false;
+    try {
+      await this.db.transaction(async () => {
+        if (this.riders.size > 0) return;
+        nothing = true;
+        throw new Error('no rider is pending');
+      });
+    } catch (error) {
+      if (!nothing) throw error;
+    }
   }
 
   /**

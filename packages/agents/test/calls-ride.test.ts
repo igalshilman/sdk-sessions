@@ -569,3 +569,50 @@ describe('two calls and a slow tool in one round', () => {
     expect(await turn).toBeInstanceOf(restate.CancelledError);
   });
 });
+
+describe('the record of a new call, while a transaction is under way', () => {
+  it('is written by that transaction with what was pending: no result is committed beside an answer not recorded', async () => {
+    const map = new Map<string, Uint8Array>();
+    const seen: { held: boolean; a?: boolean; b: boolean }[] = [];
+    let syncs = 0;
+    const sql = sqlAttempt({
+      map,
+      key: 'k',
+      id: 'inv1',
+      onSync: async () => {
+        syncs++;
+        const { records, found } = await committed(map, 'held write');
+        const a = records.find((r) => r.tool === 'pay' && (r as { ids?: string[] }).ids?.[0] === 'c1');
+        seen.push({ held: found, a: a ? a.done === true : undefined, b: records.some((r) => r.tool === 'wait') });
+      },
+    });
+    await sql.end(async () => {
+      const { ctx } = sql;
+      await ctx.db.execute('CREATE TABLE marker (x)');
+      const first = await callOf(ctx, 'pay', { n: 1 }, 'c1');
+      await first.answered();
+      // The result of the call, as a framework's write: under way, and held open, when the next call begins.
+      const release = Promise.withResolvers<void>();
+      const opened = Promise.withResolvers<void>();
+      const write = ctx.db.transaction(async (tx) => {
+        await tx.execute("INSERT INTO marker VALUES ('held write')");
+        opened.resolve();
+        await release.promise;
+      });
+      await opened.promise;
+      seen.length = 0;
+      syncs = 0;
+      // Resolved once its record is committed.
+      const second = callOf(ctx, 'wait', {}, 'c2').then(() => seen.at(-1)?.b);
+      await new Promise((resolve) => setImmediate(resolve));
+      release.resolve();
+      await write;
+      expect(await second).toBe(true);
+      // No commit has the write without the answer recorded.
+      expect(seen.filter((c) => c.held && c.a === false)).toEqual([]);
+      expect(seen.some((c) => c.held && c.a === true)).toBe(true);
+      // One commit: the write, with the answer and the new record in it.
+      expect(syncs).toBe(1);
+    });
+  });
+});
