@@ -417,11 +417,11 @@ describe("a turn's Restate calls", () => {
     teller.reply = tellerReply;
   });
 
-  // Each Restate tool call keeps a record in the key's database (calls.ts). Its first write, before the call is
-  // made, is a commit of its own; that the call answered and that its record is forgotten ride the commits that
+  // Each Restate tool call keeps a record in the key's database (calls.ts). Its first write is committed before the
+  // call is made, by a transaction under way that carries it or else one of its own; that the call answered and that its record is forgotten ride the commits that
   // happen anyway, the one that stores the call's result and the one that stores the answer.
   it.each(agentsOf(restateTools))(
-    'cost one commit each, before the call, over a turn of plain tools: %s',
+    'cost one commit each, before the call, over a turn of plain tools (fewer where a transaction under way carries it): %s',
     async (name, chat) => {
       // The reference turn: 4 requests, 3 tool calls.
       const plain = (await costs(agentsOf(tools).find(([n]) => n === name)![1](), 4, 1))[1]!.commits;

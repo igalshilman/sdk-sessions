@@ -50,7 +50,8 @@ What the core gives an integration, once ported:
   publishes there; a turn outside one (a handler of your own that calls
   `prompt()`) makes nothing, and no integration publishes by hand.
   `toolCallStarted` settles the call records before a tool makes its own.
-  A call's record commits of its own only before the call is made; that
+  A call's record is committed before the call is made, by a transaction
+  under way that writes it as it commits, or one of its own; that
   it answered, and that it is forgotten, ride a commit of `ctx.db`
   (`rideCommit`: the one that stores the call's result, whichever framework
   makes it), and `answering` writes what is still pending as the turn ends.
