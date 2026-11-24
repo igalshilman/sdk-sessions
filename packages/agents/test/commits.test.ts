@@ -6,7 +6,7 @@
 // for Restate: it is stored, and the conversation knows it.
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import * as restate from '@restatedev/sessions';
-import { CANCELLED, sessionObject, tool } from '@restatedev/agents';
+import { call, CANCELLED, sessionObject, tool, type Tool } from '@restatedev/agents';
 import { AIMessage, type BaseMessage } from '@langchain/core/messages';
 import { MessagesAnnotation, START, StateGraph } from '@langchain/langgraph';
 import { ToolNode, toolsCondition } from '@langchain/langgraph/prebuilt';
@@ -15,7 +15,7 @@ import { z } from 'zod';
 import * as claude from '@restatedev/agents/claude';
 import * as langgraph from '@restatedev/agents/langgraph';
 import * as pi from '@restatedev/agents/pi';
-import { followingOf, handlerOf, type PromptHandler, sqlAttempt } from './support.ts';
+import { followingOf, handlerOf, type Made, type PromptHandler, sqlAttempt } from './support.ts';
 import { reply as tellerReply, teller } from './fakes/claude.ts';
 import { Teller } from './fakes/langgraph.ts';
 
@@ -55,6 +55,21 @@ const tools = () =>
     tool({ name, description: `tool ${name}`, input: z.object({}), run: () => `result of ${name}` }),
   );
 
+/** A service that tools call, `call(callee, 't1', ...)`, which the test's attempts answer (`answered`). */
+const callee = restate.service({
+  name: 'callee',
+  handlers: {
+    t1: async (_c, _x: unknown) => 'r',
+    t2: async (_c, _x: unknown) => 'r',
+    t3: async (_c, _x: unknown) => 'r',
+  },
+});
+const answered = async (c: Made) => `result of ${c.method}`;
+
+/** The same tools, each a Restate call of `callee`: a record of its own in the key's database. */
+const restateTools = () =>
+  (['t1', 't2', 't3'] as const).map((name) => call(callee, name, { name, description: `tool ${name}` }));
+
 /** Claude's model, by the plan. */
 function claudePlanned() {
   teller.reply = (messages: MessageParam[]) => {
@@ -81,11 +96,11 @@ class Planned extends Teller {
 }
 
 /** A graph of your own: a model node and LangGraph's ToolNode, as the usual tool-calling loop. */
-const ownGraph = () => {
+const ownGraph = (toolsOf: () => Tool[]) => {
   const model = new Planned({});
   return new StateGraph(MessagesAnnotation)
     .addNode('model', async ({ messages }) => ({ messages: [await model.invoke(messages)] }))
-    .addNode('tools', new ToolNode(langgraph.tools(tools())))
+    .addNode('tools', new ToolNode(langgraph.tools(toolsOf())))
     .addEdge(START, 'model')
     .addConditionalEdges('model', toolsCondition)
     .addEdge('tools', 'model');
@@ -105,7 +120,15 @@ async function costs(
   chat: PromptHandler,
   r: number,
   k: number,
-  { object, published }: { object?: { readonly name: string }; published?: () => Promise<void> } = {},
+  {
+    object,
+    published,
+    route,
+  }: {
+    object?: { readonly name: string };
+    published?: () => Promise<void>;
+    route?: (call: Made) => Promise<unknown>;
+  } = {},
 ): Promise<Cost[]> {
   const map = new Map<string, Uint8Array>();
   const following = followingOf(map);
@@ -116,22 +139,24 @@ async function costs(
     let commits = 0;
     const made = following.made.length;
     const onSync = async () => void commits++;
-    const sql = sqlAttempt({ map, key: 'k', id: `inv${i}`, onSync, object, published });
+    const sql = sqlAttempt({ map, key: 'k', id: `inv${i}`, onSync, object, published, route });
     expect(await sql.end(() => handler(sql.ctx, text))).toBe('Done');
     out.push({ commits, companion: following.made.slice(made) });
   }
   return out;
 }
 
-const AGENTS: [string, () => PromptHandler, ReturnType<typeof claude.messages>][] = [
-  ['Claude', () => (claudePlanned(), claude.chat({ tools: tools() })), claude.messages()],
+/** The agents of the frameworks that this file runs, over `tools`. */
+const agentsOf = (toolsOf: () => Tool[]): [string, () => PromptHandler, ReturnType<typeof claude.messages>][] => [
+  ['Claude', () => (claudePlanned(), claude.chat({ tools: toolsOf() })), claude.messages()],
   [
     'the built-in LangGraph loop',
-    () => langgraph.chat({ model: new Planned({}), tools: tools() }),
+    () => langgraph.chat({ model: new Planned({}), tools: toolsOf() }),
     langgraph.messages(),
   ],
-  ['a LangGraph graph of your own', () => langgraph.chat({ graph: ownGraph() }), langgraph.messages()],
+  ['a LangGraph graph of your own', () => langgraph.chat({ graph: ownGraph(toolsOf) }), langgraph.messages()],
 ];
+const AGENTS = agentsOf(tools);
 
 /**
  * The commits of a key's second turn, by agent, for a plain turn (`r = 1`)
@@ -384,5 +409,50 @@ describe("a pi turn's commits", () => {
   it('are fewer with `effects` whatever the length of the turn', async () => {
     for (const r of [1, 2, 3])
       expect(await second('effects', r, unwatched)).toBeLessThan(await second('each', r, unwatched));
+  });
+});
+
+describe("a turn's Restate calls", () => {
+  afterAll(() => {
+    teller.reply = tellerReply;
+  });
+
+  // Each Restate tool call keeps a record in the key's database (calls.ts). Its first write, before the call is
+  // made, is a commit of its own; that the call answered and that its record is forgotten ride the commits that
+  // happen anyway, the one that stores the call's result and the one that stores the answer.
+  it.each(agentsOf(restateTools))(
+    'cost one commit each, before the call, over a turn of plain tools: %s',
+    async (name, chat) => {
+      // The reference turn: 4 requests, 3 tool calls.
+      const plain = (await costs(agentsOf(tools).find(([n]) => n === name)![1](), 4, 1))[1]!.commits;
+      const restated = (await costs(chat(), 4, 1, { route: answered }))[1]!.commits;
+      expect(restated - plain).toBe(3);
+    },
+  );
+
+  it('are one commit each, before the call, in pi too, with `commits: each`', async () => {
+    const unwatched = pi.agent({ name: 'unwatched-calls-each', background: true });
+    const plain = (await costs(pi.chat({ tools: tools(), commits: 'each' }), 4, 1, { object: unwatched }))[1]!.commits;
+    const restated = (
+      await costs(pi.chat({ tools: restateTools(), commits: 'each' }), 4, 1, { object: unwatched, route: answered })
+    )[1]!.commits;
+    expect(restated - plain).toBe(3);
+  });
+
+  // `commits: 'effects'` holds pi's commits in one transaction until the next effect starts, and a record's first
+  // write is written after what is held (`flushHeld`): the batches are those of a turn of plain tools, and each
+  // call adds its record's commit, before the call. The call's answered and settled ride the batch that stores its
+  // result.
+  it('are one commit each, before the call, in pi with `commits: effects`: the batches are the same', async () => {
+    const unwatched = pi.agent({ name: 'unwatched-calls-effects', background: true });
+    const plain = (await costs(pi.chat({ tools: tools(), commits: 'effects' }), 4, 1, { object: unwatched }))[1]!
+      .commits;
+    const restated = (
+      await costs(pi.chat({ tools: restateTools(), commits: 'effects' }), 4, 1, {
+        object: unwatched,
+        route: answered,
+      })
+    )[1]!.commits;
+    expect(restated - plain).toBe(3);
   });
 });

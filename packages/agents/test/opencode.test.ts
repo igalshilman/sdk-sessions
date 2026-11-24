@@ -212,20 +212,26 @@ describe.skipIf(!NODE_24)('the OpenCode agent', () => {
   it('tells the model which calls of a killed turn did happen', async () => {
     // A transfer whose Restate call returned, and whose attempt was killed before OpenCode stored its result.
     const returned = Promise.withResolvers<void>();
+    let answered = false;
     const transfer = tool({
       name: 'transfer',
       description: 'Move money.',
       input: z.object({ from: z.number(), to: z.number(), amount: z.number() }),
       run: async (input, { ctx, callId }) => {
         await (await callOf(ctx, 'transfer', input, callId)).answered();
-        returned.resolve();
-        return new Promise<never>(() => {});
+        answered = true;
+        return 'moved';
       },
     });
     const chat = handlerOf(opencode.chat({ tools: [transfer] }));
     const map = new Map<string, Uint8Array>();
     const fence = { closed: false };
-    const first = sqlAttempt({ map, fence, key: 'happened', id: 'inv1' });
+    // The commit that records it answered is made before the result is handed to OpenCode (which stores it in its
+    // own database, where a commit of `ctx.db` does not reach): killed right after, the call reads as returned.
+    const onSync = async () => {
+      if (answered) returned.resolve();
+    };
+    const first = sqlAttempt({ map, fence, key: 'happened', id: 'inv1', onSync });
     void first.end(() => chat(first.ctx, 'Please move 5 from 1 to 2')).catch(() => {});
     await returned.promise;
     fence.closed = true;

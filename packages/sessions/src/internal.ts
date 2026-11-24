@@ -5,7 +5,18 @@
 // own copy, so that a library's journaled handlers serve beside its objects).
 export * as sdk from '@restatedev/restate-sdk';
 export { ensureSchemas, Schema } from './schema.ts';
-export { asDatabase, lazyDatabase, database, reset, deferSql, undeferSql, Attempt, withAttempt } from './session.ts';
+export {
+  asDatabase,
+  lazyDatabase,
+  database,
+  reset,
+  deferSql,
+  undeferSql,
+  rideCommit,
+  flushRiders,
+  Attempt,
+  withAttempt,
+} from './session.ts';
 export type { ObjectConfig, SqlHost } from './session.ts';
 export { Link } from './link.ts';
 export { ScopeKey } from './scope.ts';

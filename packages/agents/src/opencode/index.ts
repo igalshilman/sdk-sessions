@@ -104,6 +104,7 @@ import {
   toolCallStarted,
   approves,
 } from '../common.ts';
+import { flushCalls } from '../calls.ts';
 import { answerOnce, invocationOf, type Call, type Items, type Parsed, STEPS, type Turn } from '../conversation.ts';
 import { conversationView } from '../messages.ts';
 import { tookSteers } from '../steering.ts';
@@ -148,7 +149,25 @@ const native = (t: AnyTool, ctx: restate.SessionContext): OpenCodeTool => {
       },
     },
   };
-  return { name: t.name, description: t.description, input, execute: (args, callId) => t.run(args, { ctx, callId }) };
+  return {
+    name: t.name,
+    description: t.description,
+    input,
+    execute: async (args, callId) => {
+      // OpenCode stores the result (or the error a call answered with) in its own database, which a commit of
+      // `ctx.db` does not reach: a call that answered is recorded before it is handed over. The tool's own error
+      // is the one thrown, whatever the flush does.
+      let result: string;
+      try {
+        result = await t.run(args, { ctx, callId });
+      } catch (error) {
+        await flushCalls(ctx).catch(() => {});
+        throw error;
+      }
+      await flushCalls(ctx);
+      return result;
+    },
+  };
 };
 
 /** The session every prompt goes to. */
