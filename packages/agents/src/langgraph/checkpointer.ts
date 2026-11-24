@@ -17,9 +17,26 @@
 //   a step's writes in. A write without a path (graph input, a `Command`)
 //   comes first.
 //
-// Each `put` and `putWrites` is one SQL transaction, so a step is stored whole,
-// in order with everything else the handler does. Operations run one at a
-// time, in call order: LangGraph writes the results of parallel tasks at once.
+// Each `put` is one SQL transaction, so a step is stored whole, in order with
+// everything else the handler does. Operations run one at a time, in call
+// order: LangGraph writes the results of parallel tasks at once.
+//
+// A task's `putWrites` is kept pending, and its promise resolves at once (as
+// LangGraph does not wait for it). The `put` of its step, if called before
+// the macrotask ends, which it is when the step's last task has just
+// finished, stores the pending writes and then its checkpoint in one
+// transaction, and resolves once it is committed: a step is stored before
+// any task of the next starts, as LangGraph's `durability: 'sync'` awaits
+// the `put`. Else, the step has tasks still running, and the pending writes
+// are stored on their own, in one transaction, at the end of the macrotask:
+// a task that finished has its writes stored while its siblings run, so it
+// does not run again after a crash. Reads (`getTuple`, `list`) and `prune`
+// store what is pending first. A write that fails on its own is remembered:
+// the next call fails with it, as the call it belongs to would have. So does
+// a `put` that carried writes and failed, which drops them: the attempt
+// fails, and a retry runs from what is stored, as when a `put` fails. A user
+// of the saver outside LangGraph's runs `flush`es it when done (as `graphRun`
+// does).
 //
 // By default a thread keeps every checkpoint (LangGraph's history: `list`,
 // time travel, forks). With `history: 'latest'`, each `put` drops the
@@ -184,7 +201,20 @@ async function dropEarlier(tx: DatabaseWriter, threadId: string, ns: string, kep
   );
 }
 
-/** A LangGraph checkpointer whose threads are in the database session `db`: see the top of this file. */
+/** The rows of one `putWrites` (a serialization in progress), and the statement's verb. */
+interface PendingWrites {
+  verb: string;
+  rows: Promise<SqlValue[][]>;
+}
+
+/**
+ * A LangGraph checkpointer whose threads are in the database session `db`:
+ * see the top of this file. A task's pending writes are stored with the `put`
+ * that follows them in the same macrotask, else at the end of it, so a
+ * `putWrites` is not stored when its promise resolves: `flush` it, before
+ * ending the session, if the checkpointer is used outside of a graph run's
+ * own end. This holds for a user's own use of the saver too.
+ */
 export class SqlCheckpointSaver extends BaseCheckpointSaver {
   #db: Database;
   #latest: boolean;
@@ -197,6 +227,12 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
   #needed = new Map<string, Needed[]>();
   #ready: Promise<void> | undefined;
   #tail: Promise<unknown> = Promise.resolve();
+  /** The writes of tasks that no operation has taken yet, in the order LangGraph called `putWrites`. */
+  #pending: PendingWrites[] = [];
+  /** Stores what is pending, when the macrotask ends. */
+  #timer: NodeJS.Immediate | undefined;
+  /** What a write that no call awaited failed with: every call after it fails with it. */
+  #failure: { error: unknown } | undefined;
 
   /**
    * `db`: a database session (`ctx.db`). `history`: the checkpoints a thread
@@ -229,12 +265,65 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     return `${String(count + 1).padStart(32, '0')}.${randomUUID()}` as unknown as number;
   }
 
-  /** Runs `operation` after the ones before it, on a database with the tables. */
+  /** Runs `operation` after the ones before it, on a database with the tables, unless an earlier write failed. */
   #serial<T>(operation: () => Promise<T>): Promise<T> {
     this.#ready ??= SCHEMA.ensure(this.#db);
-    const result = this.#tail.then(() => this.#ready).then(operation);
+    const result = this.#tail
+      .then(() => {
+        if (this.#failure) throw this.#failure.error;
+        return this.#ready;
+      })
+      .then(operation);
     this.#tail = result.catch(() => {});
     return result;
+  }
+
+  /** The writes pending now, which the caller must store, in order; the end of the macrotask has nothing to store then. */
+  #take(): PendingWrites[] {
+    if (this.#timer) clearImmediate(this.#timer);
+    this.#timer = undefined;
+    return this.#pending.splice(0);
+  }
+
+  /** Stores `writes` in `tx`, in order. */
+  async #store(tx: DatabaseWriter, writes: PendingWrites[]) {
+    for (const { verb, rows } of writes) {
+      for (const row of await rows) {
+        await tx.execute(
+          `${verb} INTO restate_langgraph_writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value, task_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          row,
+        );
+      }
+    }
+  }
+
+  /**
+   * Stores what is pending, on its own, in order with the operations: the
+   * ones called after it are after it. A failure is not the caller's: it is
+   * remembered, and fails the next call.
+   */
+  #storePending(): void {
+    const writes = this.#take();
+    if (writes.length === 0) return;
+    this.#serial(async () => {
+      // Serialized before the transaction opens, as a `put`'s values are.
+      await Promise.all(writes.map(({ rows }) => rows));
+      await this.#db.transaction((tx) => this.#store(tx, writes));
+    }).catch((error: unknown) => {
+      this.#failure ??= { error };
+    });
+  }
+
+  /**
+   * Stores what is pending, and resolves once everything called so far is
+   * stored, or rejects with the error of a write that failed. Call it when the
+   * graph's run is over, so that no write is left for a timer to store after
+   * the session ended.
+   */
+  async flush(): Promise<void> {
+    this.#storePending();
+    await this.#tail;
+    if (this.#failure) throw this.#failure.error;
   }
 
   /** The values of `checkpoint`'s channels, at its versions. */
@@ -346,6 +435,7 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
   }
 
   getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
+    this.#storePending();
     return this.#serial(async () => {
       const { thread_id, checkpoint_ns = '', checkpoint_id } = config.configurable ?? {};
       const rows = checkpoint_id
@@ -365,6 +455,7 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     config: RunnableConfig,
     { limit, before, filter }: CheckpointListOptions = {},
   ): AsyncGenerator<CheckpointTuple> {
+    this.#storePending();
     const tuples = await this.#serial(async () => {
       const { thread_id, checkpoint_ns } = config.configurable ?? {};
       const where: string[] = [];
@@ -401,6 +492,8 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     metadata: CheckpointMetadata,
     newVersions: ChannelVersions,
   ): Promise<RunnableConfig> {
+    // The writes called before it, whose transaction this is.
+    const writes = this.#take();
     return this.#serial(async () => {
       const { thread_id, checkpoint_ns = '', checkpoint_id: parentId } = config.configurable ?? {};
       if (!thread_id) throw new Error('Missing "thread_id" field in passed "config.configurable".');
@@ -415,8 +508,10 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
           return [channel, String(version), valueType, value];
         }),
       );
+      await Promise.all(writes.map(({ rows }) => rows));
       let kept: Needed[] | undefined;
       await this.#db.transaction(async (tx) => {
+        await this.#store(tx, writes);
         for (const row of changed) {
           await tx.execute(
             'INSERT OR REPLACE INTO restate_langgraph_channel_values (thread_id, checkpoint_ns, channel, version, type, value) VALUES (?, ?, ?, ?, ?, ?)',
@@ -435,41 +530,45 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
       // Once stored: a transaction rolled back keeps the ones before.
       if (kept) this.#needed.set(JSON.stringify([thread_id, checkpoint_ns]), kept);
       return { configurable: { thread_id, checkpoint_ns, checkpoint_id: checkpoint.id } };
+    }).catch((error: unknown) => {
+      // The writes it carried are gone: the attempt fails, and a retry runs from what is stored.
+      if (writes.length > 0) this.#failure ??= { error };
+      throw error;
     });
   }
 
   putWrites(config: RunnableConfig, writes: PendingWrite[], taskId: string, taskPath?: string): Promise<void> {
-    return this.#serial(async () => {
-      const { thread_id, checkpoint_ns = '', checkpoint_id } = config.configurable ?? {};
-      if (!thread_id) throw new Error('Missing thread_id field in config.configurable.');
-      if (!checkpoint_id) throw new Error('Missing checkpoint_id field in config.configurable.');
-      // Special writes (errors, interrupts) replace; others keep the first.
-      const verb = writes.every(([channel]) => channel in WRITES_IDX_MAP) ? 'INSERT OR REPLACE' : 'INSERT OR IGNORE';
-      const rows = await Promise.all(
-        writes.map(async ([channel, value], idx): Promise<SqlValue[]> => {
-          const [type, stored] = await this.serde.dumpsTyped(value);
-          return [
-            thread_id,
-            checkpoint_ns,
-            checkpoint_id,
-            taskId,
-            WRITES_IDX_MAP[channel] ?? idx,
-            channel,
-            type,
-            stored,
-            taskPath ?? null,
-          ];
-        }),
-      );
-      await this.#db.transaction(async (tx) => {
-        for (const row of rows) {
-          await tx.execute(
-            `${verb} INTO restate_langgraph_writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value, task_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            row,
-          );
-        }
-      });
+    const { thread_id, checkpoint_ns = '', checkpoint_id } = config.configurable ?? {};
+    if (this.#failure) return Promise.reject(this.#failure.error);
+    if (!thread_id) return Promise.reject(new Error('Missing thread_id field in config.configurable.'));
+    if (!checkpoint_id) return Promise.reject(new Error('Missing checkpoint_id field in config.configurable.'));
+    // Special writes (errors, interrupts) replace; others keep the first.
+    const verb = writes.every(([channel]) => channel in WRITES_IDX_MAP) ? 'INSERT OR REPLACE' : 'INSERT OR IGNORE';
+    const rows = Promise.all(
+      writes.map(async ([channel, value], idx): Promise<SqlValue[]> => {
+        const [type, stored] = await this.serde.dumpsTyped(value);
+        return [
+          thread_id,
+          checkpoint_ns,
+          checkpoint_id,
+          taskId,
+          WRITES_IDX_MAP[channel] ?? idx,
+          channel,
+          type,
+          stored,
+          taskPath ?? null,
+        ];
+      }),
+    );
+    // Whoever stores it awaits it, and fails with it; until then it is not an unhandled rejection.
+    rows.catch(() => {});
+    this.#pending.push({ verb, rows });
+    // A `put` in this macrotask takes it, else it is stored on its own when the macrotask ends.
+    this.#timer ??= setImmediate(() => {
+      this.#timer = undefined;
+      this.#storePending();
     });
+    return Promise.resolve();
   }
 
   /**
@@ -482,6 +581,7 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
    * (`''`) or a subgraph run's, which keeps its latest checkpoint too.
    */
   prune(threadIds: string[], { strategy = 'keepLatest' }: { strategy?: 'keepLatest' | 'delete' } = {}): Promise<void> {
+    this.#storePending();
     return this.#serial(() =>
       this.#db.transaction(async (tx) => {
         for (const threadId of threadIds) {
@@ -506,6 +606,7 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
   }
 
   deleteThread(threadId: string): Promise<void> {
+    this.#storePending();
     return this.#serial(() =>
       this.#db.transaction(async (tx) => {
         for (const table of TABLES) await tx.execute(`DELETE FROM ${table} WHERE thread_id = ?`, [threadId]);

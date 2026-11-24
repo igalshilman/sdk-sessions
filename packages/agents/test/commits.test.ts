@@ -386,3 +386,69 @@ describe("a pi turn's commits", () => {
       expect(await second('effects', r, unwatched)).toBeLessThan(await second('each', r, unwatched));
   });
 });
+
+describe("a graph of your own's commits", () => {
+  const WRITE = /(?:INSERT OR REPLACE INTO|INSERT OR IGNORE INTO|INSERT INTO|UPDATE|DELETE FROM)\s+"?restate_(\w+)/i;
+
+  /** The second turn of a key, `r` requests with `k` tool calls a round: each commit's tables, in order. */
+  async function sequence(r: number, k: number) {
+    const map = new Map<string, Uint8Array>();
+    const handler = handlerOf(langgraph.chat({ graph: ownGraph() }));
+    let seen: string[] = [];
+    const commits: string[] = [];
+    for (const [i, text] of ['first', 'second'].entries()) {
+      Object.assign(plan, { rounds: r - 1, calls: k, asked: 0 });
+      commits.length = 0;
+      const sql = sqlAttempt({
+        map,
+        key: 'k',
+        id: `inv${i}`,
+        onSync: async () => void commits.push(seen.shift() ?? '?'),
+      });
+      const transaction = sql.db.transaction.bind(sql.db);
+      sql.db.transaction = ((body: (tx: restate.Transaction) => Promise<unknown>) =>
+        transaction(async (tx) => {
+          const tables = new Set<string>();
+          const execute = tx.execute.bind(tx);
+          tx.execute = (statement, params) => {
+            const table = WRITE.exec(statement)?.[1];
+            if (table) tables.add(table.replace(/^langgraph_/, ''));
+            return execute(statement, params);
+          };
+          const result = await body(tx);
+          seen.push([...tables].join('+'));
+          return result;
+        })) as typeof sql.db.transaction;
+      seen = [];
+      expect(await sql.end(() => handler(sql.ctx, text))).toBe('Done');
+    }
+    return commits;
+  }
+
+  it("are each step's writes with its checkpoint, but for the first's, and the conversation's copies", async () => {
+    const put = 'channel_values+checkpoints';
+    const step = `writes+${put}`;
+    const commits = await sequence(4, 1);
+    // The checkpointer's: the prompt's row, then the input checkpoint and the write of LangGraph's `__start__` task
+    // (which its checkpoint does not follow at once), then each of the 7 steps' (3 rounds of a model's reply and a
+    // tool's result, then the final reply) a commit, and the thread pruned to its latest checkpoint.
+    expect(commits.filter((commit) => commit !== 'agent_items')).toEqual([
+      'agent_turns',
+      put,
+      'writes',
+      put,
+      ...Array.from({ length: 7 }, () => step),
+      'checkpoints+writes+channel_values',
+      'agent_items+agent_turns',
+    ]);
+    // The conversation's copies of the 3 replies with tool calls and the 3 results: each after its checkpoint
+    // (they run beside the next step, whose commit may come first), and the final reply with the answer.
+    expect(commits.filter((commit) => commit === 'agent_items')).toHaveLength(6);
+    expect(commits).toHaveLength(19);
+    expect(commits.at(-1)).toBe('agent_items+agent_turns');
+  });
+
+  it('are as many for a round of tool calls as for one', async () => {
+    expect(await sequence(2, 3)).toHaveLength((await sequence(2, 1)).length);
+  });
+});
