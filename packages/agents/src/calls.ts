@@ -150,14 +150,7 @@ async function store(ctx: restate.SessionContext, state: Calls) {
  * stays so. A database that cannot ride (a view's) commits it at once.
  */
 async function ride(ctx: restate.SessionContext, state: Calls, urgent = false) {
-  const written = rideCommit(
-    ctx.db,
-    RIDER,
-    (tx) => tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]),
-    {
-      urgent,
-    },
-  );
+  const written = rideCommit(ctx.db, RIDER, writing(state), { urgent });
   if (!written) await store(ctx, state);
 }
 
