@@ -399,6 +399,33 @@ type Outcome<T> = { value: T } | { error: unknown };
 /** The attempt of a `ctx.db`: for {@link database}. */
 const ATTEMPT = new Link<Attempt>('database');
 
+/** A write that rides the next commit of a database, in that commit's transaction. */
+type Rider = (tx: Transaction) => Promise<void>;
+
+/**
+ * Have `write` run in the next transaction of `db` that commits, before its
+ * commit, rather than commit on its own: for bookkeeping that must be stored
+ * with the next write, not before it. A write by `db.execute` outside a
+ * transaction, made while a rider is pending, is that transaction; a read
+ * (`get`, `values`, `query`) is not, and writes nothing. A transaction that
+ * rolls back leaves the rider pending, and so does one that ends the handler
+ * before it commits: {@link flushRiders} writes what is left.
+ *
+ * A database has one rider per `slot`: a later one replaces the earlier, and
+ * `undefined` clears it. A rider registered while a commit that runs the
+ * earlier one is under way is for the commit after. Returns false, registering
+ * nothing, for a database that cannot (a view's, another kind of
+ * `Database`): the caller writes at once.
+ */
+export function rideCommit(db: Database, slot: string, write: Rider | undefined): boolean {
+  return ATTEMPT.of(db)?.ride(slot, write) ?? false;
+}
+
+/** Write what is pending ({@link rideCommit}) in a transaction of its own: nothing, if nothing is. */
+export async function flushRiders(db: Database): Promise<void> {
+  await ATTEMPT.of(db)?.flushRiders();
+}
+
 // A database's name (`database`).
 const DATABASE_NAME = /^[\w.-]{1,64}$/;
 
@@ -514,6 +541,8 @@ export class Attempt {
   private unhanded = 0;
   /** The ids of the outbox's transactions this attempt made the sends of. */
   private readonly made = new Set<string>();
+  /** The writes that ride the next commit, by slot ({@link rideCommit}). */
+  private readonly riders = new Map<string, Rider>();
   /** The schemas this attempt's database has all the steps of. */
   private readonly ensured = new Map<string, Schema>();
   private ended = false;
@@ -523,11 +552,17 @@ export class Attempt {
     this.config = config;
     this.name = name;
     this.hasOutbox = !ctx.shared && name === undefined;
+    const base = sqlOver(
+      (sql, params) => this.askedNow(() => this.callNow((db) => db.queryColumnsNow(sql, params))),
+      handlerError,
+    );
     this.db = {
-      ...sqlOver(
-        (sql, params) => this.askedNow(() => this.callNow((db) => db.queryColumnsNow(sql, params))),
-        handlerError,
-      ),
+      ...base,
+      // A write while a rider is pending is the transaction it rides.
+      execute: (statement, params) =>
+        this.riders.size > 0
+          ? this.asked(() => this.transaction((tx) => tx.execute(statement, params)))
+          : base.execute(statement, params),
       transaction: (body) => this.asked(() => this.transaction(body)),
     };
     ensuring(this.db, (schemas) => this.asked(() => this.call((db) => this.ensureSchemas(db, schemas))));
@@ -540,6 +575,19 @@ export class Attempt {
     let other = this.databases.get(name);
     if (other === undefined) this.databases.set(name, (other = new Attempt(this.ctx, this.config, name)));
     return other.db;
+  }
+
+  /** {@link rideCommit}. */
+  ride(slot: string, write: Rider | undefined): boolean {
+    if (this.ctx.shared || this.ended) return false;
+    if (write === undefined) this.riders.delete(slot);
+    else this.riders.set(slot, write);
+    return true;
+  }
+
+  /** {@link flushRiders}, as a transaction of `db`: its commit writes them. */
+  async flushRiders() {
+    if (this.riders.size > 0) await this.db.transaction(async () => {});
   }
 
   /**
@@ -603,6 +651,8 @@ export class Attempt {
    */
   private async transaction<T>(body: (tx: Transaction) => Promise<T>): Promise<T> {
     let outgoing: Outgoing | undefined;
+    // The riders this transaction wrote: pending until it has committed.
+    let rode: [string, Rider][] = [];
     const value = await this.call((db) =>
       db.transaction(async (handle) => {
         const sends = this.hasOutbox ? new Sends() : undefined;
@@ -616,10 +666,17 @@ export class Attempt {
         } finally {
           outgoing = sends?.close();
         }
+        // After the body, which may have registered one (a transaction held open for more work), and before the commit.
+        if (this.riders.size > 0) {
+          rode = [...this.riders];
+          for (const [, write] of rode) await write(tx);
+        }
         if (this.hasOutbox) await this.commitOutbox(handle, outgoing);
         return result;
       }),
     );
+    // One registered since is for the next commit.
+    for (const [slot, write] of rode) if (this.riders.get(slot) === write) this.riders.delete(slot);
     if (outgoing !== undefined) await this.call((db) => this.flush(db));
     return value;
   }

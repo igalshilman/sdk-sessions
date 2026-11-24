@@ -19,6 +19,15 @@
 // terminal error is its result too. Once stored, the model has its result,
 // and an identical call it makes later is a call of its own.
 //
+// Only the record of a new call commits of its own, before the call is made.
+// That a call answered, and that its record is forgotten, ride the next
+// commit of the database, in its transaction ({@link rideCommit}): for an
+// answer, the commit that stores the call's result, so that the transcript
+// never has a result of a call that is not recorded as answered. A crash
+// before that commit reads the call as one that did not answer, as a crash
+// just before a commit of its own would have: made again, under the same
+// key, and cut off for a stopped turn that another invocation closes.
+//
 // A framework's own wait ({@link waitFor} of tools.ts) is its tool call's
 // alone: the framework stored its tool call before it waits, so a retried
 // attempt waits again under the same id, and a new call with the same input
@@ -26,7 +35,7 @@
 // a tool call waited for is not the call: a stopped turn does not report the
 // call as done because its approval returned ({@link outcomes}).
 import type * as restate from '@restatedev/sessions';
-import { Schema, ScopeKey } from '@restatedev/sessions/internal';
+import { flushRiders, rideCommit, Schema, ScopeKey } from '@restatedev/sessions/internal';
 import { randomUUID } from 'node:crypto';
 
 /** A tool's call: the tool, its input as JSON, the ids it was made with (the first is its own), and the attempt that last made it. */
@@ -103,17 +112,33 @@ export async function flushHeld(ctx: restate.SessionContext) {
   for (const flush of HELD.get(ctx)?.values() ?? []) await flush();
 }
 
+const UPSERT = 'INSERT OR REPLACE INTO restate_agent_calls (row, invocation, calls) VALUES (0, ?, ?)';
+
+/** The slot of the calls' write that rides the next commit ({@link ride}). */
+const RIDER = 'restate-agents.calls';
+
 /**
  * Store `calls`, committed before the call they record is made. The rows the
  * conversation holds back are written first: the call outlives the attempt,
- * and what led to it must too.
+ * and what led to it must too. It is the whole row: what rides the next
+ * commit is written, and no longer pending.
  */
 async function store(ctx: restate.SessionContext, { invocation, calls }: Calls) {
   await flushHeld(ctx);
-  await ctx.db.execute('INSERT OR REPLACE INTO restate_agent_calls (row, invocation, calls) VALUES (0, ?, ?)', [
-    invocation,
-    JSON.stringify(calls),
-  ]);
+  rideCommit(ctx.db, RIDER, undefined);
+  await ctx.db.execute(UPSERT, [invocation, JSON.stringify(calls)]);
+}
+
+/**
+ * Store `state` with the next commit of the database, rather than commit it
+ * (see the top of this file), as it is then: a later change replaces it, and
+ * the latest state is written. A database that cannot ride (a view's) commits it at once.
+ */
+async function ride(ctx: restate.SessionContext, state: Calls) {
+  const written = rideCommit(ctx.db, RIDER, (tx) =>
+    tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]),
+  );
+  if (!written) await store(ctx, state);
 }
 
 /** The calls of `invocation`, as stored: none if the row is another invocation's. */
@@ -127,8 +152,8 @@ async function load(ctx: CallsContext, invocation: string): Promise<Calls> {
     : { invocation, calls: [] };
 }
 
-/** Each attempt's id, and its calls, by its context, once they are being read. */
-const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls> }>('the calls of an attempt');
+/** Each attempt's id, its calls, and how many are in flight (made, not yet answered), by its context, once they are being read. */
+const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls>; inFlight: number }>('the calls of an attempt');
 
 /**
  * The attempt of `ctx`: its id, and the calls of its invocation (loaded once,
@@ -136,8 +161,8 @@ const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls> }>('the calls 
  * cancelled, say) is not kept: the next asks again, so that a stopped turn's
  * close reads the calls as stored, rather than fail on the load it found.
  */
-function attemptOf(ctx: restate.SessionContext): { id: string; calls: Promise<Calls> } {
-  const attempt = ATTEMPT.of(ctx, () => ({ id: randomUUID() }));
+function attemptOf(ctx: restate.SessionContext) {
+  const attempt = ATTEMPT.of(ctx, () => ({ id: randomUUID(), inFlight: 0 }));
   if (attempt.calls === undefined) {
     const calls = load(ctx, ctx.request.id);
     attempt.calls = calls;
@@ -145,7 +170,7 @@ function attemptOf(ctx: restate.SessionContext): { id: string; calls: Promise<Ca
       if (attempt.calls === calls) attempt.calls = undefined;
     });
   }
-  return attempt as { id: string; calls: Promise<Calls> };
+  return attempt as typeof attempt & { calls: Promise<Calls> };
 }
 
 /** `value` as JSON with its objects' keys sorted: the same input, however its keys came, is the same call. */
@@ -195,37 +220,64 @@ export async function callOf(
   { rejoin = true, approval = false }: { rejoin?: boolean; approval?: boolean } = {},
 ) {
   const attempt = attemptOf(ctx);
-  const state = await attempt.calls;
-  const json = canonical(input);
-  const prompt = PROMPT.get(ctx);
-  const ours = state.calls.filter((c) => c.prompt === prompt);
-  // A tool call may make more than one call (an approval, then the tool's
-  // own), each to a tool of its own.
-  let call =
-    ours.find((c) => c.ids.includes(callId) && c.tool === tool) ??
-    (rejoin ? ours.find((c) => c.attempt !== attempt.id && c.tool === tool && c.input === json) : undefined);
-  if (call) {
-    call.attempt = attempt.id;
-    if (!call.ids.includes(callId)) call.ids.push(callId);
-  } else {
-    call = { tool, input: json, ids: [callId], attempt: attempt.id };
-    if (approval) call.approval = true;
-    if (prompt !== undefined) call.prompt = prompt;
-    state.calls.push(call);
+  // In flight from now on, not from when its record is stored: a call that answers meanwhile is not the last.
+  attempt.inFlight++;
+  let flying = true;
+  const left = () => {
+    if (flying) attempt.inFlight--;
+    flying = false;
+  };
+  let made: Call;
+  let state: Calls;
+  try {
+    state = await attempt.calls;
+    const json = canonical(input);
+    const prompt = PROMPT.get(ctx);
+    const ours = state.calls.filter((c) => c.prompt === prompt);
+    // A tool call may make more than one call (an approval, then the tool's
+    // own), each to a tool of its own.
+    let call =
+      ours.find((c) => c.ids.includes(callId) && c.tool === tool) ??
+      (rejoin ? ours.find((c) => c.attempt !== attempt.id && c.tool === tool && c.input === json) : undefined);
+    if (call) {
+      call.attempt = attempt.id;
+      if (!call.ids.includes(callId)) call.ids.push(callId);
+    } else {
+      call = { tool, input: json, ids: [callId], attempt: attempt.id };
+      if (approval) call.approval = true;
+      if (prompt !== undefined) call.prompt = prompt;
+      state.calls.push(call);
+    }
+    await store(ctx, state);
+    made = call;
+  } catch (error) {
+    left();
+    throw error;
   }
-  await store(ctx, state);
-  const made = call;
   return {
     id: made.ids[0]!,
     /**
      * It answered, with `failed` if a terminal error answered it: kept until
      * the transcript has its result.
+     *
+     * It rides the next commit of the database, the one that stores the
+     * result, unless another call is still in flight: that may be a long
+     * wait (a signal, a sub-agent), and a call that answered must not stay
+     * unrecorded until it ends. A crash before that commit reads it as not
+     * answered, as one just before it was recorded would have: the retry makes the
+     * call again under the same key, and a stopped turn of another invocation
+     * that closes this one reports it as cut off ({@link outcomes} reads
+     * the stored row; the attempt's own turn reads its state).
      */
     async answered(failed?: string) {
       made.done = true;
       if (failed !== undefined) made.failed = failed;
-      await store(ctx, state);
+      left();
+      if (attempt.inFlight > 0) await store(ctx, state);
+      else await ride(ctx, state);
     },
+    /** It did not answer (the attempt fails, and its retry makes it again): no longer in flight. */
+    left,
   };
 }
 
@@ -243,7 +295,7 @@ export async function settleCalls(ctx: restate.SessionContext, stored: (id: stri
   const kept = state.calls.filter((c) => !c.done || !stored(c.ids.at(-1)!, c.failed));
   if (kept.length === state.calls.length) return;
   state.calls = kept;
-  await store(ctx, state);
+  await ride(ctx, state);
 }
 
 /**
@@ -277,3 +329,9 @@ export async function outcomes(
   }
   return found;
 }
+
+/**
+ * Write what rides the next commit ({@link ride}) now, if it is pending: at
+ * the end of a turn, when no commit follows that would.
+ */
+export const flushCalls = (ctx: restate.SessionContext) => flushRiders(ctx.db);
