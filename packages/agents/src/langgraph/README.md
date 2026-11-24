@@ -155,9 +155,10 @@ A task's pending writes are stored in the transaction of the checkpoint that
 follows them, when that comes in the same macrotask (the step's last task has
 just finished): a step is one commit. While other tasks of the step still run,
 the writes of one that finished are stored on their own at the end of the
-macrotask, so that it does not run again after a crash. Its reads and `prune`
-store what is pending first, and a saver used outside `graphRun` is `flush`ed
-when its user is done with it.
+macrotask, so that it does not run again after a crash. A `putWrites` promise
+resolves once its rows are stored (and fails with the error of the commit that
+carried them), so a graph's `invoke` that returns has everything stored, as
+LangGraph awaits them. Reads and `prune` store what is pending first.
 
 ## Run
 

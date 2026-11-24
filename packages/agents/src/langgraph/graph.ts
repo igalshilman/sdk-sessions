@@ -8,7 +8,8 @@
 //
 // - The graph's checkpoints are in the key's database (`SqlCheckpointSaver`),
 //   stored before each step runs (`durability: 'sync'`; a step's writes
-//   with its checkpoint, see checkpointer.ts), and the prebuilt
+//   with its checkpoint, see checkpointer.ts; LangGraph awaits them all
+//   before a run ends, an error or a stop included), and the prebuilt
 //   nodes (nodes.ts) and the tools of `tools()` get the handler's context
 //   there (context.ts). LangGraph's run context is the graph's own (`context`),
 //   else the handler's. A retried attempt resumes the run it cut off. A run
@@ -392,13 +393,7 @@ async function runGraph(
         values = state;
         await copied(turn, known, (state.messages ?? []) as BaseMessage[], promptId);
       }
-      // A run that ends with writes no checkpoint followed (an interrupt's, say) has them stored before the
-      // attempt goes on: nothing is left for a timer to store after the attempt ends.
-      await saver.flush();
     } catch (error) {
-      // An error or a stop ends the run with writes pending, a failed task's among them: stored now, as the run's
-      // own end would. The error that ended the run is the one that is thrown.
-      await saver.flush().catch(() => {});
       // LangGraph's own error, which a retry would meet again: a run past its recursion limit, say.
       const terminal = terminalOf(error);
       if (terminal) throw terminal;

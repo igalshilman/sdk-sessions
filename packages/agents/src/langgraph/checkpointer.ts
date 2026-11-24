@@ -21,22 +21,22 @@
 // everything else the handler does. Operations run one at a time, in call
 // order: LangGraph writes the results of parallel tasks at once.
 //
-// A task's `putWrites` is kept pending, and its promise resolves at once (as
-// LangGraph does not wait for it). The `put` of its step, if called before
-// the macrotask ends, which it is when the step's last task has just
-// finished, stores the pending writes and then its checkpoint in one
-// transaction, and resolves once it is committed: a step is stored before
-// any task of the next starts, as LangGraph's `durability: 'sync'` awaits
-// the `put`. Else, the step has tasks still running, and the pending writes
-// are stored on their own, in one transaction, at the end of the macrotask:
-// a task that finished has its writes stored while its siblings run, so it
-// does not run again after a crash. Reads (`getTuple`, `list`) and `prune`
-// store what is pending first. A write that fails on its own is remembered:
-// the next call fails with it, as the call it belongs to would have. So does
-// a `put` that carried writes and failed, which drops them: the attempt
-// fails, and a retry runs from what is stored, as when a `put` fails. A user
-// of the saver outside LangGraph's runs `flush`es it when done (as `graphRun`
-// does).
+// A task's `putWrites` is kept pending, and its promise resolves once its
+// rows are stored, as LangGraph awaits it (before a run ends, whatever ends
+// it, and before a step's `put` if it carries delta writes), and fails with
+// its error. The `put` of its step, if called before the macrotask ends,
+// which it is when the step's last task has just finished, stores the pending
+// writes and then its checkpoint in one transaction: the writes' promises and
+// the `put`'s settle when it commits, or fail with its error, so a step is
+// stored before any task of the next starts. Else, the step has tasks still
+// running, and the pending writes are stored on their own, in one
+// transaction, at the end of the macrotask: a task that finished has its
+// writes stored while its siblings run, so it does not run again after a
+// crash, and no promise waits for a `put` to be called. Reads (`getTuple`,
+// `list`), `prune` and `deleteThread` store what is pending first. Nothing
+// is remembered of a failure: a failed `put` or store rejects the promises of
+// what it carried, which are not stored again, and the attempt fails and
+// goes on from what is stored.
 //
 // By default a thread keeps every checkpoint (LangGraph's history: `list`,
 // time travel, forks). With `history: 'latest'`, each `put` drops the
@@ -201,19 +201,28 @@ async function dropEarlier(tx: DatabaseWriter, threadId: string, ns: string, kep
   );
 }
 
-/** The rows of one `putWrites` (a serialization in progress), and the statement's verb. */
+/** One `putWrites`: its rows (a serialization in progress), the statement's verb, and how its promise settles. */
 interface PendingWrites {
   verb: string;
   rows: Promise<SqlValue[][]>;
+  stored: PromiseWithResolvers<void>;
+}
+
+/** Settles the promises of `writes`: resolved once stored, or rejected with the `error` of what carried them. */
+function settle(writes: PendingWrites[], error?: { error: unknown }) {
+  for (const { stored } of writes) {
+    if (error) stored.reject(error.error);
+    else stored.resolve();
+  }
 }
 
 /**
  * A LangGraph checkpointer whose threads are in the database session `db`:
  * see the top of this file. A task's pending writes are stored with the `put`
- * that follows them in the same macrotask, else at the end of it, so a
- * `putWrites` is not stored when its promise resolves: `flush` it, before
- * ending the session, if the checkpointer is used outside of a graph run's
- * own end. This holds for a user's own use of the saver too.
+ * that follows them in the same macrotask, else at the end of it; a
+ * `putWrites` promise resolves once they are stored, so awaiting it, as
+ * LangGraph does before a run ends, has them stored. This holds for a user's
+ * own use of the saver too.
  */
 export class SqlCheckpointSaver extends BaseCheckpointSaver {
   #db: Database;
@@ -231,8 +240,6 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
   #pending: PendingWrites[] = [];
   /** Stores what is pending, when the macrotask ends. */
   #timer: NodeJS.Immediate | undefined;
-  /** What a write that no call awaited failed with: every call after it fails with it. */
-  #failure: { error: unknown } | undefined;
 
   /**
    * `db`: a database session (`ctx.db`). `history`: the checkpoints a thread
@@ -265,15 +272,10 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     return `${String(count + 1).padStart(32, '0')}.${randomUUID()}` as unknown as number;
   }
 
-  /** Runs `operation` after the ones before it, on a database with the tables, unless an earlier write failed. */
+  /** Runs `operation` after the ones before it, on a database with the tables. */
   #serial<T>(operation: () => Promise<T>): Promise<T> {
     this.#ready ??= SCHEMA.ensure(this.#db);
-    const result = this.#tail
-      .then(() => {
-        if (this.#failure) throw this.#failure.error;
-        return this.#ready;
-      })
-      .then(operation);
+    const result = this.#tail.then(() => this.#ready).then(operation);
     this.#tail = result.catch(() => {});
     return result;
   }
@@ -299,8 +301,7 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
 
   /**
    * Stores what is pending, on its own, in order with the operations: the
-   * ones called after it are after it. A failure is not the caller's: it is
-   * remembered, and fails the next call.
+   * ones called after it are after it. Its promises settle with the commit.
    */
   #storePending(): void {
     const writes = this.#take();
@@ -309,21 +310,10 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
       // Serialized before the transaction opens, as a `put`'s values are.
       await Promise.all(writes.map(({ rows }) => rows));
       await this.#db.transaction((tx) => this.#store(tx, writes));
-    }).catch((error: unknown) => {
-      this.#failure ??= { error };
-    });
-  }
-
-  /**
-   * Stores what is pending, and resolves once everything called so far is
-   * stored, or rejects with the error of a write that failed. Call it when the
-   * graph's run is over, so that no write is left for a timer to store after
-   * the session ended.
-   */
-  async flush(): Promise<void> {
-    this.#storePending();
-    await this.#tail;
-    if (this.#failure) throw this.#failure.error;
+    }).then(
+      () => settle(writes),
+      (error: unknown) => settle(writes, { error }),
+    );
   }
 
   /** The values of `checkpoint`'s channels, at its versions. */
@@ -530,16 +520,21 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
       // Once stored: a transaction rolled back keeps the ones before.
       if (kept) this.#needed.set(JSON.stringify([thread_id, checkpoint_ns]), kept);
       return { configurable: { thread_id, checkpoint_ns, checkpoint_id: checkpoint.id } };
-    }).catch((error: unknown) => {
-      // The writes it carried are gone: the attempt fails, and a retry runs from what is stored.
-      if (writes.length > 0) this.#failure ??= { error };
-      throw error;
-    });
+    }).then(
+      (stored) => {
+        settle(writes);
+        return stored;
+      },
+      (error: unknown) => {
+        // The writes it carried fail with it, and are not stored again: the attempt fails, and goes on from what is stored.
+        settle(writes, { error });
+        throw error;
+      },
+    );
   }
 
   putWrites(config: RunnableConfig, writes: PendingWrite[], taskId: string, taskPath?: string): Promise<void> {
     const { thread_id, checkpoint_ns = '', checkpoint_id } = config.configurable ?? {};
-    if (this.#failure) return Promise.reject(this.#failure.error);
     if (!thread_id) return Promise.reject(new Error('Missing thread_id field in config.configurable.'));
     if (!checkpoint_id) return Promise.reject(new Error('Missing checkpoint_id field in config.configurable.'));
     // Special writes (errors, interrupts) replace; others keep the first.
@@ -562,13 +557,16 @@ export class SqlCheckpointSaver extends BaseCheckpointSaver {
     );
     // Whoever stores it awaits it, and fails with it; until then it is not an unhandled rejection.
     rows.catch(() => {});
-    this.#pending.push({ verb, rows });
+    const stored = Promise.withResolvers<void>();
+    // The caller awaits `stored`, as LangGraph does; a rejection is observed either way.
+    stored.promise.catch(() => {});
+    this.#pending.push({ verb, rows, stored });
     // A `put` in this macrotask takes it, else it is stored on its own when the macrotask ends.
     this.#timer ??= setImmediate(() => {
       this.#timer = undefined;
       this.#storePending();
     });
-    return Promise.resolve();
+    return stored.promise;
   }
 
   /**
