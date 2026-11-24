@@ -190,8 +190,6 @@ async function once<T>(
     // retry makes the call again.
     if (error instanceof restate.TerminalError) await call.answered(`Error: ${error.message}`);
     throw error;
-  } finally {
-    call.left();
   }
 }
 

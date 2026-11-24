@@ -402,6 +402,12 @@ const ATTEMPT = new Link<Attempt>('database');
 /** A write that rides the next commit of a database, in that commit's transaction. */
 type Rider = (tx: Transaction) => Promise<void>;
 
+/** A pending {@link Rider}, and whether it may not wait for a commit that is not under way. */
+interface Pending {
+  write: Rider;
+  urgent: boolean;
+}
+
 /**
  * Have `write` run in the next transaction of `db` that commits, before its
  * commit, rather than commit on its own: for bookkeeping that must be stored
@@ -416,9 +422,22 @@ type Rider = (tx: Transaction) => Promise<void>;
  * earlier one is under way is for the commit after. Returns false, registering
  * nothing, for a database that cannot (a view's, another kind of
  * `Database`): the caller writes at once.
+ *
+ * An `urgent` rider waits only for a transaction that is under way: if none
+ * is at the end of the macrotask it was registered in (or of the one in which
+ * a transaction ended and left it pending), it is written in a transaction of
+ * its own. A transaction that is held open (a batch of commits) is under way,
+ * and writes it when it commits. A write of its own that fails is not
+ * retried and raises nothing: the rider stays pending for the next commit or
+ * {@link flushRiders}. A rider that replaces an urgent one stays urgent.
  */
-export function rideCommit(db: Database, slot: string, write: Rider | undefined): boolean {
-  return ATTEMPT.of(db)?.ride(slot, write) ?? false;
+export function rideCommit(
+  db: Database,
+  slot: string,
+  write: Rider | undefined,
+  { urgent = false }: { urgent?: boolean } = {},
+): boolean {
+  return ATTEMPT.of(db)?.ride(slot, write, urgent) ?? false;
 }
 
 /** Write what is pending ({@link rideCommit}) in a transaction of its own: nothing, if nothing is. */
@@ -542,7 +561,11 @@ export class Attempt {
   /** The ids of the outbox's transactions this attempt made the sends of. */
   private readonly made = new Set<string>();
   /** The writes that ride the next commit, by slot ({@link rideCommit}). */
-  private readonly riders = new Map<string, Rider>();
+  private readonly riders = new Map<string, Pending>();
+  /** The transactions asked for and not finished: one that is under way writes the riders. */
+  private active = 0;
+  /** The macrotask at the end of which an urgent rider is written alone, if one is set. */
+  private urgentTimer: NodeJS.Immediate | undefined;
   /** The schemas this attempt's database has all the steps of. */
   private readonly ensured = new Map<string, Schema>();
   private ended = false;
@@ -578,11 +601,27 @@ export class Attempt {
   }
 
   /** {@link rideCommit}. */
-  ride(slot: string, write: Rider | undefined): boolean {
+  ride(slot: string, write: Rider | undefined, urgent: boolean): boolean {
     if (this.ctx.shared || this.ended) return false;
     if (write === undefined) this.riders.delete(slot);
-    else this.riders.set(slot, write);
+    else {
+      this.riders.set(slot, { write, urgent: urgent || (this.riders.get(slot)?.urgent ?? false) });
+      this.arm();
+    }
     return true;
+  }
+
+  /** Have the urgent riders written at the end of this macrotask, if any is pending and none is set. */
+  private arm() {
+    if (this.urgentTimer !== undefined || this.ended) return;
+    if (![...this.riders.values()].some((r) => r.urgent)) return;
+    this.urgentTimer = setImmediate(() => {
+      this.urgentTimer = undefined;
+      // A transaction under way writes them, or re-arms as it ends.
+      if (this.ended || this.active > 0) return;
+      // Once: a failure leaves them pending, for the next commit or the flush.
+      this.transaction(async () => {}, false).catch(() => {});
+    });
   }
 
   /** {@link flushRiders}, as a transaction of `db`: its commit writes them. */
@@ -649,10 +688,21 @@ export class Attempt {
    * be made again by an attempt that resumes a long wait (an approval), past
    * the idempotency retention that drops a repeat.
    */
-  private async transaction<T>(body: (tx: Transaction) => Promise<T>): Promise<T> {
+  private async transaction<T>(body: (tx: Transaction) => Promise<T>, rearm = true): Promise<T> {
+    this.active++;
+    try {
+      return await this.transacted(body);
+    } finally {
+      this.active--;
+      // What it left pending (it rolled back, or the rider came after it ran them) is for the end of this macrotask.
+      if (rearm) this.arm();
+    }
+  }
+
+  private async transacted<T>(body: (tx: Transaction) => Promise<T>): Promise<T> {
     let outgoing: Outgoing | undefined;
     // The riders this transaction wrote: pending until it has committed.
-    let rode: [string, Rider][] = [];
+    let rode: [string, Pending][] = [];
     const value = await this.call((db) =>
       db.transaction(async (handle) => {
         const sends = this.hasOutbox ? new Sends() : undefined;
@@ -669,14 +719,14 @@ export class Attempt {
         // After the body, which may have registered one (a transaction held open for more work), and before the commit.
         if (this.riders.size > 0) {
           rode = [...this.riders];
-          for (const [, write] of rode) await write(tx);
+          for (const [, { write }] of rode) await write(tx);
         }
         if (this.hasOutbox) await this.commitOutbox(handle, outgoing);
         return result;
       }),
     );
     // One registered since is for the next commit.
-    for (const [slot, write] of rode) if (this.riders.get(slot) === write) this.riders.delete(slot);
+    for (const [slot, pending] of rode) if (this.riders.get(slot) === pending) this.riders.delete(slot);
     if (outgoing !== undefined) await this.call((db) => this.flush(db));
     return value;
   }
@@ -819,6 +869,8 @@ export class Attempt {
    */
   private async endSession<T>(outcome: Outcome<T>): Promise<T> {
     this.ended = true;
+    if (this.urgentTimer !== undefined) clearImmediate(this.urgentTimer);
+    this.urgentTimer = undefined;
     const failed = await this.close().then(
       () => undefined,
       (error: unknown) => ({ error }),

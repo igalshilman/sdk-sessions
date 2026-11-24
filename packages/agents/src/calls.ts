@@ -20,13 +20,16 @@
 // and an identical call it makes later is a call of its own.
 //
 // Only the record of a new call commits of its own, before the call is made.
-// That a call answered, and that its record is forgotten, ride the next
-// commit of the database, in its transaction ({@link rideCommit}): for an
-// answer, the commit that stores the call's result, so that the transcript
-// never has a result of a call that is not recorded as answered. A crash
-// before that commit reads the call as one that did not answer, as a crash
-// just before a commit of its own would have: made again, under the same
-// key, and cut off for a stopped turn that another invocation closes.
+// That a call answered rides a commit that is under way or starts at once
+// ({@link rideCommit}): the one that stores the call's result, so that the
+// transcript never has a result of a call that is not recorded as answered;
+// if none does (a slow tool of the round is still running, another call
+// waits), it is written on its own at the end of that macrotask, so it is
+// never left unrecorded for long. That its record is forgotten rides the next
+// commit, whenever it comes. A crash in the few moments before an answer is
+// written reads the call as one that did not answer, as a crash just before
+// a commit of its own would have: made again, under the same key, and cut off
+// for a stopped turn that another invocation closes.
 //
 // A framework's own wait ({@link waitFor} of tools.ts) is its tool call's
 // alone: the framework stored its tool call before it waits, so a retried
@@ -132,11 +135,18 @@ async function store(ctx: restate.SessionContext, { invocation, calls }: Calls) 
 /**
  * Store `state` with the next commit of the database, rather than commit it
  * (see the top of this file), as it is then: a later change replaces it, and
- * the latest state is written. A database that cannot ride (a view's) commits it at once.
+ * the latest state is written. An `urgent` one (an answer) is written on its
+ * own unless a commit is under way to write it; one pending that is urgent
+ * stays so. A database that cannot ride (a view's) commits it at once.
  */
-async function ride(ctx: restate.SessionContext, state: Calls) {
-  const written = rideCommit(ctx.db, RIDER, (tx) =>
-    tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]),
+async function ride(ctx: restate.SessionContext, state: Calls, urgent = false) {
+  const written = rideCommit(
+    ctx.db,
+    RIDER,
+    (tx) => tx.execute(UPSERT, [state.invocation, JSON.stringify(state.calls)]),
+    {
+      urgent,
+    },
   );
   if (!written) await store(ctx, state);
 }
@@ -152,8 +162,8 @@ async function load(ctx: CallsContext, invocation: string): Promise<Calls> {
     : { invocation, calls: [] };
 }
 
-/** Each attempt's id, its calls, and how many are in flight (made, not yet answered), by its context, once they are being read. */
-const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls>; inFlight: number }>('the calls of an attempt');
+/** Each attempt's id, and its calls, by its context, once they are being read. */
+const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls> }>('the calls of an attempt');
 
 /**
  * The attempt of `ctx`: its id, and the calls of its invocation (loaded once,
@@ -162,7 +172,7 @@ const ATTEMPT = new ScopeKey<{ id: string; calls?: Promise<Calls>; inFlight: num
  * close reads the calls as stored, rather than fail on the load it found.
  */
 function attemptOf(ctx: restate.SessionContext) {
-  const attempt = ATTEMPT.of(ctx, () => ({ id: randomUUID(), inFlight: 0 }));
+  const attempt = ATTEMPT.of(ctx, () => ({ id: randomUUID() }));
   if (attempt.calls === undefined) {
     const calls = load(ctx, ctx.request.id);
     attempt.calls = calls;
@@ -220,64 +230,47 @@ export async function callOf(
   { rejoin = true, approval = false }: { rejoin?: boolean; approval?: boolean } = {},
 ) {
   const attempt = attemptOf(ctx);
-  // In flight from now on, not from when its record is stored: a call that answers meanwhile is not the last.
-  attempt.inFlight++;
-  let flying = true;
-  const left = () => {
-    if (flying) attempt.inFlight--;
-    flying = false;
-  };
-  let made: Call;
-  let state: Calls;
-  try {
-    state = await attempt.calls;
-    const json = canonical(input);
-    const prompt = PROMPT.get(ctx);
-    const ours = state.calls.filter((c) => c.prompt === prompt);
-    // A tool call may make more than one call (an approval, then the tool's
-    // own), each to a tool of its own.
-    let call =
-      ours.find((c) => c.ids.includes(callId) && c.tool === tool) ??
-      (rejoin ? ours.find((c) => c.attempt !== attempt.id && c.tool === tool && c.input === json) : undefined);
-    if (call) {
-      call.attempt = attempt.id;
-      if (!call.ids.includes(callId)) call.ids.push(callId);
-    } else {
-      call = { tool, input: json, ids: [callId], attempt: attempt.id };
-      if (approval) call.approval = true;
-      if (prompt !== undefined) call.prompt = prompt;
-      state.calls.push(call);
-    }
-    await store(ctx, state);
-    made = call;
-  } catch (error) {
-    left();
-    throw error;
+  const state = await attempt.calls;
+  const json = canonical(input);
+  const prompt = PROMPT.get(ctx);
+  const ours = state.calls.filter((c) => c.prompt === prompt);
+  // A tool call may make more than one call (an approval, then the tool's
+  // own), each to a tool of its own.
+  let call =
+    ours.find((c) => c.ids.includes(callId) && c.tool === tool) ??
+    (rejoin ? ours.find((c) => c.attempt !== attempt.id && c.tool === tool && c.input === json) : undefined);
+  if (call) {
+    call.attempt = attempt.id;
+    if (!call.ids.includes(callId)) call.ids.push(callId);
+  } else {
+    call = { tool, input: json, ids: [callId], attempt: attempt.id };
+    if (approval) call.approval = true;
+    if (prompt !== undefined) call.prompt = prompt;
+    state.calls.push(call);
   }
+  await store(ctx, state);
+  const made = call;
   return {
     id: made.ids[0]!,
     /**
      * It answered, with `failed` if a terminal error answered it: kept until
      * the transcript has its result.
      *
-     * It rides the next commit of the database, the one that stores the
-     * result, unless another call is still in flight: that may be a long
-     * wait (a signal, a sub-agent), and a call that answered must not stay
-     * unrecorded until it ends. A crash before that commit reads it as not
-     * answered, as one just before it was recorded would have: the retry makes the
-     * call again under the same key, and a stopped turn of another invocation
-     * that closes this one reports it as cut off ({@link outcomes} reads
+     * It rides a commit that is under way (the one that stores the call's
+     * result, when the framework's write has started), and is otherwise
+     * written on its own at once ({@link ride}): a call that answered must
+     * not stay unrecorded while something else runs (a slow tool of the same
+     * round, a call that waits for a signal). A crash before it is written
+     * reads the call as one that did not answer, as a crash just before a
+     * commit of its own would have: made again under the same key, and cut off
+     * for a stopped turn that another invocation closes ({@link outcomes} reads
      * the stored row; the attempt's own turn reads its state).
      */
     async answered(failed?: string) {
       made.done = true;
       if (failed !== undefined) made.failed = failed;
-      left();
-      if (attempt.inFlight > 0) await store(ctx, state);
-      else await ride(ctx, state);
+      await ride(ctx, state, true);
     },
-    /** It did not answer (the attempt fails, and its retry makes it again): no longer in flight. */
-    left,
   };
 }
 

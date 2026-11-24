@@ -36,6 +36,9 @@ const callee = restate.service({
   },
 });
 const answered = async (c: Made) => `result of ${c.method}`;
+const refusing = async () => {
+  throw new restate.TerminalError('refused');
+};
 const restateTools = () =>
   (['t1', 't2', 't3'] as const).map((name) => call(callee, name, { name, description: `tool ${name}` }));
 const plainTools = () =>
@@ -113,5 +116,25 @@ describe('an OpenCode turn with Restate calls', () => {
   it('has two commits more for each, as its result is stored apart from `ctx.db`', async () => {
     const plain = await commits(opencode.chat({ tools: plainTools() }), { script });
     expect(await commits(opencode.chat({ tools: restateTools() }), { route: answered, script })).toBe(plain + 6);
+  }, 120_000);
+
+  // OpenCode stores the error a call answered with as the tool's result in its own database: the record is
+  // marked answered, with the error, before it gets there.
+  it('records a call that failed terminally as answered, with its error, before OpenCode stores it', async () => {
+    const map = new Map<string, Uint8Array>();
+    let seen: unknown;
+    let asked = 0;
+    fake.script.reply = () => {
+      if (asked++ === 0) return { call: { id: 'call_f', name: 't1', input: {} } };
+      // The model's next request: OpenCode has the error stored.
+      const read = sqlAttempt({ map, key: 'k', id: 'read', shared: true });
+      seen = read.end(() => read.db.get<{ calls: string }>('SELECT calls FROM restate_agent_calls'));
+      return { text: 'Done' };
+    };
+    const sql = sqlAttempt({ map, key: 'k', id: 'inv1', route: refusing });
+    const chat = handlerOf(opencode.chat({ tools: restateTools() }));
+    expect(await sql.end(() => chat(sql.ctx, 'go'))).toBe('Done');
+    const row = (await seen) as { calls: string };
+    expect(JSON.parse(row.calls)).toMatchObject([{ tool: 'callee/t1', done: true, failed: 'Error: refused' }]);
   }, 120_000);
 });

@@ -51,10 +51,11 @@ What the core gives an integration, once ported:
   `prompt()`) makes nothing, and no integration publishes by hand.
   `toolCallStarted` settles the call records before a tool makes its own.
   A call's record commits of its own only before the call is made; that
-  it answered, and that it is forgotten, ride the next commit of `ctx.db`
+  it answered, and that it is forgotten, ride a commit of `ctx.db`
   (`rideCommit`: the one that stores the call's result, whichever framework
   makes it), and `answering` writes what is still pending as the turn ends.
-  A call that answers while another is in flight is written at once.
+  An answer rides only a commit that is under way (an urgent rider): if none
+  is, it is written on its own at the end of that macrotask.
   OpenCode's transcript is in a database of its own, which a commit of
   `ctx.db` does not reach: its answer is written before the tool hands its
   result over (`native`, `src/opencode/index.ts`).

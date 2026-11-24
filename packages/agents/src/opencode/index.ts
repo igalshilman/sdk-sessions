@@ -154,9 +154,16 @@ const native = (t: AnyTool, ctx: restate.SessionContext): OpenCodeTool => {
     description: t.description,
     input,
     execute: async (args, callId) => {
-      const result = await t.run(args, { ctx, callId });
-      // OpenCode stores the result in its own database, which a commit of `ctx.db` does not reach: a call that
-      // answered is recorded before the result is handed over, not with a commit that comes after.
+      // OpenCode stores the result (or the error a call answered with) in its own database, which a commit of
+      // `ctx.db` does not reach: a call that answered is recorded before it is handed over. The tool's own error
+      // is the one thrown, whatever the flush does.
+      let result: string;
+      try {
+        result = await t.run(args, { ctx, callId });
+      } catch (error) {
+        await flushCalls(ctx).catch(() => {});
+        throw error;
+      }
       await flushCalls(ctx);
       return result;
     },

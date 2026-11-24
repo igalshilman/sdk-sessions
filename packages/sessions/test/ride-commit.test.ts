@@ -1,10 +1,11 @@
 // A write that rides the next commit of a database (`rideCommit`): written in
 // that commit's transaction, before its commit, so that it costs no commit of
 // its own; `flushRiders` writes what is still pending.
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { database, flushRiders, rideCommit } from '@restatedev/sessions/internal';
 import { sqlAttempt } from './support.ts';
 
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 let syncs = 0;
 /** An attempt over a store of its own, with a table `t` and `syncs` counting its commits from then on. */
 async function attempt(options: { shared?: boolean } = {}) {
@@ -190,6 +191,160 @@ describe('a view', () => {
     await view.end(async () => {
       expect(rideCommit(view.db, 'a', insert('rode'))).toBe(false);
       await flushRiders(view.db);
+    });
+  });
+});
+
+describe('an urgent rider', () => {
+  const urgent = { urgent: true };
+
+  it('with no transaction under way is written alone at the end of the macrotask: one commit', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      syncs = 0;
+      rideCommit(db, 'a', insert('rode'), urgent);
+      expect(syncs).toBe(0);
+      await vi.waitFor(async () => expect(await rows(db)).toEqual([['rode']]));
+      expect(syncs).toBe(1);
+      await flushRiders(db);
+      expect(syncs).toBe(1);
+    });
+  });
+
+  it('is written by the transaction under way, and not again', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      syncs = 0;
+      rideCommit(db, 'a', insert('rode'), urgent);
+      // Started in the same macrotask: under way when the timer fires, and held open past it.
+      await db.transaction(async (tx) => {
+        await tick();
+        await tick();
+        await tx.execute("INSERT INTO t VALUES ('own')");
+      });
+      expect(syncs).toBe(1);
+      await tick();
+      await tick();
+      expect(await rows(db)).toEqual([['own'], ['rode']]);
+      expect(syncs).toBe(1);
+    });
+  });
+
+  it('is written by a transaction held open when it was registered, as that one commits', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      syncs = 0;
+      await db.transaction(async () => {
+        rideCommit(db, 'a', insert('rode'), urgent);
+        await tick();
+        await tick();
+        // Not written alone while the transaction is open.
+        expect(syncs).toBe(0);
+      });
+      expect(syncs).toBe(1);
+      expect(await rows(db)).toEqual([['rode']]);
+    });
+  });
+
+  it('left by a transaction that rolls back is written alone after it', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      rideCommit(db, 'a', insert('rode'), urgent);
+      await expect(
+        db.transaction(async () => {
+          throw new Error('rolled back');
+        }),
+      ).rejects.toThrow('rolled back');
+      await vi.waitFor(async () => expect(await rows(db)).toEqual([['rode']]));
+    });
+  });
+
+  it('registered after the transaction ran its riders is written alone after it', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      rideCommit(db, 'a', async (tx) => {
+        await tx.execute("INSERT INTO t VALUES ('first')");
+        rideCommit(db, 'b', insert('later'), urgent);
+      });
+      await db.execute("INSERT INTO t VALUES ('own')");
+      await vi.waitFor(async () => expect(await rows(db)).toEqual([['first'], ['later'], ['own']]));
+    });
+  });
+
+  it('whose own write fails stays pending, raises nothing, and is not tried again by itself', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      let tried = 0;
+      rideCommit(
+        db,
+        'a',
+        async (tx) => {
+          tried++;
+          await tx.execute('INSERT INTO nowhere VALUES (1)');
+        },
+        urgent,
+      );
+      await tick();
+      await tick();
+      await tick();
+      expect(tried).toBe(1);
+      // Replaced, it is written by the next commit.
+      rideCommit(db, 'a', insert('rode'));
+      await db.execute("INSERT INTO t VALUES ('own')");
+      expect(await rows(db)).toEqual([['own'], ['rode']]);
+    });
+  });
+
+  it('is not written once the attempt ended', async () => {
+    const { sql, map } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      rideCommit(db, 'a', insert('rode'), urgent);
+    });
+    const ended = syncs;
+    await tick();
+    await tick();
+    expect(syncs).toBe(ended);
+    const read = sqlAttempt({ map, shared: true });
+    expect(await read.end(() => rows(read.db))).toEqual([]);
+  });
+
+  it('keeps its urgency when a rider of the same slot that is not urgent replaces it', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      rideCommit(db, 'a', insert('first'), urgent);
+      rideCommit(db, 'a', insert('second'));
+      await vi.waitFor(async () => expect(await rows(db)).toEqual([['second']]));
+    });
+  });
+
+  it('is the only kind a timer writes: a rider that is not urgent waits for a commit', async () => {
+    const { sql } = await attempt();
+    await sql.end(async () => {
+      const { db } = sql;
+      await db.execute('CREATE TABLE t(x)');
+      syncs = 0;
+      rideCommit(db, 'a', insert('rode'));
+      await tick();
+      await tick();
+      await tick();
+      expect(syncs).toBe(0);
+      expect(await rows(db)).toEqual([]);
     });
   });
 });

@@ -182,7 +182,7 @@ describe('a call that answered', () => {
 const recordsOf = async (map: Map<string, Uint8Array>) => (await committed(map, '\0')).records;
 
 describe("a call's records", () => {
-  it('ride the next commit: answered and settled write nothing, the next write or a flush does', async () => {
+  it('are written by a commit under way or on their own: an answer at once, a settling with the next commit', async () => {
     const map = new Map<string, Uint8Array>();
     let syncs = 0;
     const sql = sqlAttempt({ map, key: 'k', id: 'inv1', onSync: async () => void syncs++ });
@@ -194,12 +194,12 @@ describe("a call's records", () => {
       syncs = 0;
       await first.answered();
       expect(syncs).toBe(0);
-      expect((await recordsOf(map))[0]).not.toHaveProperty('done');
-      await flushCalls(ctx);
+      // No commit is under way: the answer is written on its own, at the end of the macrotask.
+      await vi.waitFor(async () => expect(await recordsOf(map)).toMatchObject([{ tool: 'pay', done: true }]));
       expect(syncs).toBe(1);
-      expect(await recordsOf(map)).toMatchObject([{ tool: 'pay', done: true }]);
-      // Settled, it is forgotten with the next commit; a flush with none pending commits nothing.
+      // Settled, it is forgotten with the next commit: no timer writes it.
       await settleCalls(ctx, () => true);
+      await new Promise((resolve) => setTimeout(resolve, 5));
       expect(syncs).toBe(1);
       expect(await recordsOf(map)).toHaveLength(1);
       await ctx.db.execute('CREATE TABLE IF NOT EXISTS other (x)');
@@ -227,50 +227,42 @@ describe("a call's records", () => {
     });
   });
 
-  it('are written at once when another call is in flight: a call that answered is not left unrecorded during its wait', async () => {
+  it('keep an answer urgent when a settling is registered over it', async () => {
     const map = new Map<string, Uint8Array>();
-    let syncs = 0;
-    const sql = sqlAttempt({ map, key: 'k', id: 'inv1', onSync: async () => void syncs++ });
+    const sql = sqlAttempt({ map, key: 'k', id: 'inv1' });
     await sql.end(async () => {
       const { ctx } = sql;
       const first = await callOf(ctx, 'pay', { n: 1 }, 'c1');
-      const second = await callOf(ctx, 'wait', {}, 'c2');
-      syncs = 0;
+      await callOf(ctx, 'pay', { n: 2 }, 'c2');
       await first.answered();
-      expect(syncs).toBe(1);
-      expect(await recordsOf(map)).toMatchObject([{ ids: ['c1'], done: true }, { ids: ['c2'] }]);
-      // The last in flight rides.
-      await second.answered();
-      expect(syncs).toBe(1);
-      // A call that failed to answer is no longer in flight.
-      const third = await callOf(ctx, 'pay', { n: 3 }, 'c3');
-      const fourth = await callOf(ctx, 'pay', { n: 4 }, 'c4');
-      third.left();
-      syncs = 0;
-      await fourth.answered();
-      expect(syncs).toBe(0);
+      await settleCalls(ctx, () => false);
+      await vi.waitFor(async () =>
+        expect(await recordsOf(map)).toMatchObject([{ ids: ['c1'], done: true }, { ids: ['c2'] }]),
+      );
     });
   });
 });
 
 describe("a stopped turn's report of a call", () => {
-  it('reads the attempt itself: a call that answered returned, though its record is not stored yet', async () => {
+  it('reads the attempt itself: a call that answered returned, and so does another invocation once the answer is written', async () => {
     const map = new Map<string, Uint8Array>();
     const sql = sqlAttempt({ map, key: 'k', id: 'inv1' });
     await sql.end(async () => {
       const { ctx } = sql;
       await (await callOf(ctx, 'pay', { n: 1 }, 'c1')).answered();
       expect(await outcomes(ctx, ['c1'])).toEqual(new Map([['c1', undefined]]));
-      // Another invocation that closes the turn reads the stored row, where it did not answer yet: it reads as
-      // cut off, as a crash between the call's return and its record would have left it.
-      const other = sqlAttempt({ map, key: 'k', id: 'inv2' });
-      await other.end(async () => {
-        expect(await outcomes(other.ctx, ['c1'], 'inv1')).toEqual(new Map());
+      // Another invocation that closes the turn reads the stored row: the answer is written at once, so it reads
+      // as returned.
+      await vi.waitFor(async () => {
+        const other = sqlAttempt({ map, key: 'k', id: 'inv2' });
+        await other.end(async () =>
+          expect(await outcomes(other.ctx, ['c1'], 'inv1')).toEqual(new Map([['c1', undefined]])),
+        );
       });
     });
   });
 
-  it('is that the call returned, for a Claude turn stopped while a tool that is no call runs', async () => {
+  it('is that the call returned, for a Claude turn stopped while a tool that is no call runs, and the committed record has it answered meanwhile', async () => {
     const hang = tool({
       name: 'hang',
       description: 'hangs',
@@ -297,9 +289,8 @@ describe("a stopped turn's report of a call", () => {
     const chat = handlerOf(claude.chat({ tools: [...tools().slice(0, 1), hang] }));
     const turn = sql.end(() => chat(sql.ctx, 'go')).catch((error: unknown) => error);
     await returned.promise;
-    // The record of the call is not stored as answered: its commit comes with its result's, which the hung tool holds back.
-    await vi.waitFor(async () => expect(await recordsOf(map)).toMatchObject([{ tool: 'callee/t1' }]));
-    expect((await recordsOf(map))[0]).not.toHaveProperty('done');
+    // The result is held back by the tool that hangs, but the answer is written on its own, at once.
+    await vi.waitFor(async () => expect(await recordsOf(map)).toMatchObject([{ tool: 'callee/t1', done: true }]));
     sql.cancel();
     expect(await turn).toBeInstanceOf(restate.CancelledError);
     const read = sqlAttempt({ map, key: 'k', id: 'read', shared: true });
@@ -312,6 +303,50 @@ describe("a stopped turn's report of a call", () => {
     expect(results[0]![0]).toBe('c1');
     expect(results[0]![1]).toContain(RETURNED_UNRECORDED);
     expect(results[1]).toEqual(['c2', expect.stringContaining(CANCELLED)]);
+  });
+});
+
+describe('a turn killed while a slow tool runs', () => {
+  it('is closed by another invocation with the call that returned reported as having happened', async () => {
+    const hang = tool({
+      name: 'hang',
+      description: 'hangs',
+      input: z.object({}),
+      run: () => new Promise<never>(() => {}),
+    });
+    teller.reply = (messages: MessageParam[]) => {
+      const message = tellerReply(messages);
+      const last = messages.at(-1)!.content;
+      const hello = typeof last === 'string' && last.includes('Hello');
+      message.content = hello
+        ? [{ type: 'text', text: 'Hi', citations: null }]
+        : [
+            { type: 'tool_use', id: 'c1', name: 't1', input: {} },
+            { type: 'tool_use', id: 'c2', name: 'hang', input: {} },
+          ];
+      message.stop_reason = hello ? 'end_turn' : 'tool_use';
+      return message;
+    };
+    const map = new Map<string, Uint8Array>();
+    const fence = { closed: false };
+    const first = sqlAttempt({ map, fence, key: 'k', id: 'inv1', route: async () => 'result of t1' });
+    const chat = handlerOf(claude.chat({ tools: [...tools().slice(0, 1), hang] }));
+    void first.end(() => chat(first.ctx, 'go')).catch(() => {});
+    await vi.waitFor(async () => expect(await recordsOf(map)).toMatchObject([{ tool: 'callee/t1', done: true }]));
+    fence.closed = true;
+    first.abort();
+    const second = sqlAttempt({ map, key: 'k', id: 'inv2' });
+    expect(await second.end(() => chat(second.ctx, 'Hello'))).toBe('Hi');
+    const read = sqlAttempt({ map, key: 'k', id: 'read', shared: true });
+    const items = await read.end(() => read.db.values('SELECT item FROM restate_agent_items ORDER BY n'));
+    const results = items
+      .map(([item]) => JSON.parse(String(item)) as MessageParam)
+      .flatMap(({ content }) => (Array.isArray(content) ? content : []))
+      .flatMap((b) => (b.type === 'tool_result' ? [[b.tool_use_id, JSON.stringify(b.content)] as const] : []));
+    expect(results[0]![0]).toBe('c1');
+    expect(results[0]![1]).toContain(RETURNED_UNRECORDED);
+    expect(results[1]![0]).toBe('c2');
+    expect(results[1]![1]).not.toContain(RETURNED_UNRECORDED);
   });
 });
 
@@ -473,7 +508,7 @@ describe('two calls at once', () => {
     });
     const chat = handlerOf(claude.chat({ tools: tools() }));
     const turn = sql.end(() => chat(sql.ctx, 'go'));
-    // The second still waits: the first's answer is stored by a commit of its own.
+    // The second still waits, and no commit is under way: the first's answer is written on its own.
     await vi.waitFor(async () =>
       expect(await recordsOf(map)).toMatchObject([{ tool: 'callee/t1', done: true }, { tool: 'callee/t2' }]),
     );
