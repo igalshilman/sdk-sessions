@@ -103,6 +103,23 @@ describe('a graph of your own', () => {
     expect(await agent.texts()).toEqual(['user: go', 'assistant: first done', 'assistant: second done']);
   });
 
+  it("stores a failed run's pending writes before its attempt ends", async () => {
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('fail', () => {
+        throw new Error('the node failed');
+      })
+      .addEdge(START, 'fail')
+      .addEdge('fail', END);
+    const agent = agentOf(langgraph.chat({ graph }));
+    await expect(agent.ask('go', 'inv_a')).rejects.toThrow('the node failed');
+    // The task's error is stored, not left for the end of a macrotask that the attempt did not outlive.
+    const sql = sqlAttempt({ map: agent.map, key: 'k', id: 'count', shared: true });
+    const rows = await sql.end(() =>
+      sql.view.db.values("SELECT task_id FROM restate_langgraph_writes WHERE channel = '__error__'"),
+    );
+    expect(rows).toHaveLength(1);
+  });
+
   it('ends a turn on a terminal error, and gives the next run what closed it', async () => {
     const seen: string[][] = [];
     const graph = replying((messages) => {

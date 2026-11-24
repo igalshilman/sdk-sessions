@@ -7,7 +7,9 @@
 // the message as a new `HumanMessage`:
 //
 // - The graph's checkpoints are in the key's database (`SqlCheckpointSaver`),
-//   stored before each step runs (`durability: 'sync'`), and the prebuilt
+//   stored before each step runs (`durability: 'sync'`; a step's writes
+//   with its checkpoint, see checkpointer.ts; LangGraph awaits them all
+//   before a run ends, an error or a stop included), and the prebuilt
 //   nodes (nodes.ts) and the tools of `tools()` get the handler's context
 //   there (context.ts). LangGraph's run context is the graph's own (`context`),
 //   else the handler's. A retried attempt resumes the run it cut off. A run

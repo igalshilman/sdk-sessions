@@ -259,6 +259,12 @@ The Anthropic SDK's tool runner (`@anthropic-ai/sdk` 1.8.0, without the API's me
   (one checkpoint, without its channel values), `restate_langgraph_channel_values`
   (one channel's value at one version), `restate_langgraph_writes` (one
   pending write of a task; no `task_path`, unlike the Python SDK's).
+  `putWrites` keeps its rows pending; the `put` of its step, in the same
+  macrotask, stores them and its checkpoint in one transaction, else they are
+  stored on their own at the end of the macrotask (a sibling task still runs),
+  so a finished task is not run again after a crash. Its promise resolves
+  once the rows are committed, or fails with the commit's error, as LangGraph
+  awaits it before any run ends (`pregel/index.js:1231`).
 - **The built-in agent**: a `StateGraph` of its own, model → tools → model →
   answer (`index.ts:159-172`), compiled with
   `SqlCheckpointSaver(ctx.db, { history: 'latest' })` (`:216`), the thread
