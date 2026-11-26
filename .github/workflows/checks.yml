@@ -65,12 +65,15 @@ jobs:
       # VM is freed once the attempt ends.
       - run: pnpm --filter e2e explicit-recovery
       - run: pnpm --filter e2e leak
-      # A failed crash run keeps its services' and the server's logs.
+      # A failed crash run keeps its services' and the server's logs, and a
+      # failed explicit-recovery run its server's log.
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-logs
-          path: /tmp/restate-sessions-examples-*
+          path: |
+            /tmp/restate-sessions-examples-*
+            /tmp/recovery-*/server.log
           if-no-files-found: ignore
 
   # The addon's Rust tests (`pnpm --filter @restatedev/sessions test:rust`).

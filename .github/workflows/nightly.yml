@@ -81,6 +81,7 @@ jobs:
           path: |
             /tmp/restate-sessions-examples-*
             /tmp/restate-sessions-versions-*
+            /tmp/recovery-*/server.log
           if-no-files-found: ignore
 
   platforms:
