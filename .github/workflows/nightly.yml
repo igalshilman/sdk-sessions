@@ -69,7 +69,7 @@ jobs:
           echo "RESTATE_SERVER=$RUNNER_TEMP/restate/node_modules/@restatedev/restate-server-linux-x64/bin/restate-server" >> "$GITHUB_ENV"
       - run: '"$RESTATE_SERVER" --version'
       - run: pnpm --filter e2e concurrency
-      - run: pnpm --filter e2e suspension
+      - run: pnpm --filter e2e explicit-recovery
       - run: pnpm --filter e2e versions
       - run: pnpm --filter e2e tools
       - run: pnpm --filter e2e steering
@@ -109,7 +109,7 @@ jobs:
       - run: pnpm --filter @restatedev/sessions test:rust
       - run: pnpm --filter @restatedev/agents test
       - run: pnpm --filter e2e concurrency
-      - run: pnpm --filter e2e suspension
+      - run: pnpm --filter e2e explicit-recovery
       - run: pnpm --filter e2e versions
 
   bench:
