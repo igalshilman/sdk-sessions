@@ -58,12 +58,12 @@ import {
   Harness,
   hook,
   section,
+  wrapTool,
   type Conversation,
   type ConversationId,
   type ConversationRetryPolicy,
   type ConversationStreamOptions,
   type ToolRegistration,
-  type Wrap,
 } from '@earendil-works/pi-durable';
 import { keptModels } from './keepalive.ts';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
@@ -352,7 +352,14 @@ async function extensions(
   registry.install(
     defineExtension({
       name: 'steering',
-      hooks: [hook(GenerationTask, { afterTools: (_assistant, _results, api) => afterTools(api.conversationId) })],
+      hooks: [
+        hook(GenerationTask, {
+          // It asks for no tasks.
+          afterTools: async (_assistant, _results, api): Promise<undefined> => {
+            await afterTools(api.conversationId);
+          },
+        }),
+      ],
     }),
   );
   if (system) registry.install(defineExtension({ name: 'system', sections: [section('system', () => system)] }));
@@ -367,7 +374,7 @@ async function extensions(
     ...t,
     execute: (args, api, context) => effect(() => ctx.working(() => t.execute(args, api, context))),
   });
-  const wraps = (CodingTools.tools ?? []).map((t): Wrap => ({ tool: t.name, wrap: kept }));
+  const wraps = (CodingTools.tools ?? []).map((t) => wrapTool(t, kept));
   registry.install(defineExtension({ name: 'keepalive', wraps }));
   return { registry, env: () => new NodeExecutionEnv({ cwd: workspace }) };
 }

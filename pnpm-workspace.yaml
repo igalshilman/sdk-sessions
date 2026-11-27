@@ -12,9 +12,15 @@ allowBuilds:
   protobufjs: true
   tree-sitter-bash: true
   tree-sitter-powershell: true
-# Releases newer than pnpm's minimum age, taken on purpose: the Restate SDK and agentlib.
+# Releases newer than pnpm's minimum age, taken on purpose: the Restate SDK, agentlib and pi.
 minimumReleaseAgeExclude:
   - '@restatedev/restate-sdk-clients@1.18.2'
   - '@restatedev/restate-sdk-core@1.18.2'
   - '@restatedev/restate-sdk@1.18.2'
   - '@restatedev/agentlib@0.2.0'
+  - '@earendil-works/chord@1.7.0'
+  - '@earendil-works/pi-ai@1.7.0'
+  - '@earendil-works/pi-codemode@1.7.0'
+  - '@earendil-works/pi-durable@1.7.0'
+  - '@earendil-works/pi-schema@1.7.0'
+  - '@earendil-works/pi-telemetry@1.7.0'

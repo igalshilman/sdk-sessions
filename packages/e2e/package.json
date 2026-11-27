@@ -20,7 +20,7 @@
     "identity": "node identity.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-ai": "1.7.0",
     "@restatedev/agentlib": "0.2.0",
     "@restatedev/agents": "workspace:*",
     "@restatedev/restate-sdk": "1.18.2",

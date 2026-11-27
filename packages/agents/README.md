@@ -103,11 +103,11 @@ install with it, and the packages of the frameworks it imports, so that
 `@restatedev/agents/pi` brings pi alone:
 
 ```sh
-npm install @restatedev/agents @earendil-works/{pi-durable,pi-ai,chord}@1.5.2                           # pi
+npm install @restatedev/agents @earendil-works/{pi-durable,pi-ai,chord}@1.7.0                           # pi
 npm install @restatedev/agents @anthropic-ai/sdk                                                        # Claude
 npm install @restatedev/agents @langchain/core @langchain/langgraph @langchain/langgraph-checkpoint \
   @langchain/openai                       # LangGraph, and the provider of its models: or @langchain/anthropic
-npm install @restatedev/agents @earendil-works/pi-ai@1.5.2 @deepseek-ai/cordis \
+npm install @restatedev/agents @earendil-works/pi-ai@1.7.0 @deepseek-ai/cordis \
   @deepseek-ai/{dsh-agent,dsh-agent-loop,dsh-llm,dsh-llm-deepseek-api-key,dsh-llm-pi-ai,dsh-session}@0.2.2-rc.2 \
   @deepseek-ai/{dsh-session-checkpoint-policy,dsh-session-persistence,dsh-session-projection}@0.2.2-rc.2 \
   @deepseek-ai/{dsh-system-prompt,dsh-tools,dsh-tool-executor-native,dsh-user-approval}@0.2.2-rc.2 \
@@ -117,9 +117,10 @@ npm install @restatedev/agents @restatedev/agentlib@0.2.0 @restatedev/restate-sd
   @restatedev/restate-sdk@1.18.2 @ai-sdk/openai  # agentlib, and the provider of its models: or @ai-sdk/anthropic
 ```
 
-pi's packages are on 1.5 (`~1.5.2`): pi changes its API in minor releases
-(1.5 dropped pi-ai's `Type`, and changed pi-durable's storage), so a minor
-newer than the one @restatedev/agents is tested on is not taken.
+pi's packages are on 1.7 (`~1.7.0`): pi changes its API in minor releases
+(1.6 tagged pi-durable's wraps and hook results, and changed the format of
+its tasks), so a minor newer than the one @restatedev/agents is tested on is
+not taken.
 A subpath whose packages are missing fails as it is imported, naming the
 first it lacks. The packages are not published yet:
 [`pnpm --filter e2e packaging`](../e2e/packaging.ts) installs them from

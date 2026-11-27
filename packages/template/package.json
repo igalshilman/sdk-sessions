@@ -6,9 +6,9 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@earendil-works/chord": "1.5.2",
-    "@earendil-works/pi-ai": "1.5.2",
-    "@earendil-works/pi-durable": "1.5.2",
+    "@earendil-works/chord": "1.7.0",
+    "@earendil-works/pi-ai": "1.7.0",
+    "@earendil-works/pi-durable": "1.7.0",
     "@restatedev/agents": "workspace:*",
     "@restatedev/sessions": "workspace:*",
     "zod": "4.6.7"

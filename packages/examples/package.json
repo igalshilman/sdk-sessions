@@ -10,9 +10,9 @@
   },
   "dependencies": {
     "@ai-sdk/openai": "4.0.13",
-    "@earendil-works/pi-ai": "1.5.2",
-    "@earendil-works/pi-durable": "1.5.2",
-    "@earendil-works/pi-schema": "1.5.2",
+    "@earendil-works/pi-ai": "1.7.0",
+    "@earendil-works/pi-durable": "1.7.0",
+    "@earendil-works/pi-schema": "1.7.0",
     "@langchain/core": "1.4.0",
     "@langchain/openai": "1.8.4",
     "@modelcontextprotocol/client": "2.0.0",
